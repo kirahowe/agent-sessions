@@ -1,0 +1,6 @@
+macapp/Agents.xcodeproj/
+macapp/.build/
+.DS_Store
+xcuserdata/
+.lsp/
+.clj-kondo/

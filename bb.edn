@@ -1,0 +1,16 @@
+{:tasks
+ {gen {:doc "Generate the Xcode project via XcodeGen"
+       :task (shell {:dir "macapp"} "xcodegen generate")}
+
+  build {:doc "Generate the project, then build Debug"
+         :depends [gen]
+         :task (shell "xcodebuild" "-project" "macapp/Agents.xcodeproj"
+                       "-scheme" "Agents" "-configuration" "Debug"
+                       "-derivedDataPath" "macapp/.build" "build")}
+
+  run {:doc "Build, then launch the built app"
+       :depends [build]
+       :task (shell "open" "macapp/.build/Build/Products/Debug/Agents.app")}
+
+  clean {:doc "Remove the generated Xcode project and build artifacts"
+         :task (shell "rm" "-rf" "macapp/Agents.xcodeproj" "macapp/.build")}}}
