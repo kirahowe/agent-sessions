@@ -1,4 +1,3 @@
-import AppKit
 import Combine
 import Foundation
 
@@ -8,14 +7,18 @@ final class AppStore: ObservableObject {
     @Published var sessions: [SessionRow] = []
     @Published var selection: String?
 
-    let terminalCenter = TerminalCenter()
+    let terminals: any SessionTerminating
 
     /// Per-project session-number counters, in-memory only. Seeded from
     /// restored session names on launch; on relaunch max+1 is fine, no need
     /// to persist the counter itself.
     private var sessionCounters: [String: Int] = [:]
 
-    private let stateURL: URL = {
+    private let stateURL: URL
+
+    /// The app's real persisted-state location: ~/Library/Application
+    /// Support/Agents/state.json.
+    static let defaultStateURL: URL = {
         let appSupport = FileManager.default.urls(
             for: .applicationSupportDirectory,
             in: .userDomainMask
@@ -25,8 +28,10 @@ final class AppStore: ObservableObject {
             .appendingPathComponent("state.json")
     }()
 
-    init() {
-        terminalCenter.onProcessExit = { [weak self] id in
+    init(terminals: any SessionTerminating, stateURL: URL) {
+        self.terminals = terminals
+        self.stateURL = stateURL
+        terminals.onProcessExit = { [weak self] id in
             self?.closeSession(id)
         }
         load()
@@ -35,14 +40,7 @@ final class AppStore: ObservableObject {
 
     // MARK: - Project management
 
-    func addProject() {
-        let panel = NSOpenPanel()
-        panel.canChooseDirectories = true
-        panel.canChooseFiles = false
-        panel.allowsMultipleSelection = false
-        guard panel.runModal() == .OK, let url = panel.url else { return }
-
-        let path = url.path
+    func addProject(path: String) {
         let project: Project
         if let existing = projects.first(where: { $0.path == path }) {
             project = existing
@@ -56,20 +54,9 @@ final class AppStore: ObservableObject {
     }
 
     func removeProject(_ project: Project) {
-        let alert = NSAlert()
-        alert.messageText = "Remove \u{201C}\(project.name)\u{201D}?"
-        alert.informativeText =
-            "This removes the project and its sessions from Agents. The directory on disk is not affected."
-        alert.alertStyle = .warning
-        let removeButton = alert.addButton(withTitle: "Remove")
-        removeButton.hasDestructiveAction = true
-        alert.addButton(withTitle: "Cancel")
-
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
-
         let removedIDs = sessions.filter { $0.projectPath == project.path }.map(\.id)
         for id in removedIDs {
-            terminalCenter.closeSession(id)
+            terminals.closeSession(id)
         }
         sessions.removeAll { $0.projectPath == project.path }
         projects.removeAll { $0.path == project.path }
@@ -108,7 +95,7 @@ final class AppStore: ObservableObject {
         let row = sessions[index]
         let wasSelected = selection == id
 
-        terminalCenter.closeSession(id)
+        terminals.closeSession(id)
         sessions.remove(at: index)
 
         if wasSelected {
@@ -124,22 +111,10 @@ final class AppStore: ObservableObject {
         save()
     }
 
-    func renameSession(_ id: String) {
+    func renameSession(_ id: String, to name: String) {
         guard let index = sessions.firstIndex(where: { $0.id == id }) else { return }
 
-        let alert = NSAlert()
-        alert.messageText = "Rename Session"
-        alert.addButton(withTitle: "Rename")
-        alert.addButton(withTitle: "Cancel")
-
-        let textField = NSTextField(frame: NSRect(x: 0, y: 0, width: 240, height: 24))
-        textField.stringValue = sessions[index].name
-        alert.accessoryView = textField
-        alert.window.initialFirstResponder = textField
-
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
-
-        let trimmed = textField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         sessions[index].name = trimmed
         save()
@@ -159,6 +134,7 @@ final class AppStore: ObservableObject {
 
     private func save() {
         let state = PersistedState(
+            version: 1,
             projects: projects.map(\.path),
             sessions: sessions,
             selection: selection

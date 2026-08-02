@@ -13,6 +13,7 @@ import SwiftUI
 /// elsewhere).
 struct TerminalHostView: NSViewRepresentable {
     @ObservedObject var store: AppStore
+    let center: TerminalCenter
 
     func makeNSView(context: Context) -> NSView {
         NSView()
@@ -28,7 +29,7 @@ struct TerminalHostView: NSViewRepresentable {
             return
         }
 
-        let terminalView = store.terminalCenter.terminalView(
+        let terminalView = center.terminalView(
             for: selectedID,
             workingDirectory: row.projectPath
         )

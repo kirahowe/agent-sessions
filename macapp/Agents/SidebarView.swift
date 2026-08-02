@@ -15,7 +15,9 @@ struct SidebarView: View {
                         .tag(session.id)
                         .contextMenu {
                             Button("Rename…") {
-                                store.renameSession(session.id)
+                                if let name = Dialogs.promptRename(currentName: session.name) {
+                                    store.renameSession(session.id, to: name)
+                                }
                             }
                             Button("Close Session") {
                                 store.closeSession(session.id)
@@ -35,7 +37,9 @@ struct SidebarView: View {
                     }
                     .contextMenu {
                         Button("Remove Project…") {
-                            store.removeProject(project)
+                            if Dialogs.confirmRemove(project) {
+                                store.removeProject(project)
+                            }
                         }
                     }
                 }
@@ -44,7 +48,9 @@ struct SidebarView: View {
         .listStyle(.sidebar)
         .safeAreaInset(edge: .bottom) {
             Button {
-                store.addProject()
+                if let path = Dialogs.chooseProjectDirectory() {
+                    store.addProject(path: path)
+                }
             } label: {
                 Text("Add Project…")
                     .frame(maxWidth: .infinity)

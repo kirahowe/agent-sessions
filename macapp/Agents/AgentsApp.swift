@@ -3,11 +3,20 @@ import SwiftUI
 
 @main
 struct AgentsApp: App {
-    @StateObject private var store = AppStore()
+    let center: TerminalCenter
+    @StateObject private var store: AppStore
+
+    init() {
+        let center = TerminalCenter()
+        self.center = center
+        _store = StateObject(
+            wrappedValue: AppStore(terminals: center, stateURL: AppStore.defaultStateURL)
+        )
+    }
 
     var body: some Scene {
         WindowGroup {
-            RootView(store: store)
+            RootView(store: store, center: center)
         }
         .commands {
             CommandGroup(after: .newItem) {
@@ -15,7 +24,9 @@ struct AgentsApp: App {
                     store.newSession(in: nil)
                 }
                 .keyboardShortcut("t", modifiers: .command)
+            }
 
+            CommandGroup(replacing: .saveItem) {
                 Button("Close Session") {
                     guard let selection = store.selection else { return }
                     store.closeSession(selection)

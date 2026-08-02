@@ -2,6 +2,7 @@ import SwiftUI
 
 struct RootView: View {
     @ObservedObject var store: AppStore
+    let center: TerminalCenter
 
     private var windowTitle: String {
         if let selectedID = store.selection,
@@ -23,7 +24,7 @@ struct RootView: View {
             // a live TerminalView blanks its Metal surface. The empty state
             // is an overlay on top, never a conditional swap.
             ZStack {
-                TerminalHostView(store: store)
+                TerminalHostView(store: store, center: center)
 
                 if store.selection == nil {
                     VStack(spacing: 8) {

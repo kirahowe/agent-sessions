@@ -6,7 +6,7 @@ import GhosttyTerminal
 /// NSView container/subview/constraint/visibility/focus mechanics live in
 /// `TerminalHostView`.
 @MainActor
-final class TerminalCenter {
+final class TerminalCenter: SessionTerminating {
     private struct Entry {
         let view: TerminalView
         let controller: TerminalController
