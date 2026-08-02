@@ -39,3 +39,41 @@ targets:
         CODE_SIGN_IDENTITY: "-"
         CODE_SIGNING_REQUIRED: NO
         DEAD_CODE_STRIPPING: YES
+
+  AgentsTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - path: AgentsTests
+    dependencies:
+      - target: Agents
+        embed: false
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.kirahowe.agents.tests
+        SWIFT_VERSION: "5.0"
+        GENERATE_INFOPLIST_FILE: YES
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/Agents.app/Contents/MacOS/Agents"
+        BUNDLE_LOADER: "$(TEST_HOST)"
+        CODE_SIGN_STYLE: Manual
+        CODE_SIGN_IDENTITY: "-"
+        CODE_SIGNING_REQUIRED: NO
+
+schemes:
+  Agents:
+    build:
+      targets:
+        Agents: all
+        AgentsTests: [test]
+    run:
+      config: Debug
+    test:
+      config: Debug
+      targets:
+        - AgentsTests
+    profile:
+      config: Release
+    analyze:
+      config: Debug
+    archive:
+      config: Release
