@@ -1,0 +1,247 @@
+#!/usr/bin/env bb
+;; agents-cli — jj-workspace operations for the Agents macOS app.
+;;
+;; Contract: every invocation prints EXACTLY ONE JSON object to stdout and
+;; exits 0 (ok) or 1 (error), no matter what goes wrong. jj's own
+;; stdout/stderr are always captured and never passed through to our stdout.
+;;
+;;   success: {"ok":true, ...payload}
+;;   error:   {"ok":false,"error":{"code":"<code>","message":"<message>"}}
+;;
+;; This is deliberately a single flat script (no internal namespaces) so it
+;; stays easy to read as it grows into a bigger engine.
+
+(require '[cheshire.core :as json]
+         '[babashka.process :as p]
+         '[babashka.fs :as fs]
+         '[clojure.string :as str])
+
+;; -----------------------------------------------------------------------
+;; Word lists for auto-generated "adjective-noun" workspace names.
+;; Kept small and boring on purpose: lowercase, single word, no punctuation,
+;; so `adjective + "-" + noun` always satisfies ^[a-z]+-[a-z]+$.
+
+(def adjectives
+  ["calm" "bright" "swift" "gentle" "quiet" "brave" "kind" "clever" "eager" "fresh"
+   "golden" "happy" "jolly" "keen" "lively" "mellow" "nimble" "plucky" "quick" "radiant"
+   "sunny" "tidy" "upbeat" "vivid" "warm" "young" "zesty" "amber" "bold" "crisp"
+   "dapper" "earnest" "fair" "gracious" "honest" "jovial" "lucky" "mild" "noble" "patient"])
+
+(def nouns
+  ["river" "forest" "ember" "meadow" "harbor" "canyon" "willow" "summit" "brook" "glade"
+   "cove" "ridge" "orchard" "prairie" "grove" "lagoon" "valley" "cliff" "delta" "haven"
+   "island" "knoll" "lake" "marsh" "nest" "oasis" "peak" "quarry" "reef" "shore"
+   "trail" "vale" "wharf" "yard" "zephyr" "bay" "cedar" "dune" "fern" "garden"])
+
+(defn gen-name []
+  (str (rand-nth adjectives) "-" (rand-nth nouns)))
+
+;; -----------------------------------------------------------------------
+;; Errors. Every failure path throws ex-info carrying {:code :message}; the
+;; top-level handler in -main turns that into the error envelope. `code`
+;; must always be one of the five contract codes.
+
+(def error-codes #{"not-a-jj-repo" "dest-exists" "name-conflict" "bad-args" "jj-failed"})
+
+(defn cli-error [code message]
+  (assert (contains? error-codes code) (str "internal: unknown error code " code))
+  (throw (ex-info message {:code code :message message})))
+
+;; -----------------------------------------------------------------------
+;; Shelling out to jj. Global flags (-R, --no-pager) always go before the
+;; subcommand — jj is picky about that ordering for some subcommands, so we
+;; do it consistently everywhere rather than relying on it not mattering.
+
+(defn run-jj [args]
+  (let [result @(p/process (into ["jj"] args) {:out :string :err :string})]
+    {:exit (:exit result) :out (:out result) :err (:err result)}))
+
+(defn stderr-tail
+  "Last few lines of stderr, for embedding in jj-failed messages."
+  [err]
+  (->> (str/split-lines (str/trim (or err "")))
+       (take-last 5)
+       (str/join "\n")))
+
+(defn jj-failed! [err]
+  (cli-error "jj-failed" (str "jj command failed: " (stderr-tail err))))
+
+;; -----------------------------------------------------------------------
+;; Path/name conventions shared by every subcommand. The destination for a
+;; workspace named `name` under `project` is ALWAYS
+;;   <parent-dir-of-project>/workspaces/<name>
+;; This is not configurable, and workspace-list reconstructs it the same
+;; way (jj's `workspace list` output carries no filesystem path).
+
+(defn workspaces-root [project]
+  (str (fs/path (fs/parent project) "workspaces")))
+
+(defn dest-path [project name]
+  (str (fs/path (workspaces-root project) name)))
+
+(defn jj-name [name] (str "agents/" name))
+
+(defn assert-jj-repo!
+  "Validates that project is a jj repo (git-worktree projects are
+   deliberately out of scope for now). Throws not-a-jj-repo otherwise."
+  [project]
+  (let [{:keys [exit]} (run-jj ["--ignore-working-copy" "--no-pager" "-R" project "root"])]
+    (when-not (zero? exit)
+      (cli-error "not-a-jj-repo"
+                 (str "'" project "' is not a jj repo — jj repos only (for now); "
+                      "git-worktree support is deliberately deferred.")))))
+
+(defn list-workspace-names
+  "Raw `jj workspace list` output, as a seq of just the name on each line
+   (the part before the first ':'), e.g. \"default\", \"agents/foo\"."
+  [project]
+  (let [{:keys [exit out err]} (run-jj ["--no-pager" "-R" project "workspace" "list"])]
+    (when-not (zero? exit) (jj-failed! err))
+    (->> (str/split-lines out)
+         (remove str/blank?)
+         (map (fn [line]
+                (let [idx (str/index-of line ":")]
+                  (if idx (subs line 0 idx) line)))))))
+
+(defn workspace-name-taken? [project full-name]
+  (contains? (set (list-workspace-names project)) full-name))
+
+;; -----------------------------------------------------------------------
+;; Argument parsing: subcommand followed by `--flag value` pairs.
+
+(defn parse-flags [args]
+  (loop [args args acc {}]
+    (if (empty? args)
+      acc
+      (let [[k v & more] args]
+        (when-not (and (string? k) (str/starts-with? k "--") (> (count k) 2))
+          (cli-error "bad-args" (str "Expected a --flag, got: " (pr-str k))))
+        (when (nil? v)
+          (cli-error "bad-args" (str "Missing value for " k)))
+        (recur more (assoc acc (keyword (subs k 2)) v))))))
+
+(defn require-flags! [flags & ks]
+  (doseq [k ks]
+    (when (str/blank? (get flags k))
+      (cli-error "bad-args" (str "Missing required --" (name k))))))
+
+;; -----------------------------------------------------------------------
+;; workspace-add
+
+(defn check-name-available!
+  "Throws name-conflict / dest-exists if `name` is already taken, either in
+   jj's workspace registry or on disk (dest dir already there).
+
+   jj-registry is checked first: re-adding the very same name after a
+   successful add leaves BOTH the jj workspace and the dest dir present, and
+   in that case we want to surface name-conflict (a name collision) rather
+   than dest-exists (which is reserved for a directory blocking the way
+   that jj never registered, e.g. something pre-existing or left behind)."
+  [project name]
+  (let [dest (dest-path project name)]
+    (when (workspace-name-taken? project (jj-name name))
+      (cli-error "name-conflict" (str "jj workspace already exists: " (jj-name name))))
+    (when (fs/exists? dest)
+      (cli-error "dest-exists" (str "Destination already exists: " dest)))))
+
+(defn pick-name
+  "Returns the name to use. An explicit name is validated once, with no
+   retry. An auto-generated name is retried up to 5 times on conflict;
+   if all 5 attempts collide, the last conflict's error is raised."
+  [project explicit-name]
+  (if explicit-name
+    (do (check-name-available! project explicit-name)
+        explicit-name)
+    (loop [attempt 1]
+      (let [candidate (gen-name)
+            outcome (try (check-name-available! project candidate)
+                         :available
+                         (catch clojure.lang.ExceptionInfo e e))]
+        (cond
+          (= outcome :available) candidate
+          (< attempt 5) (recur (inc attempt))
+          :else (throw outcome))))))
+
+(defn cmd-workspace-add [flags]
+  (require-flags! flags :project)
+  (let [project (str (fs/absolutize (:project flags)))]
+    (assert-jj-repo! project)
+    (let [name (pick-name project (:name flags))
+          dest (dest-path project name)
+          root (workspaces-root project)]
+      ;; jj does NOT create intermediate directories for `workspace add`
+      ;; (verified empirically), so we make the workspaces/ parent ourselves.
+      (fs/create-dirs root)
+      (let [{:keys [exit err]}
+            (run-jj ["--no-pager" "-R" project "workspace" "add"
+                     "--name" (jj-name name) dest])]
+        (when-not (zero? exit) (jj-failed! err))
+        {:ok true
+         :workspace {:name name
+                     :jj_name (jj-name name)
+                     :path dest
+                     :project project}}))))
+
+;; -----------------------------------------------------------------------
+;; workspace-forget
+;;
+;; NOTE: empirically, `jj workspace forget <unknown-name>` exits 0 with just
+;; a stderr warning ("No such workspace: ...", "Nothing changed.") — it is
+;; NOT a jj failure. So this command reports {"ok":true} whenever jj itself
+;; exits 0, and jj-failed only on a genuine nonzero exit, same as every
+;; other subcommand. This command never touches the directory on disk.
+
+(defn cmd-workspace-forget [flags]
+  (require-flags! flags :project :name)
+  (let [project (str (fs/absolutize (:project flags)))
+        name (:name flags)
+        {:keys [exit err]} (run-jj ["--no-pager" "-R" project "workspace" "forget" (jj-name name)])]
+    (when-not (zero? exit) (jj-failed! err))
+    {:ok true}))
+
+;; -----------------------------------------------------------------------
+;; workspace-list
+
+(defn cmd-workspace-list [flags]
+  (require-flags! flags :project)
+  (let [project (str (fs/absolutize (:project flags)))
+        agents-names (->> (list-workspace-names project)
+                           (filter #(str/starts-with? % "agents/"))
+                           (map #(subs % (count "agents/"))))]
+    {:ok true
+     :workspaces (mapv (fn [name]
+                          (let [dest (dest-path project name)]
+                            {:name name
+                             :jj_name (jj-name name)
+                             :path dest
+                             :dir_exists (fs/exists? dest)}))
+                        agents-names)}))
+
+;; -----------------------------------------------------------------------
+;; Dispatch + top-level error handling.
+
+(defn dispatch [args]
+  (let [[subcmd & rest-args] args]
+    (when (str/blank? subcmd)
+      (cli-error "bad-args" "Missing subcommand. Expected one of: workspace-add, workspace-forget, workspace-list."))
+    (let [flags (parse-flags rest-args)]
+      (case subcmd
+        "workspace-add"    (cmd-workspace-add flags)
+        "workspace-forget" (cmd-workspace-forget flags)
+        "workspace-list"   (cmd-workspace-list flags)
+        (cli-error "bad-args" (str "Unknown subcommand: " subcmd))))))
+
+(defn emit! [m]
+  (println (json/generate-string m))
+  (System/exit (if (:ok m) 0 1)))
+
+(defn -main [args]
+  (try
+    (emit! (dispatch args))
+    (catch clojure.lang.ExceptionInfo e
+      (let [{:keys [code message]} (ex-data e)]
+        (emit! {:ok false :error {:code code :message message}})))
+    (catch Throwable t
+      (emit! {:ok false :error {:code "bad-args" :message (str "Unexpected error: " (.getMessage t))}}))))
+
+(-main *command-line-args*)

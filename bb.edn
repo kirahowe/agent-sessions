@@ -19,4 +19,7 @@
                       "-derivedDataPath" "macapp/.build" "test")}
 
   clean {:doc "Remove the generated Xcode project and build artifacts"
-         :task (shell "rm" "-rf" "macapp/Agents.xcodeproj" "macapp/.build")}}}
+         :task (shell "rm" "-rf" "macapp/Agents.xcodeproj" "macapp/.build")}
+
+  cli-test {:doc "Run the agents-cli behavioral test suite"
+            :task (shell "bb" "cli/test_agents_cli.clj")}}}
