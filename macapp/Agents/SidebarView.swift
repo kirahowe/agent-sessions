@@ -8,10 +8,12 @@ struct SidebarView: View {
             ForEach(store.projects) { project in
                 Section {
                     ForEach(store.sessions.filter { $0.projectPath == project.path }) { session in
-                        HStack {
+                        HStack(spacing: 8) {
                             Image(systemName: "terminal")
+                                .foregroundStyle(.secondary)
                             Text(session.name)
                         }
+                        .padding(.vertical, 5)
                         .tag(session.id)
                         .contextMenu {
                             Button("Rename…") {
@@ -27,6 +29,8 @@ struct SidebarView: View {
                 } header: {
                     HStack {
                         Text(project.name)
+                            .font(.subheadline)
+                            .fontWeight(.semibold)
                         Spacer()
                         Button {
                             store.newSession(in: project)
@@ -35,6 +39,8 @@ struct SidebarView: View {
                         }
                         .buttonStyle(.borderless)
                     }
+                    .padding(.vertical, 6)
+                    .padding(.trailing, 4)
                     .contextMenu {
                         Button("Remove Project…") {
                             if Dialogs.confirmRemove(project) {
@@ -46,6 +52,7 @@ struct SidebarView: View {
             }
         }
         .listStyle(.sidebar)
+        .environment(\.defaultMinListRowHeight, 28)
         .safeAreaInset(edge: .bottom) {
             Button {
                 if let path = Dialogs.chooseProjectDirectory() {
@@ -55,7 +62,8 @@ struct SidebarView: View {
                 Text("Add Project…")
                     .frame(maxWidth: .infinity)
             }
-            .padding(8)
+            .controlSize(.large)
+            .padding(12)
         }
     }
 }

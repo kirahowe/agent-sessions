@@ -27,12 +27,16 @@ struct RootView: View {
                 TerminalHostView(store: store, center: center)
 
                 if store.selection == nil {
-                    VStack(spacing: 8) {
+                    VStack(spacing: 12) {
+                        Image(systemName: "terminal")
+                            .font(.system(size: 48))
+                            .foregroundStyle(.tertiary)
                         Text("Add a project to get started")
+                            .font(.title3)
                         Text("⌘T for a new session")
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
                     }
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
                 }
             }

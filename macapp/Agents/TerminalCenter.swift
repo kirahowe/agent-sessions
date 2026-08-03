@@ -43,6 +43,12 @@ final class TerminalCenter: SessionTerminating {
             // TERM=xterm-ghostty breaks ncurses apps (vim, htop, ...) in the
             // spawned shell.
             builder.withCustom("term", "xterm-256color")
+
+            // Terminal-content breathing room. Done via ghostty config
+            // rather than AppKit view nesting/insets around TerminalView,
+            // since ghostty already renders its own content padding.
+            builder.withCustom("window-padding-x", "10")
+            builder.withCustom("window-padding-y", "10")
         }
         view.controller = controller
 
