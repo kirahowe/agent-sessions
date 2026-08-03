@@ -386,4 +386,79 @@ final class AppStoreTests: XCTestCase {
         XCTAssertEqual(sessions.first?.id, "legacy-1")
         XCTAssertEqual(store.selection, "legacy-1")
     }
+
+    // MARK: - 17
+
+    func test17_orderedSessionsGroupsByProjectInSidebarOrderRegardlessOfInsertionInterleaving() {
+        let (store, _, _) = TestSupport.makeStore()
+        let pathA = "/tmp/proj-A"
+        let pathB = "/tmp/proj-B"
+        store.addProject(path: pathA) // A: Session 1
+        store.addProject(path: pathB) // B: Session 1
+        let projectA = store.projects.first(where: { $0.path == pathA })!
+        store.newSession(in: projectA) // A: Session 2, inserted into `sessions` after B1
+
+        let ordered = store.orderedSessions.map { ($0.projectPath, $0.name) }
+        XCTAssertEqual(ordered.map(\.0), [pathA, pathA, pathB])
+        XCTAssertEqual(ordered.map(\.1), ["Session 1", "Session 2", "Session 1"])
+    }
+
+    // MARK: - 18
+
+    func test18_selectNextAndPreviousWrapAndHandleNilSelection() {
+        let (store, _, _) = TestSupport.makeStore()
+        store.addProject(path: "/tmp/proj-A")
+        let project = store.projects.first!
+        store.newSession(in: project)
+        store.newSession(in: project)
+        let ordered = store.orderedSessions
+        XCTAssertEqual(ordered.count, 3)
+
+        store.selection = nil
+        store.selectNext()
+        XCTAssertEqual(store.selection, ordered[0].id, "nil selection -> next selects first")
+
+        store.selection = nil
+        store.selectPrevious()
+        XCTAssertEqual(store.selection, ordered[2].id, "nil selection -> previous selects last")
+
+        store.selection = ordered[2].id
+        store.selectNext()
+        XCTAssertEqual(store.selection, ordered[0].id, "next wraps last -> first")
+
+        store.selection = ordered[0].id
+        store.selectPrevious()
+        XCTAssertEqual(store.selection, ordered[2].id, "previous wraps first -> last")
+    }
+
+    // MARK: - 19
+
+    func test19_selectSessionAtIndexCrossesProjectBoundariesAndRejectsOutOfRange() {
+        let (store, _, _) = TestSupport.makeStore()
+        store.addProject(path: "/tmp/proj-A")
+        store.addProject(path: "/tmp/proj-B")
+        let ordered = store.orderedSessions
+        XCTAssertEqual(ordered.count, 2)
+
+        XCTAssertTrue(store.selectSession(at: 1))
+        XCTAssertEqual(store.selection, ordered[1].id)
+
+        XCTAssertFalse(store.selectSession(at: 5))
+        XCTAssertEqual(store.selection, ordered[1].id, "out-of-range is a no-op")
+    }
+
+    // MARK: - 20
+
+    func test20_navigationWithZeroSessionsIsNoOp() {
+        let (store, _, _) = TestSupport.makeStore()
+
+        store.selectNext()
+        XCTAssertNil(store.selection)
+
+        store.selectPrevious()
+        XCTAssertNil(store.selection)
+
+        XCTAssertFalse(store.selectSession(at: 0))
+        XCTAssertNil(store.selection)
+    }
 }

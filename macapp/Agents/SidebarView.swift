@@ -2,6 +2,7 @@ import SwiftUI
 
 struct SidebarView: View {
     @ObservedObject var store: AppStore
+    @Environment(\.appActions) private var actions
 
     var body: some View {
         List(selection: $store.selection) {
@@ -16,11 +17,18 @@ struct SidebarView: View {
                         .padding(.vertical, 5)
                         .tag(session.id)
                         .contextMenu {
+                            // Direct store/Dialogs call, not actions.perform: this
+                            // targets the specific right-clicked row, not the app's
+                            // global selection, so it isn't the same operation as
+                            // AppActions' selection-based cases.
                             Button("Rename…") {
                                 if let name = Dialogs.promptRename(currentName: session.name) {
                                     store.renameSession(session.id, to: name)
                                 }
                             }
+                            // Direct store call, not actions.perform: this closes the
+                            // specific right-clicked row, not the app's global
+                            // selection (see comment above).
                             Button("Close Session") {
                                 store.closeSession(session.id)
                             }
@@ -32,6 +40,9 @@ struct SidebarView: View {
                             .font(.subheadline)
                             .fontWeight(.semibold)
                         Spacer()
+                        // Direct store call, not actions.perform: this targets the
+                        // specific project this header belongs to, not the app's
+                        // global selection (see comment on the row context menu above).
                         Button {
                             store.newSession(in: project)
                         } label: {
@@ -42,6 +53,10 @@ struct SidebarView: View {
                     .padding(.vertical, 6)
                     .padding(.trailing, 4)
                     .contextMenu {
+                        // Direct store/Dialogs call, not actions.perform: this
+                        // targets the specific right-clicked project, not the
+                        // resolved-from-selection target AppActions' .removeProject
+                        // case would use (see design rationale in AppActions.swift).
                         Button("Remove Project…") {
                             if Dialogs.confirmRemove(project) {
                                 store.removeProject(project)
@@ -55,9 +70,7 @@ struct SidebarView: View {
         .environment(\.defaultMinListRowHeight, 28)
         .safeAreaInset(edge: .bottom) {
             Button {
-                if let path = Dialogs.chooseProjectDirectory() {
-                    store.addProject(path: path)
-                }
+                actions?.perform(.addProject)
             } label: {
                 Text("Add Project…")
                     .frame(maxWidth: .infinity)

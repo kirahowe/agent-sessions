@@ -120,6 +120,60 @@ final class AppStore: ObservableObject {
         save()
     }
 
+    // MARK: - Navigation
+
+    /// Sidebar display order: for each project in `projects` order, its
+    /// sessions in `sessions` array order. Mirrors exactly what SidebarView
+    /// renders — project A's sessions all before project B's, even when
+    /// insertion interleaved the two projects.
+    var orderedSessions: [SessionRow] {
+        projects.flatMap { project in
+            sessions.filter { $0.projectPath == project.path }
+        }
+    }
+
+    func selectNext() {
+        let ordered = orderedSessions
+        guard !ordered.isEmpty else { return }
+        guard let currentID = selection,
+              let index = ordered.firstIndex(where: { $0.id == currentID })
+        else {
+            selection = ordered.first?.id
+            save()
+            return
+        }
+        let nextIndex = ordered.index(after: index)
+        selection = nextIndex == ordered.endIndex ? ordered[ordered.startIndex].id : ordered[nextIndex].id
+        save()
+    }
+
+    func selectPrevious() {
+        let ordered = orderedSessions
+        guard !ordered.isEmpty else { return }
+        guard let currentID = selection,
+              let index = ordered.firstIndex(where: { $0.id == currentID })
+        else {
+            selection = ordered.last?.id
+            save()
+            return
+        }
+        if index == ordered.startIndex {
+            selection = ordered.last?.id
+        } else {
+            selection = ordered[ordered.index(before: index)].id
+        }
+        save()
+    }
+
+    @discardableResult
+    func selectSession(at index: Int) -> Bool {
+        let ordered = orderedSessions
+        guard ordered.indices.contains(index) else { return false }
+        selection = ordered[index].id
+        save()
+        return true
+    }
+
     // MARK: - Persistence
 
     private func load() {
