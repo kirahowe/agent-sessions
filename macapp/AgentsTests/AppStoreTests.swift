@@ -281,9 +281,10 @@ final class AppStoreTests: XCTestCase {
 
     // MARK: - 12
 
-    func test12_corruptStateFileStartsEmptyAndIsNotOverwritten() throws {
+    func test12_corruptStateFileStartsEmptyAndIsMovedAside() throws {
         let url = TestSupport.freshStateURL()
-        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let directory = url.deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let garbage = "not json at all {{{"
         try Data(garbage.utf8).write(to: url)
 
@@ -294,14 +295,69 @@ final class AppStoreTests: XCTestCase {
         XCTAssertTrue(store.sessions.isEmpty)
         XCTAssertNil(store.selection)
 
-        // A failed load must not delete or overwrite the unreadable file.
-        let contents = try String(contentsOf: url, encoding: .utf8)
-        XCTAssertEqual(contents, garbage)
+        // The garbage must no longer sit at stateURL...
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
+
+        // ...but must survive, untouched, as exactly one moved-aside sibling.
+        let siblings = try FileManager.default.contentsOfDirectory(atPath: directory.path)
+            .filter { $0.hasPrefix("state.json.corrupt-") }
+        XCTAssertEqual(siblings.count, 1, "expected exactly one corrupt-sibling, found: \(siblings)")
+        let corruptContents = try String(contentsOf: directory.appendingPathComponent(siblings[0]), encoding: .utf8)
+        XCTAssertEqual(corruptContents, garbage)
+    }
+
+    func test12b_mutationAfterCorruptLoadWritesFreshStateWithoutTouchingCorruptSibling() throws {
+        let url = TestSupport.freshStateURL()
+        let directory = url.deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let garbage = "not json at all {{{"
+        try Data(garbage.utf8).write(to: url)
+
+        let spy = SpyTerminals()
+        let store = AppStore(terminals: spy, stateURL: url)
+
+        // The clobber-protection contract: a mutation after a failed load
+        // must produce a fresh, valid state.json, and must never touch the
+        // preserved corrupt sibling.
+        store.addProject(path: "/tmp/proj-A")
+
+        XCTAssertTrue(FileManager.default.fileExists(atPath: url.path))
+        let raw = try String(contentsOf: url, encoding: .utf8)
+        XCTAssertTrue(raw.contains("\"version\":2"), "expected fresh save to be version 2: \(raw)")
+
+        let siblings = try FileManager.default.contentsOfDirectory(atPath: directory.path)
+            .filter { $0.hasPrefix("state.json.corrupt-") }
+        XCTAssertEqual(siblings.count, 1)
+        let corruptContents = try String(contentsOf: directory.appendingPathComponent(siblings[0]), encoding: .utf8)
+        XCTAssertEqual(corruptContents, garbage, "the original garbage must still be intact in the corrupt sibling")
+    }
+
+    func test12c_undecodableButValidJSONIsAlsoMovedAside() throws {
+        let url = TestSupport.freshStateURL()
+        let directory = url.deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        // Valid JSON, but "projects" doesn't decode as PersistedState expects
+        // — pins that a decode failure (not just unreadable bytes) also
+        // triggers move-aside protection.
+        let wrongShape = #"{"version":2,"projects":"nope"}"#
+        try Data(wrongShape.utf8).write(to: url)
+
+        let spy = SpyTerminals()
+        let store = AppStore(terminals: spy, stateURL: url)
+
+        XCTAssertTrue(store.projects.isEmpty)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
+
+        let siblings = try FileManager.default.contentsOfDirectory(atPath: directory.path)
+            .filter { $0.hasPrefix("state.json.corrupt-") }
+        XCTAssertEqual(siblings.count, 1)
+        let corruptContents = try String(contentsOf: directory.appendingPathComponent(siblings[0]), encoding: .utf8)
+        XCTAssertEqual(corruptContents, wrongShape)
     }
 
     // MARK: - 13
 
-    func test13_missingStateFileStartsEmpty() {
+    func test13_missingStateFileStartsEmpty() throws {
         let url = TestSupport.freshStateURL() // deliberately never created
         let spy = SpyTerminals()
 
@@ -310,6 +366,15 @@ final class AppStoreTests: XCTestCase {
         XCTAssertTrue(store.projects.isEmpty)
         XCTAssertTrue(store.sessions.isEmpty)
         XCTAssertNil(store.selection)
+
+        // A merely-missing file must not create any corrupt-sibling corpses.
+        store.addProject(path: "/tmp/proj-A")
+
+        let directory = url.deletingLastPathComponent()
+        XCTAssertTrue(FileManager.default.fileExists(atPath: url.path))
+        let siblings = try FileManager.default.contentsOfDirectory(atPath: directory.path)
+            .filter { $0.hasPrefix("state.json.corrupt-") }
+        XCTAssertTrue(siblings.isEmpty, "expected no corrupt siblings, found: \(siblings)")
     }
 
     // MARK: - 14

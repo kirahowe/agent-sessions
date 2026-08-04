@@ -25,6 +25,13 @@ final class AppStore: ObservableObject {
 
     private let stateURL: URL
 
+    /// Set when a corrupt state file exists but can't be moved aside (e.g.
+    /// the directory became unwritable). Overwriting the user's last good
+    /// state is the one unacceptable outcome, so when we can't secure the
+    /// old bytes first, we disable persistence for the rest of the session
+    /// rather than risk a save() clobbering them.
+    private var saveDisabled = false
+
     /// The app's real persisted-state location: ~/Library/Application
     /// Support/Agents/state.json.
     static let defaultStateURL: URL = {
@@ -351,10 +358,22 @@ final class AppStore: ObservableObject {
 
     // MARK: - Persistence
 
+    /// A file that plain doesn't exist yet (first launch, or the app's
+    /// Application Support directory was never created) is not corruption —
+    /// starting fresh there has no side effects to protect against. Only a
+    /// file that EXISTS but fails to read or decode is treated as data to
+    /// preserve, because every mutating store method calls save(): silently
+    /// starting empty in that case would mean the user's very next action
+    /// overwrites their last good state.json with nothing.
     private func load() {
+        guard FileManager.default.fileExists(atPath: stateURL.path) else { return }
+
         guard let data = try? Data(contentsOf: stateURL),
               let state = try? JSONDecoder().decode(PersistedState.self, from: data)
-        else { return }
+        else {
+            moveAsideCorruptStateFile()
+            return
+        }
 
         projects = state.projects.map { Project(path: $0) }
         sessions = state.sessions
@@ -362,7 +381,42 @@ final class AppStore: ObservableObject {
         selection = state.selection
     }
 
+    /// Renames an unreadable/undecodable state.json to a sibling file
+    /// instead of deleting or (via the next save()) overwriting it, so the
+    /// old bytes stay recoverable. The timestamp plus UUID suffix means two
+    /// failures in the same second can never collide on a name.
+    private func moveAsideCorruptStateFile() {
+        let directory = stateURL.deletingLastPathComponent()
+        let timestamp = Self.corruptStampFormatter.string(from: Date())
+        let uniqueSuffix = UUID().uuidString.prefix(8)
+        let corruptURL = directory.appendingPathComponent(
+            "\(stateURL.lastPathComponent).corrupt-\(timestamp)-\(uniqueSuffix)"
+        )
+
+        do {
+            try FileManager.default.moveItem(at: stateURL, to: corruptURL)
+            NSLog("Agents: state file at \(stateURL.path) was unreadable or undecodable; moved aside to \(corruptURL.path)")
+        } catch {
+            // Can't secure the old file, so refuse to write at all this
+            // session — see `saveDisabled`'s doc comment for why.
+            NSLog("Agents: failed to move aside corrupt state file at \(stateURL.path): \(error); persistence disabled for this session")
+            saveDisabled = true
+        }
+    }
+
+    private static let corruptStampFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyyMMdd-HHmmss"
+        return formatter
+    }()
+
     private func save() {
+        // See `saveDisabled`'s doc comment: a corrupt state file we couldn't
+        // move aside means the old bytes are still sitting at stateURL, so
+        // writing here would destroy them. Skip the write entirely.
+        guard !saveDisabled else { return }
+
         let state = PersistedState(
             version: 2,
             projects: projects.map(\.path),
