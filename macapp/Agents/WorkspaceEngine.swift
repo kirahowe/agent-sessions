@@ -24,6 +24,13 @@ enum EngineError: Error, Equatable {
 struct LandResult: Equatable {
     let commitID: String
     let bookmark: String
+    /// Non-nil when the land itself succeeded (jj already forgot the
+    /// workspace and advanced the bookmark) but the leftover workspace
+    /// directory couldn't be moved to the Bin. User-readable, meant to be
+    /// surfaced as a non-fatal notice rather than treated as a failed land.
+    /// Defaulted so every existing `LandResult(commitID:bookmark:)` call
+    /// site (including in tests) keeps compiling unchanged.
+    var cleanupWarning: String? = nil
 }
 
 @MainActor
@@ -125,7 +132,40 @@ final class WorkspaceEngineCLI: WorkspaceEngineProviding {
     /// `terminationHandler` (which fires on Process's own callback queue,
     /// not MainActor) can freely read its captured pipes and resume a
     /// continuation without any actor-isolation ceremony.
-    private static func runProcess(bb: String, scriptPath: String, args: [String]) async throws -> (stdout: String, stderr: String, exitCode: Int32) {
+    ///
+    /// Both pipes are drained CONCURRENTLY on background queues starting at
+    /// launch, not after termination: a child that writes more than the
+    /// pipe buffer (~64KB) before exiting would otherwise block forever in
+    /// write() because nobody is reading yet, while we sit waiting for an
+    /// exit that can't happen — a classic pipe deadlock. Three independent
+    /// completions (stdout drained, stderr drained, process terminated) are
+    /// fanned into one `DispatchGroup`, whose `notify` resumes the
+    /// continuation exactly once after all three have finished. `didResume`
+    /// + `resumeLock` exist only to make the launch-failure path safe: if
+    /// `process.run()` throws, `group.notify`'s eventual fan-in and the
+    /// catch block's own resume could otherwise race to resume twice.
+    ///
+    /// On the launch-failure path we also explicitly close both pipes'
+    /// write ends: if `process.run()` throws, the child never spawned, so
+    /// the write ends are still open only in this process. Left open, the
+    /// background reads above would block forever waiting for an EOF that
+    /// will never come — closing them unblocks `readDataToEndOfFile()`
+    /// immediately so `group.leave()` for those two reads still fires.
+    ///
+    /// `ResultBox` exists only because Swift 5's concurrency checker cannot
+    /// see the happens-before relationship `DispatchGroup` actually
+    /// provides (enter/leave/notify orders every write to these fields
+    /// strictly before the one read of them in `notify`'s closure); each
+    /// field is still written by exactly one single-owner closure, so no
+    /// locking is added beyond what the group already guarantees.
+    private final class ResultBox: @unchecked Sendable {
+        var stdoutData = Data()
+        var stderrData = Data()
+        var terminationStatus: Int32 = 0
+    }
+
+    // internal for @testable regression coverage
+    static func runProcess(bb: String, scriptPath: String, args: [String]) async throws -> (stdout: String, stderr: String, exitCode: Int32) {
         try await withCheckedThrowingContinuation { continuation in
             let process = Process()
             process.executableURL = URL(fileURLWithPath: bb)
@@ -136,18 +176,66 @@ final class WorkspaceEngineCLI: WorkspaceEngineProviding {
             process.standardOutput = stdoutPipe
             process.standardError = stderrPipe
 
+            let group = DispatchGroup()
+            let resumeLock = NSLock()
+            var didResume = false
+            func resumeOnce(_ body: () -> Void) {
+                resumeLock.lock()
+                defer { resumeLock.unlock() }
+                guard !didResume else { return }
+                didResume = true
+                body()
+            }
+
+            let box = ResultBox()
+
+            group.enter()
+            DispatchQueue.global().async {
+                box.stdoutData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
+                group.leave()
+            }
+
+            group.enter()
+            DispatchQueue.global().async {
+                box.stderrData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+                group.leave()
+            }
+
+            group.enter()
             process.terminationHandler = { finishedProcess in
-                let stdoutData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
-                let stderrData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
-                let stdout = String(data: stdoutData, encoding: .utf8) ?? ""
-                let stderr = String(data: stderrData, encoding: .utf8) ?? ""
-                continuation.resume(returning: (stdout, stderr, finishedProcess.terminationStatus))
+                box.terminationStatus = finishedProcess.terminationStatus
+                group.leave()
+            }
+
+            group.notify(queue: .global()) {
+                resumeOnce {
+                    let stdout = String(data: box.stdoutData, encoding: .utf8) ?? ""
+                    let stderr = String(data: box.stderrData, encoding: .utf8) ?? ""
+                    continuation.resume(returning: (stdout, stderr, box.terminationStatus))
+                }
             }
 
             do {
                 try process.run()
             } catch {
-                continuation.resume(throwing: EngineError.failed("failed to launch bb: \(error)"))
+                // The child never spawned — unblock the two background
+                // reads (they're waiting on an EOF only a spawned child's
+                // exit would produce) and let the terminationHandler's
+                // group.leave() go uncalled by leaving it here instead,
+                // since terminationHandler will never fire for a process
+                // that never ran.
+                //
+                // The throwing resume must come BEFORE the balancing
+                // group.leave(): once that leave zeroes the group, notify
+                // can fire on another queue and win the resumeOnce race,
+                // resuming with a bogus empty ("", "", 0) success instead
+                // of the launch error.
+                stdoutPipe.fileHandleForWriting.closeFile()
+                stderrPipe.fileHandleForWriting.closeFile()
+                resumeOnce {
+                    continuation.resume(throwing: EngineError.failed("failed to launch bb: \(error)"))
+                }
+                group.leave()
             }
         }
     }
@@ -209,6 +297,13 @@ final class WorkspaceEngineCLI: WorkspaceEngineProviding {
 
         let fm = FileManager.default
         guard fm.fileExists(atPath: workspace.path) else { return }
+        // Deliberately left to throw/propagate here, unlike landWorkspace's
+        // trashItem below: workspace-forget is idempotent and retryable, so
+        // AppStore's catch can safely leave the WorkspaceRow in place as a
+        // visible retry marker without stranding anything. landWorkspace's
+        // land is NOT retryable — the trunk bookmark already moved — so the
+        // same fatal treatment there would leave the app falsely believing
+        // the workspace still needs landing.
         try fm.trashItem(at: URL(fileURLWithPath: workspace.path), resultingItemURL: nil)
     }
 
@@ -225,11 +320,28 @@ final class WorkspaceEngineCLI: WorkspaceEngineProviding {
             throw EngineError.failed("agents-cli workspace-land returned ok with no landed payload")
         }
 
+        // By this point the CLI envelope has already reported success: jj
+        // has forgotten the workspace and advanced the bookmark server-side,
+        // irreversibly. A trash failure here is purely cosmetic (a leftover
+        // directory), so it must never turn a successful land into a thrown
+        // error — that would desync app state from reality (AppStore would
+        // treat the land as failed and keep sessions/rows around for a
+        // workspace jj no longer knows about). This is the deliberate
+        // ASYMMETRY with deleteWorkspace's trashItem above: forgetting a
+        // workspace is idempotent/retryable, so letting that one throw and
+        // leave a retry marker is safe; landing is not retryable, so the
+        // same treatment here would strand the app in a false "still needs
+        // landing" state.
         let fm = FileManager.default
+        var cleanupWarning: String? = nil
         if fm.fileExists(atPath: workspace.path) {
-            try fm.trashItem(at: URL(fileURLWithPath: workspace.path), resultingItemURL: nil)
+            do {
+                try fm.trashItem(at: URL(fileURLWithPath: workspace.path), resultingItemURL: nil)
+            } catch {
+                cleanupWarning = "Changes were kept, but the workspace folder couldn't be moved to the Bin — it's still at \(workspace.path)"
+            }
         }
 
-        return LandResult(commitID: payload.commit_id, bookmark: payload.bookmark)
+        return LandResult(commitID: payload.commit_id, bookmark: payload.bookmark, cleanupWarning: cleanupWarning)
     }
 }

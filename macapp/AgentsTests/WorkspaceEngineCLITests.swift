@@ -211,4 +211,25 @@ final class WorkspaceEngineCLITests: XCTestCase {
             XCTFail("expected EngineError, got \(error)")
         }
     }
+
+    // MARK: - runProcess deadlock regression
+
+    /// Regression test for the pipe-read deadlock: the old implementation
+    /// only started draining stdout/stderr in `terminationHandler`, AFTER
+    /// the process exited. A child writing more than the pipe buffer
+    /// (~64KB) before exiting would block forever in write() with nobody
+    /// reading yet, and the process would never exit to fire that handler —
+    /// a permanent hang. This needs no jj/bb, only `/bin/sh`, so it runs
+    /// unconditionally (no `requireTools()`/XCTSkip path) rather than being
+    /// soft-skipped in tool-less environments.
+    func test_runProcess_drainsOutputLargerThanPipeBufferWithoutDeadlocking() async throws {
+        let result = try await WorkspaceEngineCLI.runProcess(
+            bb: "/bin/sh",
+            scriptPath: "-c",
+            args: ["dd if=/dev/zero bs=1024 count=200 2>/dev/null | tr '\\0' 'x'"]
+        )
+
+        XCTAssertEqual(result.stdout.count, 204800, "200KB of output is comfortably past the ~64KB pipe buffer that deadlocked the old drain-after-exit implementation")
+        XCTAssertEqual(result.exitCode, 0)
+    }
 }

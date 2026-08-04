@@ -953,6 +953,7 @@ final class AppStoreTests: XCTestCase {
         XCTAssertTrue(store.sessions.filter { $0.target == .workspace(projectPath: pathA, name: "ws-a") }.isEmpty)
         XCTAssertFalse(store.workspaces.contains { $0.id == wsRow.id })
         XCTAssertNil(store.selection)
+        XCTAssertNil(store.lastError, "a nil cleanupWarning must leave lastError untouched")
 
         // The removal must persist across a fresh AppStore load from the
         // same stateURL, not just live in the in-memory store.
@@ -985,6 +986,40 @@ final class AppStoreTests: XCTestCase {
         XCTAssertTrue(landed)
         XCTAssertEqual(store.selection, rootSelection)
         XCTAssertTrue(store.workspaces.isEmpty)
+    }
+
+    /// The land itself succeeded (jj already forgot the workspace and
+    /// advanced the bookmark, irreversibly) even though the leftover
+    /// directory couldn't be trashed — so teardown must still fully happen,
+    /// and the warning must surface as a non-fatal lastError rather than
+    /// making landWorkspace look like it failed.
+    func test33c_landWorkspaceCleanupWarningSurfacesAsLastErrorButTeardownStillHappens() async {
+        let fake = FakeWorkspaceEngine()
+        let (store, spy, _) = TestSupport.makeStore(engine: fake)
+        let pathA = "/tmp/proj-A"
+        store.addProject(path: pathA)
+
+        let wsRow = WorkspaceRow(projectPath: pathA, name: "ws-a", path: "/tmp/workspaces/ws-a", label: nil)
+        fake.nextCreateResult = .success(wsRow)
+        await store.createWorkspace(in: pathA) // ws: Session 1, selected
+        store.newSession(in: .workspace(projectPath: pathA, name: "ws-a")) // ws: Session 2, selected
+
+        let wsSessionIDs = store.sessions
+            .filter { $0.target == .workspace(projectPath: pathA, name: "ws-a") }
+            .map(\.id)
+        XCTAssertEqual(wsSessionIDs.count, 2)
+        XCTAssertTrue(wsSessionIDs.contains(store.selection!))
+
+        fake.nextLandResult = .success(LandResult(commitID: "abc123", bookmark: "main", cleanupWarning: "some warning"))
+        let landed = await store.landWorkspace(wsRow.id, message: "Ship it")
+
+        XCTAssertTrue(landed)
+        XCTAssertEqual(spy.closedIDs.count, wsSessionIDs.count, "each session must be closed exactly once")
+        XCTAssertEqual(Set(spy.closedIDs), Set(wsSessionIDs))
+        XCTAssertTrue(store.sessions.filter { $0.target == .workspace(projectPath: pathA, name: "ws-a") }.isEmpty)
+        XCTAssertFalse(store.workspaces.contains { $0.id == wsRow.id })
+        XCTAssertNil(store.selection)
+        XCTAssertEqual(store.lastError, "some warning")
     }
 
     // MARK: - 34

@@ -154,8 +154,9 @@ final class AppStore: ObservableObject {
     func landWorkspace(_ id: WorkspaceRow.ID, message: String, createTrunk: String? = nil) async -> Bool {
         guard let workspace = workspaces.first(where: { $0.id == id }) else { return false }
 
+        let result: LandResult
         do {
-            _ = try await engine.landWorkspace(workspace, message: message, createTrunk: createTrunk)
+            result = try await engine.landWorkspace(workspace, message: message, createTrunk: createTrunk)
         } catch EngineError.noTrunk {
             // Not surfaced via lastError: the UI offers to create the trunk
             // bookmark and retry, so this isn't a dead-end the user just
@@ -181,6 +182,17 @@ final class AppStore: ObservableObject {
             self.selection = nil
         }
         save()
+
+        // The land itself already succeeded by this point (sessions/rows
+        // torn down above) — a cleanupWarning is a non-fatal notice about
+        // the leftover directory, not a failure of the land, but it still
+        // needs to reach the user. Deliberately rides the existing
+        // lastError alert UI (RootView.swift's "Workspace Error" alert is
+        // already bound to store.lastError) rather than adding new UI for
+        // what's a rare, low-stakes cosmetic case.
+        if let cleanupWarning = result.cleanupWarning {
+            lastError = cleanupWarning
+        }
         return true
     }
 
