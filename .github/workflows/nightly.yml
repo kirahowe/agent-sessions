@@ -59,6 +59,33 @@ jobs:
             macapp/.build/Build/Products/Release/Agents.app \
             "Agents-nightly-b${BUILD}.zip"
 
+      - name: Generate signed appcast
+        if: steps.guard.outputs.changed == 'true'
+        # Sparkle's command-line tools ship as their own release asset,
+        # separate from the SPM package the app depends on — keep this
+        # version in lockstep with project.yml's Sparkle `exactVersion`.
+        run: |
+          curl -fsSL -o sparkle-tools.tar.xz \
+            https://github.com/sparkle-project/Sparkle/releases/download/2.9.5/Sparkle-2.9.5.tar.xz
+          mkdir -p sparkle-tools
+          tar -xf sparkle-tools.tar.xz -C sparkle-tools
+
+          # Restrictive umask so the key file is never group/world readable
+          # on the runner, however briefly it exists.
+          umask 077
+          printf '%s' "${{ secrets.SPARKLE_ED_PRIVATE_KEY }}" > ed_key
+
+          # generate_appcast scans a directory of archives, not a single
+          # file, so the built zip goes into its own directory first.
+          mkdir -p appcast-dir
+          cp "Agents-nightly-b${BUILD}.zip" appcast-dir/
+          sparkle-tools/bin/generate_appcast \
+            --ed-key-file ed_key \
+            --download-url-prefix "https://github.com/kirahowe/agent-sessions/releases/download/nightly/" \
+            appcast-dir
+
+          rm -f ed_key
+
       - name: Publish rolling nightly release
         if: steps.guard.outputs.changed == 'true'
         # One rolling "nightly" tag/prerelease, recreated each run, so there
@@ -80,7 +107,7 @@ jobs:
             echo "Requires bb and jj for workspace features (the app guides you)."
           } > notes.md
           gh release delete nightly --yes --cleanup-tag 2>/dev/null || true
-          gh release create nightly "Agents-nightly-b${BUILD}.zip" \
+          gh release create nightly "Agents-nightly-b${BUILD}.zip" appcast-dir/appcast.xml \
             --prerelease \
             --target "$GITHUB_SHA" \
             --title "Agents nightly b${BUILD}" \

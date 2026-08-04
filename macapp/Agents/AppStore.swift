@@ -32,15 +32,36 @@ final class AppStore: ObservableObject {
     /// rather than risk a save() clobbering them.
     private var saveDisabled = false
 
+    /// Dev and nightly/release builds must never share one state.json: they
+    /// run side by side (different bundle identifiers, different app
+    /// instances), and last-writer-wins would mean whichever one saves last
+    /// clobbers the other's session/workspace list. Keyed off
+    /// `Bundle.main.bundleIdentifier` rather than a build-config check so
+    /// this stays correct even if something other than Xcode's Debug/Release
+    /// distinction ends up driving identity later.
+    ///
+    /// Migration note: this is a one-way split, not a rename. The existing
+    /// "Agents" state directory (and everyone's real state.json in it)
+    /// becomes the release/nightly app's state, unchanged, because
+    /// com.kirahowe.agents (release) still maps to "Agents" here. The dev
+    /// build (com.kirahowe.agents.dev) gets a brand-new "Agents Dev"
+    /// directory and starts fresh — there is nothing to migrate for it, it
+    /// never had persisted state of its own before this split existed.
+    static func stateDirectoryName(forBundleIdentifier id: String?) -> String {
+        id == "com.kirahowe.agents.dev" ? "Agents Dev" : "Agents"
+    }
+
     /// The app's real persisted-state location: ~/Library/Application
-    /// Support/Agents/state.json.
+    /// Support/Agents/state.json (or "Agents Dev" for the dev-identity
+    /// build — see `stateDirectoryName(forBundleIdentifier:)`).
     static let defaultStateURL: URL = {
         let appSupport = FileManager.default.urls(
             for: .applicationSupportDirectory,
             in: .userDomainMask
         )[0]
+        let directoryName = stateDirectoryName(forBundleIdentifier: Bundle.main.bundleIdentifier)
         return appSupport
-            .appendingPathComponent("Agents", isDirectory: true)
+            .appendingPathComponent(directoryName, isDirectory: true)
             .appendingPathComponent("state.json")
     }()
 

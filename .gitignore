@@ -1,5 +1,6 @@
 macapp/Agents.xcodeproj/
 macapp/.build/
+macapp/Info-Agents.plist
 .DS_Store
 xcuserdata/
 .lsp/

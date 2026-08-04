@@ -1,4 +1,5 @@
 import AppKit
+import Sparkle
 import SwiftUI
 
 /// Tiny UI-only state that doesn't belong in AppStore's persisted model —
@@ -26,6 +27,8 @@ struct AgentsApp: App {
     let actions: AppActions
     let router: ShortcutRouter
     let uiState: UIState
+    let updaterEnabled: Bool
+    let updaterController: SPUStandardUpdaterController
     @StateObject private var store: AppStore
 
     init() {
@@ -47,6 +50,18 @@ struct AgentsApp: App {
         // construction. (If a real launch shows this is flaky, move the
         // install() call into RootView's .task instead and note why here.)
         router.install()
+
+        // The dev build (com.kirahowe.agents.dev) never starts the updater
+        // at all — this bundle-identifier check is the ONLY place that
+        // happens, so a dev build can never phone home or attempt a
+        // self-update against the release app's identity/state.
+        let updaterEnabled = Bundle.main.bundleIdentifier == "com.kirahowe.agents"
+        self.updaterEnabled = updaterEnabled
+        self.updaterController = SPUStandardUpdaterController(
+            startingUpdater: updaterEnabled,
+            updaterDelegate: nil,
+            userDriverDelegate: nil
+        )
     }
 
     /// Whether `store.selection` currently points at a session whose target
@@ -76,6 +91,20 @@ struct AgentsApp: App {
                 .environment(\.appActions, actions)
         }
         .commands {
+            // Deliberately does NOT route through AppActions/Keymap the way
+            // the other menu items in this file do: Sparkle owns its own
+            // update-checking UI and flow end-to-end, and this touches
+            // neither `store` nor `uiState`. It's menu-only, exactly like
+            // "Remove Project…" above is menu-only — no .keymapShortcut call
+            // either, for the same reason: this isn't a shortcut-table
+            // action.
+            CommandGroup(after: .appInfo) {
+                Button("Check for Updates…") {
+                    updaterController.checkForUpdates(nil)
+                }
+                .disabled(!updaterEnabled)
+            }
+
             // Replaces (rather than extends) the system File > New Window
             // group: New Window (⌘N) makes no sense for this app, and ⌘N is
             // repurposed below for New Workspace.
