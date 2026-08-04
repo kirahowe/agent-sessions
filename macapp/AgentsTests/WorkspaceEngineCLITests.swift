@@ -19,6 +19,17 @@ final class WorkspaceEngineCLITests: XCTestCase {
 
     // MARK: - Tool location (skip-soft if bb/jj aren't installed)
 
+    /// Custom error thrown when a required tool is missing in CI mode.
+    /// Skip locally for convenience, but CI must fail hard to catch
+    /// misconfigured environments before they mask integration failures.
+    private struct MissingToolError: Error, CustomStringConvertible {
+        let toolName: String
+
+        var description: String {
+            "\(toolName) not installed, but AGENTS_REQUIRE_TOOLS=1 — install it on CI instead of silently skipping the Swift↔CLI integration coverage"
+        }
+    }
+
     /// Resolves an executable's absolute path by checking common Homebrew
     /// locations first, then falling back to `which` via `/usr/bin/env` --
     /// mirrors WorkspaceEngineCLI's own bb-resolution strategy closely
@@ -54,12 +65,31 @@ final class WorkspaceEngineCLITests: XCTestCase {
         resolveTool(named: "bb", candidates: ["/opt/homebrew/bin/bb", "/usr/local/bin/bb"])
     }
 
+    /// Throws XCTSkip or MissingToolError depending on environment.
+    /// When AGENTS_REQUIRE_TOOLS="1", throws MissingToolError so CI fails hard.
+    /// Otherwise, throws XCTSkip for developer convenience.
+    private func missingToolThrow(_ toolName: String) throws -> Never {
+        if ProcessInfo.processInfo.environment["AGENTS_REQUIRE_TOOLS"] == "1" {
+            throw MissingToolError(toolName: toolName)
+        } else {
+            throw XCTSkip("\(toolName) not installed")
+        }
+    }
+
     /// Call at the top of every test: fails soft (XCTSkip) rather than hard
     /// in environments without jj/bb installed, since this suite's whole
     /// point is exercising the real subprocess seam.
+    ///
+    /// Two modes:
+    /// - **Developer (default)**: Missing tools throw XCTSkip, soft-skipping the test.
+    ///   Convenient for local development without a full environment.
+    /// - **CI (AGENTS_REQUIRE_TOOLS=1)**: Missing tools throw MissingToolError,
+    ///   a hard failure. CI must never silently skip — this suite is the only
+    ///   integration coverage of the Swift↔CLI seam. A missing tool on CI is
+    ///   a configuration problem, not a reason to hide it.
     private func requireTools() throws -> (jj: String, bb: String) {
-        guard let jj = Self.resolveJJPath() else { throw XCTSkip("jj not installed") }
-        guard let bb = Self.resolveBBPath() else { throw XCTSkip("bb not installed") }
+        guard let jj = Self.resolveJJPath() else { try missingToolThrow("jj") }
+        guard let bb = Self.resolveBBPath() else { try missingToolThrow("bb") }
         Self.ensurePathIncludesToolDirectories(jj: jj, bb: bb)
         return (jj, bb)
     }
