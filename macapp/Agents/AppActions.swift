@@ -8,10 +8,12 @@ import SwiftUI
 final class AppActions {
     let store: AppStore
     let uiState: UIState
+    private let dialogs: any DialogPresenting
 
-    init(store: AppStore, uiState: UIState) {
+    init(store: AppStore, uiState: UIState, dialogs: any DialogPresenting = LiveDialogPresenter()) {
         self.store = store
         self.uiState = uiState
+        self.dialogs = dialogs
     }
 
     @discardableResult
@@ -35,7 +37,7 @@ final class AppActions {
         case .addProject:
             // Cancel still counts as handled — the shortcut did its job by
             // opening the panel.
-            if let path = Dialogs.chooseProjectDirectory() {
+            if let path = dialogs.chooseProjectDirectory() {
                 store.addProject(path: path)
             }
             return true
@@ -46,7 +48,7 @@ final class AppActions {
             // Once a project is resolved we opened the confirm dialog, so
             // the shortcut/menu-item did its job regardless of the user's
             // choice (same "cancel still counts as handled" reasoning as addProject).
-            if Dialogs.confirmRemove(project) {
+            if dialogs.confirmRemove(project) {
                 store.removeProject(project)
             }
             return true
@@ -78,7 +80,7 @@ final class AppActions {
             // Once a workspace is resolved we opened the confirm dialog, so
             // the shortcut/menu-item did its job regardless of the user's
             // choice (same "cancel still counts as handled" reasoning as addProject/removeProject).
-            if Dialogs.confirmDeleteWorkspace(workspace) {
+            if dialogs.confirmDeleteWorkspace(workspace) {
                 Task { await store.deleteWorkspace(workspace.id) }
             }
             return true
@@ -92,7 +94,7 @@ final class AppActions {
             // Cancel still counts as handled, same reasoning as
             // .deleteWorkspace above: once a workspace is resolved we opened
             // the prompt, so the menu item did its job regardless of choice.
-            if let message = Dialogs.promptLandMessage(workspace: workspace) {
+            if let message = dialogs.promptLandMessage(workspace: workspace) {
                 Task { await store.landWorkspace(workspace.id, message: message) }
             }
             return true

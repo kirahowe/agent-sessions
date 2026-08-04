@@ -12,9 +12,11 @@ import AppKit
 final class ShortcutRouter {
     private var monitor: Any?
     private let perform: (AppAction) -> Bool
+    private let isModalActive: () -> Bool
 
-    init(perform: @escaping (AppAction) -> Bool) {
+    init(perform: @escaping (AppAction) -> Bool, isModalActive: @escaping () -> Bool = { NSApp.modalWindow != nil }) {
         self.perform = perform
+        self.isModalActive = isModalActive
     }
 
     func install() {
@@ -30,9 +32,12 @@ final class ShortcutRouter {
         }
     }
 
-    private func handle(_ event: NSEvent) -> NSEvent? {
+    // Internal (not private) so AgentsTests can exercise the consume/pass-
+    // through decision directly via @testable import, without needing a
+    // real global NSEvent monitor or real NSApp modal state.
+    func handle(_ event: NSEvent) -> NSEvent? {
         // Alerts/open panels own the keyboard while modal.
-        if NSApp.modalWindow != nil {
+        if isModalActive() {
             return event
         }
         // Cheap fast-path: every shortcut in Keymap is ⌘-based, so plain
