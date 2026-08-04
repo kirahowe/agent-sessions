@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: macos-15
+    timeout-minutes: 30
+    env:
+      # The CLI suite drives real jj repos; identity via env keeps jj from
+      # warning/embedding "(no email configured)" in test commits.
+      JJ_USER: ci
+      JJ_EMAIL: ci@invalid.example
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tools
+        # macos-15 runners are arm64, so brew lands these in
+        # /opt/homebrew/bin — the first fallback candidate every resolver
+        # in this repo (Swift and CLI alike) already checks.
+        run: brew install xcodegen borkdude/brew/babashka jj
+
+      - name: CLI behavioral tests
+        run: bb cli-test
+
+      - name: App tests
+        # AGENTS_REQUIRE_TOOLS turns WorkspaceEngineCLITests' XCTSkips into
+        # hard failures: on CI a missing tool is a configuration bug, and a
+        # skip would silently drop the only Swift<->CLI integration
+        # coverage. Set twice because xcodebuild's test host does not
+        # reliably inherit the shell environment — the TEST_RUNNER_ prefix
+        # is xcodebuild's supported channel for injecting env vars into the
+        # test process (prefix stripped on delivery).
+        env:
+          AGENTS_REQUIRE_TOOLS: "1"
+          TEST_RUNNER_AGENTS_REQUIRE_TOOLS: "1"
+        run: bb test
