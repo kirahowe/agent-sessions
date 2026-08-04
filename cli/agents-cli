@@ -41,7 +41,8 @@
 ;; top-level handler in -main turns that into the error envelope. `code`
 ;; must always be one of the five contract codes.
 
-(def error-codes #{"not-a-jj-repo" "dest-exists" "name-conflict" "bad-args" "jj-failed"})
+(def error-codes #{"not-a-jj-repo" "dest-exists" "name-conflict" "bad-args" "jj-failed"
+                    "no-trunk" "land-conflict" "nothing-to-land"})
 
 (defn cli-error [code message]
   (assert (contains? error-codes code) (str "internal: unknown error code " code))
@@ -65,6 +66,16 @@
 
 (defn jj-failed! [err]
   (cli-error "jj-failed" (str "jj command failed: " (stderr-tail err))))
+
+(defn run-jj-in
+  "Like run-jj, but the jj process's CWD is `dir` instead of relying on -R.
+   For workspace-land: cwd (not -R) is what selects which workspace's `@` a
+   command like rebase/squash/bookmark set/op restore operates on -- this is
+   the load-bearing safety property that keeps this command from ever
+   touching the default workspace's working copy."
+  [dir args]
+  (let [result @(p/process (into ["jj"] args) {:dir dir :out :string :err :string})]
+    {:exit (:exit result) :out (:out result) :err (:err result)}))
 
 ;; -----------------------------------------------------------------------
 ;; Path/name conventions shared by every subcommand. The destination for a
@@ -218,17 +229,168 @@
                         agents-names)}))
 
 ;; -----------------------------------------------------------------------
+;; workspace-land
+;;
+;; "Land" squashes the workspace's entire net change -- its committed chain
+;; of `jj commit`s AND any currently-uncommitted working-copy edit (jj's
+;; working copy is itself a commit, so no special-casing is needed) -- into
+;; ONE commit on top of the trunk bookmark, advances the bookmark to it, and
+;; forgets the workspace (directory stays on disk, same non-destructive
+;; convention as workspace-forget). On any conflict or unexpected jj failure
+;; partway through, every bit of prior state (trunk position, workspace
+;; registration, the workspace's commit chain, its directory) is restored via
+;; `jj op restore` -- nothing partially mutated is ever left behind.
+;;
+;; CWD (not -R) is what selects which workspace's `@` a jj command targets,
+;; so every jj call below that needs to act on the WORKSPACE's own `@` runs
+;; via run-jj-in on the workspace's dest dir. The ONE exception is the final
+;; `workspace forget`, which runs from OUTSIDE the workspace dir (ordinary
+;; run-jj + -R project, exactly like cmd-workspace-forget) since forgetting
+;; while it's the cwd is asking for trouble and it's a repo-level op anyway.
+;; This cwd discipline is the load-bearing property that keeps the DEFAULT
+;; workspace's own working copy from ever being touched by this command.
+
+(defn jj!
+  "run-jj-in, but throws jj-failed! on nonzero exit. Used throughout
+   workspace-land wherever a jj call must succeed or the whole command
+   aborts (and, on the mutating steps, triggers a rollback -- see below)."
+  [dir args]
+  (let [{:keys [exit err] :as result} (run-jj-in dir args)]
+    (when-not (zero? exit) (jj-failed! err))
+    result))
+
+(defn jj-line!
+  "jj!, returning trimmed single-line stdout -- for the -T template calls
+   that capture a single commit id / operation id."
+  [dir args]
+  (str/trim (:out (jj! dir args))))
+
+(def commit-id-template "commit_id ++ \"\\n\"")
+(def op-id-template "id.short() ++ \"\\n\"")
+
+(defn list-bookmark-names
+  "Local bookmark names (`jj bookmark list`, no -a -- this deliberately
+   excludes remote-tracking pseudo-entries like @git), using the same
+   'split each line on the first :' idiom as list-workspace-names."
+  [dir]
+  (let [{:keys [out]} (jj! dir ["--no-pager" "bookmark" "list"])]
+    (->> (str/split-lines out)
+         (remove str/blank?)
+         (map (fn [line]
+                (let [idx (str/index-of line ":")]
+                  (if idx (subs line 0 idx) line)))))))
+
+(defn find-trunk
+  "The first of main/master/trunk that exists as a LOCAL bookmark in
+   ws-dir, in that priority order, or nil if none do."
+  [ws-dir]
+  (let [names (set (list-bookmark-names ws-dir))]
+    (first (filter names ["main" "master" "trunk"]))))
+
+(defn cmd-workspace-land [flags]
+  (require-flags! flags :project :name :message)
+  (let [project (str (fs/absolutize (:project flags)))
+        name (:name flags)
+        message (:message flags)
+        create-trunk (:create-trunk flags)
+        full-name (jj-name name)]
+    (assert-jj-repo! project)
+    ;; Step 0: fail fast if the workspace isn't registered, rather than
+    ;; letting some later jj command fail organically inside ws-dir.
+    (when-not (contains? (set (list-workspace-names project)) full-name)
+      (cli-error "jj-failed" (str "workspace not registered: " full-name)))
+    (let [ws-dir (dest-path project name)
+          trunk (find-trunk ws-dir)]
+      (when (and (not trunk) (str/blank? create-trunk))
+        (cli-error "no-trunk"
+                   (str "No trunk bookmark found (looked for main, master, trunk). "
+                        "Pass --create-trunk <name> to have the app create one.")))
+      (let [bookmark-name (or trunk create-trunk)
+            ;; Step 1: merge-base of trunk (or, in the --create-trunk case,
+            ;; the default workspace) vs @. Needed for the nothing-to-land
+            ;; check, and -- only in the --create-trunk branch, which has no
+            ;; named trunk to rebase onto -- as the base of the squash/
+            ;; conflict-check revsets too.
+            base (jj-line! ws-dir
+                            ["--no-pager" "log" "--no-graph" "-r"
+                             (if trunk
+                               (str "heads(::" trunk " & ::@)")
+                               "heads(::@ & ::default@)")
+                             "-T" commit-id-template])
+            diff-out (:out (jj! ws-dir ["--no-pager" "diff" "--from" base "--to" "@"]))]
+        ;; Step 2: nothing-to-land check, still entirely read-only.
+        (when (str/blank? diff-out)
+          (cli-error "nothing-to-land"
+                     (str "Nothing to land: " name " has no content changes since it diverged.")))
+        ;; Step 3: capture the operation id -- the rollback point for
+        ;; everything from here on.
+        (let [opid (jj-line! ws-dir ["--no-pager" "op" "log" "--no-graph" "-n" "1" "-T" op-id-template])
+              commit-id
+              (try
+                ;; Step 3.5: rebase the workspace's chain onto trunk. Only
+                ;; when an existing trunk was found; always safe to run even
+                ;; if @ is already directly on top of it (jj no-ops).
+                (when trunk
+                  (jj! ws-dir ["--no-pager" "rebase" "-s" (str "roots(" trunk "..@)") "-d" trunk]))
+                ;; Step 4: conflict check.
+                (let [conflict-revset (if trunk
+                                        (str "(" trunk "..@) & conflicts()")
+                                        (str "(" base "..@) & conflicts()"))
+                      conflicts (:out (jj! ws-dir ["--no-pager" "log" "--no-graph" "-r" conflict-revset
+                                                    "-T" commit-id-template]))]
+                  (when-not (str/blank? conflicts)
+                    (cli-error "land-conflict"
+                               (str "Landing conflicts with " bookmark-name
+                                    "; rolled back — trunk and workspace are unchanged. "
+                                    "Resolve the conflict and try again."))))
+                ;; Step 5: squash the whole chain into one commit. -m is
+                ;; passed directly on the squash (5a); an unconditional
+                ;; describe (5b) always follows, since squash silently drops
+                ;; -m when --from/--into resolve to the same single commit
+                ;; (a one-revision chain) -- 5b is what actually sets the
+                ;; message in that case, and is a harmless no-op otherwise.
+                (let [from-revset (if trunk (str trunk "..@") (str base "..@"))]
+                  (jj! ws-dir ["--no-pager" "squash" "--from" from-revset "--into" "@" "-m" message])
+                  (jj! ws-dir ["--no-pager" "describe" "-r" "@" "-m" message]))
+                ;; Step 6 (must follow 5b -- describing rewrites the commit
+                ;; id) then step 7: advance/create the trunk bookmark.
+                (let [cid (jj-line! ws-dir ["--no-pager" "log" "--no-graph" "-r" "@" "-T" commit-id-template])]
+                  (if trunk
+                    (jj! ws-dir ["--no-pager" "bookmark" "set" trunk "-r" "@"])
+                    (jj! ws-dir ["--no-pager" "bookmark" "create" create-trunk "-r" "@"]))
+                  cid)
+                (catch Throwable t
+                  ;; Best-effort rollback: restore, then rethrow the
+                  ;; ORIGINAL exception unchanged so -main reports the
+                  ;; correct error code/message regardless of whether the
+                  ;; restore itself succeeds.
+                  (try (run-jj-in ws-dir ["--no-pager" "op" "restore" opid])
+                       (catch Throwable _ nil))
+                  (throw t)))]
+          ;; Step 8: forget the workspace. Deliberately OUTSIDE ws-dir (-R
+          ;; project via ordinary run-jj), same as cmd-workspace-forget --
+          ;; this is a repo-level op and running it with ws-dir as cwd risks
+          ;; forgetting the very workspace jj thinks it's standing in.
+          (let [{:keys [exit err]} (run-jj ["--no-pager" "-R" project "workspace" "forget" full-name])]
+            (when-not (zero? exit) (jj-failed! err)))
+          {:ok true
+           :landed {:commit_id commit-id
+                    :bookmark bookmark-name
+                    :workspace name}})))))
+
+;; -----------------------------------------------------------------------
 ;; Dispatch + top-level error handling.
 
 (defn dispatch [args]
   (let [[subcmd & rest-args] args]
     (when (str/blank? subcmd)
-      (cli-error "bad-args" "Missing subcommand. Expected one of: workspace-add, workspace-forget, workspace-list."))
+      (cli-error "bad-args" "Missing subcommand. Expected one of: workspace-add, workspace-forget, workspace-list, workspace-land."))
     (let [flags (parse-flags rest-args)]
       (case subcmd
         "workspace-add"    (cmd-workspace-add flags)
         "workspace-forget" (cmd-workspace-forget flags)
         "workspace-list"   (cmd-workspace-list flags)
+        "workspace-land"   (cmd-workspace-land flags)
         (cli-error "bad-args" (str "Unknown subcommand: " subcmd))))))
 
 (defn emit! [m]

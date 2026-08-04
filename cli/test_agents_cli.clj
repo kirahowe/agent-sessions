@@ -84,10 +84,70 @@
         (throw (ex-info "test setup: git init failed" init))))
     {:root root :project project}))
 
+(defn fresh-jj-project-on-main!
+  "Like fresh-jj-project!, but the seed file is PROPERLY COMMITTED (via
+   `jj commit -m \"seed\"`, not just `jj st`) and a `main` bookmark is
+   created at that seed commit.
+
+   This is required for workspace-land tests that add workspaces via the
+   CLI (`run-cli \"workspace-add\" ...`): `jj workspace add` (no -r) forks
+   the new workspace from the SAME PARENT(S) as the current workspace's @,
+   not from wherever a bookmark points. If the default workspace's own @
+   were still an undescribed snapshot sitting on the root commit (as in
+   fresh-jj-project!), a workspace added from it would fork from the ROOT,
+   completely empty, with `main` (if created at that snapshot) pointing
+   somewhere the new workspace never descends from. Finalizing the seed via
+   `jj commit` first -- which also advances the default workspace's own @ to
+   a fresh empty commit on top -- and creating `main` at the now-finalized
+   seed commit (@-) means workspace-add forks correctly from `main`."
+  []
+  (let [root (str (fs/create-temp-dir))
+        project (str (fs/path root "project"))
+        init (sh "jj" "--quiet" "git" "init" project)]
+    (when-not (zero? (:exit init))
+      (throw (ex-info "test setup: jj git init failed" init)))
+    (spit (str (fs/path project "seed.txt")) "seed\n")
+    (let [commit (sh "jj" "-R" project "commit" "-m" "seed")]
+      (when-not (zero? (:exit commit))
+        (throw (ex-info "test setup: jj commit (seed) failed" commit))))
+    (let [bookmark (sh "jj" "-R" project "bookmark" "create" "main" "-r" "@-")]
+      (when-not (zero? (:exit bookmark))
+        (throw (ex-info "test setup: jj bookmark create main failed" bookmark))))
+    {:root root :project project}))
+
 (defn direct-jj-workspace-list
   "Ground truth: run `jj workspace list` directly (not through the CLI)."
   [project]
   (:out (sh "jj" "--no-pager" "-R" project "workspace" "list")))
+
+;; commit_id / change_id templates for the ground-truth log/id helpers below
+;; -- same escaping idiom the CLI itself uses for -T arguments.
+(def commit-id-tpl "commit_id ++ \"\\n\"")
+(def change-id-tpl "change_id ++ \"\\n\"")
+
+(defn direct-jj-log
+  "Ground truth: `jj log --no-graph -r revset -T template`, run directly
+   (never through the CLI) against `dir` via -R. `dir` may be a project
+   root OR a specific workspace's own directory -- jj resolves -R to that
+   directory's own workspace context (same as run-jj-in's cwd trick in the
+   CLI itself), so revsets like \"@\" or \"default@\"/\"<jj-name>@\" resolve
+   correctly either way. Trims trailing whitespace."
+  [dir revset template]
+  (str/trim (:out (sh "jj" "--no-pager" "-R" dir "log" "--no-graph" "-r" revset "-T" template))))
+
+(defn direct-jj-file-show
+  "Ground truth: raw contents of `path` at `revset`, via `jj file show`, run
+   directly against `dir` via -R. `path` is wrapped in a `root:\"...\"`
+   fileset pattern -- plain relative paths are resolved against CWD (not
+   the repo root), which fails whenever `dir` isn't also the process's CWD
+   (e.g. any -R call from outside the repo, as all of these are)."
+  [dir revset path]
+  (:out (sh "jj" "--no-pager" "-R" dir "file" "show" "-r" revset (str "root:\"" path "\""))))
+
+(defn direct-jj-bookmark-list
+  "Ground truth: run `jj bookmark list` directly (not through the CLI)."
+  [dir]
+  (:out (sh "jj" "--no-pager" "-R" dir "bookmark" "list")))
 
 ;; -----------------------------------------------------------------------
 ;; 1. workspace-add with explicit --name
@@ -255,6 +315,247 @@
       (is (= 1 exit))
       (is (false? (:ok json)))
       (is (= "bad-args" (get-in json [:error :code]))))))
+
+;; -----------------------------------------------------------------------
+;; 10. workspace-land: happy path, existing main
+
+(deftest workspace-land-happy-path-main-test
+  (testing "landing a single uncommitted edit onto an existing main bookmark"
+    (let [{:keys [root project]} (fresh-jj-project-on-main!)]
+      (try
+        (let [add (run-cli "workspace-add" "--project" project "--name" "foo")
+              ws-dir (get-in add [:json :workspace :path])
+              default-before (direct-jj-log project "default@" change-id-tpl)
+              main-before (direct-jj-log project "main" commit-id-tpl)]
+          (is (true? (get-in add [:json :ok])) "sanity: workspace-add succeeded")
+          ;; Establish ground truth of the uncommitted edit before landing,
+          ;; by snapshotting it directly (mirrors how a real workspace
+          ;; accumulates uncommitted edits).
+          (spit (str (fs/path ws-dir "edit.txt")) "EDIT_CONTENT\n")
+          (is (zero? (:exit (sh "jj" "-R" ws-dir "st")))
+              "sanity: direct snapshot of the uncommitted edit succeeded")
+          (let [{:keys [exit json]} (run-cli "workspace-land" "--project" project "--name" "foo"
+                                              "--message" "landed msg")]
+            (is (= 0 exit))
+            (is (true? (:ok json)))
+            (let [landed (:landed json)]
+              (is (= "main" (:bookmark landed)))
+              (is (= "foo" (:workspace landed)))
+              (is (re-matches #"[0-9a-f]{40}" (:commit_id landed))
+                  "commit_id should be a full 40-char hex commit id")
+              (is (= (:commit_id landed) (direct-jj-log project "main" commit-id-tpl))
+                  "envelope commit_id should match what main points at directly"))
+            (is (= main-before (direct-jj-log project "main-" commit-id-tpl))
+                "the landed commit should be descended directly from the OLD main")
+            (is (str/includes? (direct-jj-log project "main" "description") "landed msg")
+                "landed commit should carry the given message")
+            (is (= "EDIT_CONTENT\n" (direct-jj-file-show project "main" "edit.txt"))
+                "landed commit's tree should contain the edited file's content"))
+          (is (not (str/includes? (direct-jj-workspace-list project) "agents/foo"))
+              "jj workspace list (direct) should no longer show the forgotten workspace")
+          (is (fs/exists? ws-dir) "the workspace directory should still exist on disk")
+          (is (= default-before (direct-jj-log project "default@" change-id-tpl))
+              "THE INVARIANT: default workspace's own @ change id must be untouched by landing"))
+        (finally (cleanup! root))))))
+
+;; -----------------------------------------------------------------------
+;; 11. workspace-land: multi-commit chain plus trailing uncommitted edit
+
+(deftest workspace-land-multi-commit-chain-test
+  (testing "landing squashes a multi-commit chain plus a trailing uncommitted edit into one commit"
+    (let [{:keys [root project]} (fresh-jj-project-on-main!)]
+      (try
+        (let [add (run-cli "workspace-add" "--project" project "--name" "foo")
+              ws-dir (get-in add [:json :workspace :path])]
+          (is (true? (get-in add [:json :ok])))
+          (spit (str (fs/path ws-dir "one.txt")) "ONE_CONTENT\n")
+          (is (zero? (:exit (sh "jj" "-R" ws-dir "commit" "-m" "c1"))))
+          (spit (str (fs/path ws-dir "two.txt")) "TWO_CONTENT\n")
+          (is (zero? (:exit (sh "jj" "-R" ws-dir "commit" "-m" "c2"))))
+          (spit (str (fs/path ws-dir "three.txt")) "THREE_CONTENT\n")
+          (is (zero? (:exit (sh "jj" "-R" ws-dir "st")))
+              "sanity: snapshot the trailing uncommitted edit")
+          (let [{:keys [exit json]} (run-cli "workspace-land" "--project" project "--name" "foo"
+                                              "--message" "landed all three")]
+            (is (= 0 exit))
+            (is (true? (:ok json)))
+            (is (= "ONE_CONTENT\n" (direct-jj-file-show project "main" "one.txt")))
+            (is (= "TWO_CONTENT\n" (direct-jj-file-show project "main" "two.txt")))
+            (is (= "THREE_CONTENT\n" (direct-jj-file-show project "main" "three.txt")))))
+        (finally (cleanup! root))))))
+
+;; -----------------------------------------------------------------------
+;; 12. workspace-land: trunk advanced concurrently
+
+(deftest workspace-land-concurrent-advance-test
+  (testing "landing rebases onto a trunk that moved forward concurrently, keeping both sides' changes"
+    (let [{:keys [root project]} (fresh-jj-project-on-main!)]
+      (try
+        (let [add (run-cli "workspace-add" "--project" project "--name" "foo")
+              ws-dir (get-in add [:json :workspace :path])]
+          (is (true? (get-in add [:json :ok])))
+          (spit (str (fs/path ws-dir "foo-edit.txt")) "FOO_EDIT\n")
+          (is (zero? (:exit (sh "jj" "-R" ws-dir "st"))))
+          ;; Concurrently, via a DIRECT jj command against the DEFAULT
+          ;; workspace (-R project, not the workspace dir), commit a
+          ;; different file and move main forward.
+          (spit (str (fs/path project "main-edit.txt")) "MAIN_EDIT\n")
+          (is (zero? (:exit (sh "jj" "-R" project "commit" "-m" "advance main"))))
+          (is (zero? (:exit (sh "jj" "-R" project "bookmark" "set" "main" "-r" "@-"))))
+          (let [advanced-main-id (direct-jj-log project "main" commit-id-tpl)
+                {:keys [exit json]} (run-cli "workspace-land" "--project" project "--name" "foo"
+                                              "--message" "landed after advance")]
+            (is (= 0 exit))
+            (is (true? (:ok json)))
+            (is (= advanced-main-id (direct-jj-log project "main-" commit-id-tpl))
+                "the landed commit's parent should be the ADVANCED main, not the original")
+            (is (= "FOO_EDIT\n" (direct-jj-file-show project "main" "foo-edit.txt"))
+                "the workspace's own edit should be present at main")
+            (is (= "MAIN_EDIT\n" (direct-jj-file-show project "main" "main-edit.txt"))
+                "the concurrently-added main file should also be present at main")))
+        (finally (cleanup! root))))))
+
+;; -----------------------------------------------------------------------
+;; 13. workspace-land: conflict rolls back cleanly
+
+(deftest workspace-land-conflict-test
+  (testing "a genuine content conflict rolls back cleanly and reports land-conflict"
+    (let [{:keys [root project]} (fresh-jj-project-on-main!)]
+      (try
+        (let [add (run-cli "workspace-add" "--project" project "--name" "foo")
+              ws-dir (get-in add [:json :workspace :path])
+              seed-path (str (fs/path ws-dir "seed.txt"))]
+          (is (true? (get-in add [:json :ok])))
+          (spit seed-path "FOO_VERSION\n")
+          (is (zero? (:exit (sh "jj" "-R" ws-dir "st"))))
+          (let [ws-change-before (direct-jj-log ws-dir "@" change-id-tpl)]
+            ;; Concurrently, via a DIRECT jj command against the DEFAULT
+            ;; workspace, edit the SAME file with DIFFERENT content and move
+            ;; main forward -- landing will now produce a real conflict.
+            (spit (str (fs/path project "seed.txt")) "MAIN_VERSION\n")
+            (is (zero? (:exit (sh "jj" "-R" project "commit" "-m" "conflicting advance"))))
+            (is (zero? (:exit (sh "jj" "-R" project "bookmark" "set" "main" "-r" "@-"))))
+            (let [main-before (direct-jj-log project "main" commit-id-tpl)
+                  {:keys [exit json]} (run-cli "workspace-land" "--project" project "--name" "foo"
+                                                "--message" "should conflict")]
+              (is (= 1 exit))
+              (is (false? (:ok json)))
+              (is (= "land-conflict" (get-in json [:error :code])))
+              (is (= main-before (direct-jj-log project "main" commit-id-tpl))
+                  "main bookmark must be unchanged (still at its advanced position) after rollback")
+              (is (str/includes? (direct-jj-workspace-list project) "agents/foo")
+                  "workspace must still be registered after rollback")
+              (is (= "FOO_VERSION\n" (slurp seed-path))
+                  "workspace's own edit must be intact on disk after rollback")
+              (is (= ws-change-before (direct-jj-log ws-dir "@" change-id-tpl))
+                  "workspace's own @ (its commit chain/working-copy edit) must be exactly restored after rollback")
+              (is (fs/exists? ws-dir) "workspace directory must still exist on disk"))))
+        (finally (cleanup! root))))))
+
+;; -----------------------------------------------------------------------
+;; 14. workspace-land: no trunk, no --create-trunk
+
+(deftest workspace-land-no-trunk-test
+  (testing "no bookmarks at all and no --create-trunk -> no-trunk, nothing mutated"
+    (let [{:keys [root project]} (fresh-jj-project!)]
+      (try
+        (let [add (run-cli "workspace-add" "--project" project "--name" "foo")]
+          (is (true? (get-in add [:json :ok])))
+          (let [{:keys [exit json]} (run-cli "workspace-land" "--project" project "--name" "foo"
+                                              "--message" "x")]
+            (is (= 1 exit))
+            (is (false? (:ok json)))
+            (is (= "no-trunk" (get-in json [:error :code])))
+            (is (str/includes? (direct-jj-workspace-list project) "agents/foo")
+                "nothing should have been mutated -- workspace still registered")))
+        (finally (cleanup! root))))))
+
+;; -----------------------------------------------------------------------
+;; 15. workspace-land: no trunk, --create-trunk main
+
+(deftest workspace-land-create-trunk-test
+  (testing "no existing trunk, --create-trunk creates one at the landed commit"
+    (let [{:keys [root project]} (fresh-jj-project!)]
+      (try
+        (let [add (run-cli "workspace-add" "--project" project "--name" "foo")
+              ws-dir (get-in add [:json :workspace :path])]
+          (is (true? (get-in add [:json :ok])))
+          ;; Concurrently, via a DIRECT jj command against the DEFAULT
+          ;; workspace, advance default's own @ with a commit that is
+          ;; completely unrelated to `foo` (which already forked off before
+          ;; this happens). Since there's no existing trunk bookmark to
+          ;; rebase onto, --create-trunk must compute its base via
+          ;; heads(::@ & ::default@) -- this commit must NOT leak in as a
+          ;; required ancestor of the newly-created bookmark.
+          (spit (str (fs/path project "default-only.txt")) "DEFAULT_ONLY\n")
+          (is (zero? (:exit (sh "jj" "-R" project "commit" "-m" "default advances independently"))))
+          (let [default-only-change-id (direct-jj-log project "@-" change-id-tpl)
+                default-before (direct-jj-log project "default@" change-id-tpl)]
+            (spit (str (fs/path ws-dir "new-file.txt")) "NEW_CONTENT\n")
+            (is (zero? (:exit (sh "jj" "-R" ws-dir "st")))
+                "sanity: something to land, else this would hit nothing-to-land instead")
+            (let [{:keys [exit json]} (run-cli "workspace-land" "--project" project "--name" "foo"
+                                                "--message" "created trunk"
+                                                "--create-trunk" "main")]
+              (is (= 0 exit))
+              (is (true? (:ok json)))
+              (is (= "main" (get-in json [:landed :bookmark])))
+              (is (str/includes? (direct-jj-bookmark-list project) "main")
+                  "main bookmark should now exist")
+              (is (= (get-in json [:landed :commit_id]) (direct-jj-log project "main" commit-id-tpl))
+                  "main should point at the landed commit")
+              (is (str/blank? (direct-jj-log project (str "::main & " default-only-change-id) change-id-tpl))
+                  "default workspace's own independent commit must NOT be an ancestor of the newly-created main bookmark"))
+            (is (= default-before (direct-jj-log project "default@" change-id-tpl))
+                "THE INVARIANT: default workspace's own @ change id must be untouched by landing")))
+        (finally (cleanup! root))))))
+
+;; -----------------------------------------------------------------------
+;; 16. workspace-land: fresh workspace, zero changes
+
+(deftest workspace-land-nothing-to-land-test
+  (testing "a fresh workspace with zero changes -> nothing-to-land"
+    (let [{:keys [root project]} (fresh-jj-project-on-main!)]
+      (try
+        (let [add (run-cli "workspace-add" "--project" project "--name" "foo")]
+          (is (true? (get-in add [:json :ok])))
+          (let [{:keys [exit json]} (run-cli "workspace-land" "--project" project "--name" "foo"
+                                              "--message" "x")]
+            (is (= 1 exit))
+            (is (false? (:ok json)))
+            (is (= "nothing-to-land" (get-in json [:error :code])))
+            (is (str/includes? (direct-jj-workspace-list project) "agents/foo")
+                "workspace should still be registered")))
+        (finally (cleanup! root))))))
+
+;; -----------------------------------------------------------------------
+;; 17. workspace-land: missing --message
+
+(deftest workspace-land-missing-message-test
+  (testing "missing --message -> bad-args"
+    (let [{:keys [root project]} (fresh-jj-project-on-main!)]
+      (try
+        (let [add (run-cli "workspace-add" "--project" project "--name" "foo")]
+          (is (true? (get-in add [:json :ok])))
+          (let [{:keys [exit json]} (run-cli "workspace-land" "--project" project "--name" "foo")]
+            (is (= 1 exit))
+            (is (false? (:ok json)))
+            (is (= "bad-args" (get-in json [:error :code])))))
+        (finally (cleanup! root))))))
+
+;; -----------------------------------------------------------------------
+;; 18. workspace-land: unregistered workspace name
+
+(deftest workspace-land-unregistered-workspace-test
+  (testing "--name referring to a never-added workspace -> jj-failed"
+    (let [{:keys [root project]} (fresh-jj-project-on-main!)]
+      (try
+        (let [{:keys [exit json]} (run-cli "workspace-land" "--project" project "--name" "does-not-exist"
+                                            "--message" "x")]
+          (is (= 1 exit))
+          (is (false? (:ok json)))
+          (is (= "jj-failed" (get-in json [:error :code]))))
+        (finally (cleanup! root))))))
 
 ;; -----------------------------------------------------------------------
 ;; Runner: exit nonzero on any failure/error, for CI-style invocation.
