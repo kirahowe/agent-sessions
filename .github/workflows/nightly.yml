@@ -1,0 +1,87 @@
+name: Nightly
+
+on:
+  schedule:
+    - cron: "0 9 * * *" # 09:00 UTC daily; adjust freely
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  nightly:
+    runs-on: macos-15
+    timeout-minutes: 30
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history: the build number is the commit count (monotonic,
+          # so a future Sparkle feed can compare builds numerically), and
+          # release notes are the commit range since the previous nightly.
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Skip when nothing changed since the last nightly
+        id: guard
+        run: |
+          previous=$(git rev-parse -q --verify 'refs/tags/nightly^{commit}' || true)
+          echo "previous=$previous" >> "$GITHUB_OUTPUT"
+          if [ "$previous" = "$(git rev-parse HEAD)" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "No new commits since the last nightly — skipping."
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install tools
+        if: steps.guard.outputs.changed == 'true'
+        run: brew install xcodegen
+
+      - name: Build Release
+        if: steps.guard.outputs.changed == 'true'
+        # Ad-hoc signed for now (matches project.yml). When the paid Apple
+        # Developer membership lands, Developer ID signing + notarization
+        # slot in here as extra steps + two secrets, nothing else changes.
+        run: |
+          BUILD=$(git rev-list --count HEAD)
+          echo "BUILD=$BUILD" >> "$GITHUB_ENV"
+          (cd macapp && xcodegen generate)
+          xcodebuild -project macapp/Agents.xcodeproj -scheme Agents \
+            -configuration Release -derivedDataPath macapp/.build \
+            CURRENT_PROJECT_VERSION="$BUILD" build
+
+      - name: Package
+        if: steps.guard.outputs.changed == 'true'
+        run: |
+          ditto -c -k --keepParent \
+            macapp/.build/Build/Products/Release/Agents.app \
+            "Agents-nightly-b${BUILD}.zip"
+
+      - name: Publish rolling nightly release
+        if: steps.guard.outputs.changed == 'true'
+        # One rolling "nightly" tag/prerelease, recreated each run, so there
+        # is exactly one place to look for the current nightly. Notes are
+        # captured against the previous tag BEFORE it is deleted.
+        run: |
+          {
+            echo "Nightly build b${BUILD} from $(git rev-parse --short HEAD)."
+            echo
+            if [ -n "${{ steps.guard.outputs.previous }}" ]; then
+              echo "Changes since the previous nightly:"
+              git log --format='- %s' "${{ steps.guard.outputs.previous }}..HEAD"
+            else
+              echo "First nightly build."
+            fi
+            echo
+            echo "Unsigned build: on first launch macOS will require"
+            echo "System Settings > Privacy & Security > Open Anyway."
+            echo "Requires bb and jj for workspace features (the app guides you)."
+          } > notes.md
+          gh release delete nightly --yes --cleanup-tag 2>/dev/null || true
+          gh release create nightly "Agents-nightly-b${BUILD}.zip" \
+            --prerelease \
+            --target "$GITHUB_SHA" \
+            --title "Agents nightly b${BUILD}" \
+            --notes-file notes.md
