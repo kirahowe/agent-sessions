@@ -22,4 +22,7 @@
          :task (shell "rm" "-rf" "macapp/Agents.xcodeproj" "macapp/.build")}
 
   cli-test {:doc "Run the agents-cli behavioral test suite"
-            :task (shell "bb" "cli/test_agents_cli.clj")}}}
+            :task (shell "bb" "cli/test_agents_cli.clj")}
+
+  icon {:doc "Render the app icon PNGs into the asset catalog"
+        :task (shell "swift" "design/icon/RenderAppIcon.swift")}}}
