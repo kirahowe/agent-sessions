@@ -8,6 +8,12 @@ final class AppStore: ObservableObject {
     @Published var workspaces: [WorkspaceRow] = []
     @Published var selection: String?
     @Published var lastError: String?
+    /// Set (instead of `lastError`) when `landWorkspace` fails with
+    /// `.noTrunk` — that error is recoverable by creating the trunk bookmark
+    /// and retrying, so the UI needs to offer that instead of just showing a
+    /// dead-end error message. Carries the original workspace id + message
+    /// so the retry doesn't require the user to retype anything.
+    @Published var pendingTrunkBootstrap: (workspaceID: String, message: String)?
 
     let terminals: any SessionTerminating
     private let engine: any WorkspaceEngineProviding
@@ -119,6 +125,56 @@ final class AppStore: ObservableObject {
             lastError = "\(error)"
         }
         save()
+    }
+
+    /// Lands (squashes onto trunk and advances the bookmark for) a
+    /// workspace's changes, then tears down its sessions and removes it.
+    /// Returns whether it actually landed.
+    ///
+    /// ORDER MATTERS here, and is the INVERSE of `deleteWorkspace` above:
+    /// the engine call happens FIRST, and local teardown (sessions, rows,
+    /// selection) only happens on success. `deleteWorkspace` can safely tear
+    /// sessions down before calling the engine because forgetting a
+    /// workspace isn't expected to be meaningfully "rejected" — any engine
+    /// failure there just leaves the row as a retry marker regardless. But
+    /// `land-conflict` is a first-class, EXPECTED outcome here (e.g. trunk
+    /// moved since the workspace was created) that leaves the workspace
+    /// fully intact on purpose, specifically so the user keeps working in
+    /// it. Tearing sessions down before knowing whether the land succeeded
+    /// would kill a live terminal for a change that was never actually
+    /// landed — so nothing local changes until the engine confirms success.
+    @discardableResult
+    func landWorkspace(_ id: WorkspaceRow.ID, message: String, createTrunk: String? = nil) async -> Bool {
+        guard let workspace = workspaces.first(where: { $0.id == id }) else { return false }
+
+        do {
+            _ = try await engine.landWorkspace(workspace, message: message, createTrunk: createTrunk)
+        } catch EngineError.noTrunk {
+            // Not surfaced via lastError: the UI offers to create the trunk
+            // bookmark and retry, so this isn't a dead-end the user just
+            // dismisses.
+            pendingTrunkBootstrap = (workspaceID: id, message: message)
+            return false
+        } catch let error as EngineError {
+            lastError = error.message
+            return false
+        } catch {
+            lastError = "\(error)"
+            return false
+        }
+
+        let target = TargetRef.workspace(projectPath: workspace.projectPath, name: workspace.name)
+        let removedIDs = sessions.filter { $0.target == target }.map(\.id)
+        for sessionID in removedIDs {
+            terminals.closeSession(sessionID)
+        }
+        sessions.removeAll { $0.target == target }
+        workspaces.removeAll { $0.id == id }
+        if let selection, removedIDs.contains(selection) {
+            self.selection = nil
+        }
+        save()
+        return true
     }
 
     func setWorkspaceLabel(_ id: WorkspaceRow.ID, label: String?) {

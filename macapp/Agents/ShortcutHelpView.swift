@@ -4,8 +4,10 @@ import SwiftUI
 /// `Keymap.standard` plus `AppAction.helpTitle`/`helpGroup` — never a
 /// hand-maintained list, so a shortcut added to `Keymap.standard` without a
 /// `helpTitle` is caught by `KeymapTests` rather than silently missing here.
-/// Dismisses via Esc (SwiftUI's default sheet behavior) or ⌘? again (which
-/// toggles `UIState.showShortcutHelp` back off through the normal
+/// Dismisses via Esc (works because the Close button below carries
+/// `.keyboardShortcut(.cancelAction)` — SwiftUI sheets do NOT get Esc-dismiss
+/// for free; the content must contain a cancel-action button) or ⌘? again
+/// (which toggles `UIState.showShortcutHelp` back off through the normal
 /// AppActions/ShortcutRouter path — no special-casing needed here).
 struct ShortcutHelpView: View {
     /// Section order for the sheet. Every `AppAction.helpGroup` value must
@@ -43,38 +45,60 @@ struct ShortcutHelpView: View {
         return rows
     }
 
+    @Environment(\.dismiss) private var dismiss
+
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 28) {
-                Text("Keyboard Shortcuts")
-                    .font(.title2)
-                    .fontWeight(.semibold)
+        VStack(spacing: 0) {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 28) {
+                    Text("Keyboard Shortcuts")
+                        .font(.title2)
+                        .fontWeight(.semibold)
 
-                ForEach(Self.groupOrder, id: \.self) { group in
-                    let groupRows = rows(in: group)
-                    if !groupRows.isEmpty {
-                        VStack(alignment: .leading, spacing: 10) {
-                            Text(group)
-                                .font(.subheadline)
-                                .fontWeight(.semibold)
-                                .foregroundStyle(.secondary)
+                    ForEach(Self.groupOrder, id: \.self) { group in
+                        let groupRows = rows(in: group)
+                        if !groupRows.isEmpty {
+                            VStack(alignment: .leading, spacing: 10) {
+                                Text(group)
+                                    .font(.subheadline)
+                                    .fontWeight(.semibold)
+                                    .foregroundStyle(.secondary)
 
-                            VStack(alignment: .leading, spacing: 8) {
-                                ForEach(groupRows) { row in
-                                    HStack {
-                                        Text(row.title)
-                                        Spacer(minLength: 32)
-                                        Text(row.shortcut)
-                                            .foregroundStyle(.secondary)
-                                            .monospaced()
+                                VStack(alignment: .leading, spacing: 8) {
+                                    ForEach(groupRows) { row in
+                                        HStack {
+                                            Text(row.title)
+                                            Spacer(minLength: 32)
+                                            Text(row.shortcut)
+                                                .foregroundStyle(.secondary)
+                                                .monospaced()
+                                        }
                                     }
                                 }
                             }
                         }
                     }
                 }
+                .padding(32)
             }
-            .padding(32)
+
+            Divider()
+
+            HStack {
+                Spacer()
+                // SwiftUI sheets only get Esc-dismiss when their content
+                // contains a button with `.keyboardShortcut(.cancelAction)`
+                // — there's no other way to opt a sheet into it. This button
+                // exists to satisfy that requirement; it deliberately does
+                // NOT go through Keymap/ShortcutRouter, because it's
+                // sheet-contextual (only meaningful while this sheet is
+                // open), not a global app shortcut.
+                Button("Close") {
+                    dismiss()
+                }
+                .keyboardShortcut(.cancelAction)
+            }
+            .padding([.horizontal, .bottom], 16)
         }
         .frame(minWidth: 440, minHeight: 380)
     }

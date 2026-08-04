@@ -64,4 +64,27 @@ enum Dialogs {
 
         return alert.runModal() == .alertFirstButtonReturn
     }
+
+    /// Prompts for the landing commit message when keeping (landing) a
+    /// workspace's changes. Returns the trimmed message iff the user
+    /// confirmed with non-blank input; nil on Cancel OR on blank input (a
+    /// blank message is treated the same as cancelling — never lands with
+    /// an empty commit message).
+    static func promptLandMessage(workspace: WorkspaceRow) -> String? {
+        let alert = NSAlert()
+        alert.messageText = "Keep Changes in \u{201C}\(workspace.displayName)\u{201D}?"
+        alert.informativeText =
+            "Lands the workspace's changes as one commit on main, then removes the workspace and moves its directory to the Bin."
+        alert.addButton(withTitle: "Keep Changes")
+        alert.addButton(withTitle: "Cancel")
+
+        let textField = NSTextField(frame: NSRect(x: 0, y: 0, width: 240, height: 24))
+        textField.placeholderString = "Describe the change…"
+        alert.accessoryView = textField
+        alert.window.initialFirstResponder = textField
+
+        guard alert.runModal() == .alertFirstButtonReturn else { return nil }
+        let trimmed = textField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
 }

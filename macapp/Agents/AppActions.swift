@@ -83,6 +83,20 @@ final class AppActions {
             }
             return true
 
+        case .keepWorkspaceChanges:
+            guard let selection = store.selection,
+                  let row = store.sessions.first(where: { $0.id == selection }),
+                  case .workspace(let projectPath, let name) = row.target,
+                  let workspace = store.workspaces.first(where: { $0.projectPath == projectPath && $0.name == name })
+            else { return false }
+            // Cancel still counts as handled, same reasoning as
+            // .deleteWorkspace above: once a workspace is resolved we opened
+            // the prompt, so the menu item did its job regardless of choice.
+            if let message = Dialogs.promptLandMessage(workspace: workspace) {
+                Task { await store.landWorkspace(workspace.id, message: message) }
+            }
+            return true
+
         case .showShortcutHelp:
             uiState.showShortcutHelp.toggle()
             return true

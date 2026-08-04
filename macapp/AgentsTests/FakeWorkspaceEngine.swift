@@ -11,9 +11,13 @@ final class FakeWorkspaceEngine: WorkspaceEngineProviding {
         WorkspaceRow(projectPath: "", name: "unset", path: "", label: nil)
     )
     var nextDeleteResult: Result<Void, EngineError> = .success(())
+    var nextLandResult: Result<LandResult, EngineError> = .success(
+        LandResult(commitID: "unset", bookmark: "main")
+    )
 
     private(set) var createCalls: [String] = []       // projectPath args
     private(set) var deleteCalls: [WorkspaceRow] = []
+    private(set) var landCalls: [(workspace: WorkspaceRow, message: String, createTrunk: String?)] = []
 
     func createWorkspace(projectPath: String) async throws -> WorkspaceRow {
         createCalls.append(projectPath)
@@ -23,5 +27,10 @@ final class FakeWorkspaceEngine: WorkspaceEngineProviding {
     func deleteWorkspace(_ workspace: WorkspaceRow) async throws {
         deleteCalls.append(workspace)
         _ = try nextDeleteResult.get()
+    }
+
+    func landWorkspace(_ workspace: WorkspaceRow, message: String, createTrunk: String?) async throws -> LandResult {
+        landCalls.append((workspace: workspace, message: message, createTrunk: createTrunk))
+        return try nextLandResult.get()
     }
 }

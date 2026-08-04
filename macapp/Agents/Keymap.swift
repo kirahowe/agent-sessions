@@ -16,6 +16,7 @@ enum AppAction: Hashable {
     case selectSession(Int)
     case newWorkspace
     case deleteWorkspace
+    case keepWorkspaceChanges
     case showShortcutHelp
 }
 
@@ -27,7 +28,7 @@ extension AppAction: CaseIterable {
     static var allCases: [AppAction] {
         [
             .newSession, .closeSession, .closeWindow, .addProject, .removeProject,
-            .previousSession, .nextSession, .newWorkspace, .deleteWorkspace, .showShortcutHelp,
+            .previousSession, .nextSession, .newWorkspace, .deleteWorkspace, .keepWorkspaceChanges, .showShortcutHelp,
         ]
             + (0..<9).map { AppAction.selectSession($0) }
     }
@@ -51,6 +52,7 @@ extension AppAction {
         case .selectSession: return "Jump to session"
         case .newWorkspace: return "New Workspace"
         case .deleteWorkspace: return "Delete Workspace…"
+        case .keepWorkspaceChanges: return "Keep Changes…"
         case .showShortcutHelp: return "Keyboard Shortcuts"
         }
     }
@@ -61,7 +63,7 @@ extension AppAction {
         switch self {
         case .newSession, .closeSession, .previousSession, .nextSession, .selectSession:
             return "Sessions"
-        case .newWorkspace, .deleteWorkspace:
+        case .newWorkspace, .deleteWorkspace, .keepWorkspaceChanges:
             return "Workspaces"
         case .addProject, .removeProject:
             return "Projects"
@@ -172,7 +174,7 @@ enum Keymap {
             .nextSession: Shortcut(key: .downArrow, modifiers: [.command, .option]),
             .newWorkspace: Shortcut(key: .char("n"), modifiers: [.command]),
             .showShortcutHelp: Shortcut(key: .char("?"), modifiers: [.command, .shift]),
-            // .removeProject, .deleteWorkspace intentionally have no entry: menu-only, no shortcut.
+            // .removeProject, .deleteWorkspace, .keepWorkspaceChanges intentionally have no entry: menu-only, no shortcut.
         ]
         for index in 0..<9 {
             let digit = Character("\(index + 1)")

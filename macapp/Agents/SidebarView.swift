@@ -133,6 +133,14 @@ struct SidebarView: View {
         // resolves to that workspace's first session, or creates one.
         .buttonStyle(.plain)
         .contextMenu {
+            // Direct store/Dialogs call, not actions.perform: this targets
+            // the specific right-clicked workspace, row-targeted the same
+            // way the rest of this context menu is.
+            Button("Keep Changes…") {
+                if let message = Dialogs.promptLandMessage(workspace: workspace) {
+                    Task { await store.landWorkspace(workspace.id, message: message) }
+                }
+            }
             // Direct store call, not actions.perform: this targets the
             // specific right-clicked workspace, row-targeted the same way
             // the session row's context menu above is.

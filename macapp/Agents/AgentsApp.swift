@@ -39,6 +39,18 @@ struct AgentsApp: App {
         router.install()
     }
 
+    /// Whether `store.selection` currently points at a session whose target
+    /// is a workspace (rather than a project root) — drives "Keep Workspace
+    /// Changes…"'s enabled state, resolved the same way
+    /// `AppActions.perform(.keepWorkspaceChanges)` resolves its target.
+    private var selectionTargetsWorkspace: Bool {
+        guard let selection = store.selection,
+              let row = store.sessions.first(where: { $0.id == selection })
+        else { return false }
+        if case .workspace = row.target { return true }
+        return false
+    }
+
     var body: some Scene {
         WindowGroup {
             RootView(store: store, center: center, uiState: uiState)
@@ -73,6 +85,12 @@ struct AgentsApp: App {
                     actions.perform(.deleteWorkspace)
                 }
                 // No .keymapShortcut: deleteWorkspace has no Keymap entry (menu-only).
+
+                Button("Keep Workspace Changes…") {
+                    actions.perform(.keepWorkspaceChanges)
+                }
+                .disabled(!selectionTargetsWorkspace)
+                // No .keymapShortcut: keepWorkspaceChanges has no Keymap entry (menu-only).
             }
 
             CommandGroup(replacing: .saveItem) {

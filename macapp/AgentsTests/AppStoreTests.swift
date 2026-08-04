@@ -855,4 +855,178 @@ final class AppStoreTests: XCTestCase {
         XCTAssertNotNil(created)
         XCTAssertEqual(store.selection, created?.id)
     }
+
+    // MARK: - 33
+
+    func test33a_landWorkspaceSuccessTearsDownSessionsRemovesRowAndClearsSelectionWhenInside() async {
+        let fake = FakeWorkspaceEngine()
+        let (store, spy, url) = TestSupport.makeStore(engine: fake)
+        let pathA = "/tmp/proj-A"
+        store.addProject(path: pathA)
+
+        let wsRow = WorkspaceRow(projectPath: pathA, name: "ws-a", path: "/tmp/workspaces/ws-a", label: nil)
+        fake.nextCreateResult = .success(wsRow)
+        await store.createWorkspace(in: pathA) // ws: Session 1, selected
+        store.newSession(in: .workspace(projectPath: pathA, name: "ws-a")) // ws: Session 2, selected
+
+        let wsSessionIDs = store.sessions
+            .filter { $0.target == .workspace(projectPath: pathA, name: "ws-a") }
+            .map(\.id)
+        XCTAssertEqual(wsSessionIDs.count, 2)
+        XCTAssertTrue(wsSessionIDs.contains(store.selection!))
+
+        fake.nextLandResult = .success(LandResult(commitID: "abc123", bookmark: "main"))
+        let landed = await store.landWorkspace(wsRow.id, message: "Ship it")
+
+        XCTAssertTrue(landed)
+        XCTAssertEqual(fake.landCalls.count, 1)
+        XCTAssertEqual(fake.landCalls.first?.workspace, wsRow)
+        XCTAssertEqual(fake.landCalls.first?.message, "Ship it")
+        XCTAssertNil(fake.landCalls.first?.createTrunk)
+        XCTAssertEqual(spy.closedIDs.count, wsSessionIDs.count, "each session must be closed exactly once")
+        XCTAssertEqual(Set(spy.closedIDs), Set(wsSessionIDs))
+        XCTAssertTrue(store.sessions.filter { $0.target == .workspace(projectPath: pathA, name: "ws-a") }.isEmpty)
+        XCTAssertFalse(store.workspaces.contains { $0.id == wsRow.id })
+        XCTAssertNil(store.selection)
+
+        // The removal must persist across a fresh AppStore load from the
+        // same stateURL, not just live in the in-memory store.
+        let spy2 = SpyTerminals()
+        let store2 = AppStore(terminals: spy2, stateURL: url, engine: FakeWorkspaceEngine())
+        XCTAssertFalse(store2.workspaces.contains { $0.id == wsRow.id })
+        XCTAssertTrue(store2.sessions.filter { $0.target == .workspace(projectPath: pathA, name: "ws-a") }.isEmpty)
+    }
+
+    func test33b_landWorkspaceSuccessLeavesUnrelatedRootSelectionUntouched() async {
+        let fake = FakeWorkspaceEngine()
+        let (store, _, _) = TestSupport.makeStore(engine: fake)
+        let pathA = "/tmp/proj-A"
+        store.addProject(path: pathA) // root: Session 1, selected
+        let rootSelection = store.selection
+
+        let wsRow = WorkspaceRow(projectPath: pathA, name: "ws-a", path: "/tmp/workspaces/ws-a", label: nil)
+        fake.nextCreateResult = .success(wsRow)
+        await store.createWorkspace(in: pathA) // ws: Session 1, now selected
+
+        // Re-select the root session explicitly: createWorkspace moves
+        // selection to its new session, and this variant is about a
+        // pre-existing ROOT selection surviving an unrelated workspace's
+        // landing, not about createWorkspace's own selection behavior.
+        store.selection = rootSelection
+
+        fake.nextLandResult = .success(LandResult(commitID: "abc123", bookmark: "main"))
+        let landed = await store.landWorkspace(wsRow.id, message: "Ship it")
+
+        XCTAssertTrue(landed)
+        XCTAssertEqual(store.selection, rootSelection)
+        XCTAssertTrue(store.workspaces.isEmpty)
+    }
+
+    // MARK: - 34
+
+    func test34_landWorkspaceConflictFailureLeavesEverythingIntact() async {
+        let fake = FakeWorkspaceEngine()
+        let (store, spy, _) = TestSupport.makeStore(engine: fake)
+        let pathA = "/tmp/proj-A"
+        store.addProject(path: pathA)
+
+        let wsRow = WorkspaceRow(projectPath: pathA, name: "ws-a", path: "/tmp/workspaces/ws-a", label: nil)
+        fake.nextCreateResult = .success(wsRow)
+        await store.createWorkspace(in: pathA) // ws: Session 1, selected
+
+        let sessionsBefore = store.sessions
+        let workspacesBefore = store.workspaces
+        let selectionBefore = store.selection
+
+        fake.nextLandResult = .failure(.landConflict("trunk moved since this workspace was created"))
+        let landed = await store.landWorkspace(wsRow.id, message: "Ship it")
+
+        XCTAssertFalse(landed)
+        XCTAssertTrue(spy.closedIDs.isEmpty, "a land-conflict must leave the workspace fully intact, sessions included")
+        XCTAssertEqual(store.sessions, sessionsBefore)
+        XCTAssertEqual(store.workspaces, workspacesBefore)
+        XCTAssertEqual(store.selection, selectionBefore)
+        XCTAssertEqual(store.lastError, "trunk moved since this workspace was created")
+        XCTAssertNil(store.pendingTrunkBootstrap)
+    }
+
+    // MARK: - 35
+
+    func test35_landWorkspaceNoTrunkFailureSetsPendingTrunkBootstrapWithoutLastError() async {
+        let fake = FakeWorkspaceEngine()
+        let (store, spy, _) = TestSupport.makeStore(engine: fake)
+        let pathA = "/tmp/proj-A"
+        store.addProject(path: pathA)
+
+        let wsRow = WorkspaceRow(projectPath: pathA, name: "ws-a", path: "/tmp/workspaces/ws-a", label: nil)
+        fake.nextCreateResult = .success(wsRow)
+        await store.createWorkspace(in: pathA)
+
+        let sessionsBefore = store.sessions
+        let workspacesBefore = store.workspaces
+        let selectionBefore = store.selection
+
+        fake.nextLandResult = .failure(.noTrunk("no main/master/trunk bookmark exists"))
+        let landed = await store.landWorkspace(wsRow.id, message: "Ship it")
+
+        XCTAssertFalse(landed)
+        XCTAssertTrue(spy.closedIDs.isEmpty)
+        XCTAssertEqual(store.sessions, sessionsBefore)
+        XCTAssertEqual(store.workspaces, workspacesBefore)
+        XCTAssertEqual(store.selection, selectionBefore)
+        XCTAssertNil(store.lastError, "noTrunk is recoverable via pendingTrunkBootstrap, not a dead-end lastError")
+        XCTAssertEqual(store.pendingTrunkBootstrap?.workspaceID, wsRow.id)
+        XCTAssertEqual(store.pendingTrunkBootstrap?.message, "Ship it")
+    }
+
+    // MARK: - 36
+
+    func test36_retryLandWorkspaceWithCreateTrunkPassesThroughAndSucceeds() async {
+        let fake = FakeWorkspaceEngine()
+        let (store, _, _) = TestSupport.makeStore(engine: fake)
+        let pathA = "/tmp/proj-A"
+        store.addProject(path: pathA)
+
+        let wsRow = WorkspaceRow(projectPath: pathA, name: "ws-a", path: "/tmp/workspaces/ws-a", label: nil)
+        fake.nextCreateResult = .success(wsRow)
+        await store.createWorkspace(in: pathA)
+
+        fake.nextLandResult = .failure(.noTrunk("no main/master/trunk bookmark exists"))
+        _ = await store.landWorkspace(wsRow.id, message: "Ship it")
+        XCTAssertNotNil(store.pendingTrunkBootstrap, "precondition: a prior noTrunk failure set the pending retry")
+
+        fake.nextLandResult = .success(LandResult(commitID: "def456", bookmark: "main"))
+        let landed = await store.landWorkspace(wsRow.id, message: "Ship it", createTrunk: "main")
+
+        XCTAssertEqual(fake.landCalls.last?.createTrunk, "main")
+        XCTAssertTrue(landed)
+        XCTAssertTrue(store.workspaces.isEmpty)
+    }
+
+    // MARK: - 37
+
+    func test37_landWorkspaceNothingToLandFailureSetsLastError() async {
+        let fake = FakeWorkspaceEngine()
+        let (store, spy, _) = TestSupport.makeStore(engine: fake)
+        let pathA = "/tmp/proj-A"
+        store.addProject(path: pathA)
+
+        let wsRow = WorkspaceRow(projectPath: pathA, name: "ws-a", path: "/tmp/workspaces/ws-a", label: nil)
+        fake.nextCreateResult = .success(wsRow)
+        await store.createWorkspace(in: pathA)
+
+        let sessionsBefore = store.sessions
+        let workspacesBefore = store.workspaces
+        let selectionBefore = store.selection
+
+        fake.nextLandResult = .failure(.nothingToLand("workspace has no changes to land"))
+        let landed = await store.landWorkspace(wsRow.id, message: "Ship it")
+
+        XCTAssertFalse(landed)
+        XCTAssertTrue(spy.closedIDs.isEmpty)
+        XCTAssertEqual(store.sessions, sessionsBefore)
+        XCTAssertEqual(store.workspaces, workspacesBefore)
+        XCTAssertEqual(store.selection, selectionBefore)
+        XCTAssertEqual(store.lastError, "workspace has no changes to land")
+    }
 }

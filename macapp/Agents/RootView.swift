@@ -61,5 +61,24 @@ struct RootView: View {
         } message: {
             Text(store.lastError ?? "")
         }
+        .alert(
+            "No main bookmark exists in this repo. Create \u{201C}main\u{201D} at this landed commit?",
+            isPresented: Binding(
+                get: { store.pendingTrunkBootstrap != nil },
+                set: { isPresented in
+                    if !isPresented { store.pendingTrunkBootstrap = nil }
+                }
+            )
+        ) {
+            Button("Create") {
+                if let pending = store.pendingTrunkBootstrap {
+                    Task { await store.landWorkspace(pending.workspaceID, message: pending.message, createTrunk: "main") }
+                }
+                store.pendingTrunkBootstrap = nil
+            }
+            Button("Cancel", role: .cancel) {
+                store.pendingTrunkBootstrap = nil
+            }
+        }
     }
 }

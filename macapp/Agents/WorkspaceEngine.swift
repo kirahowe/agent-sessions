@@ -5,19 +5,32 @@ enum EngineError: Error, Equatable {
     case nameConflict(String)
     case destExists(String)
     case failed(String)
+    case noTrunk(String)
+    case landConflict(String)
+    case nothingToLand(String)
 
     var message: String {
         switch self {
-        case .notAJJRepo(let m), .nameConflict(let m), .destExists(let m), .failed(let m):
+        case .notAJJRepo(let m), .nameConflict(let m), .destExists(let m), .failed(let m),
+             .noTrunk(let m), .landConflict(let m), .nothingToLand(let m):
             return m
         }
     }
+}
+
+/// The result of successfully landing a workspace's changes onto its
+/// project's trunk bookmark: the squashed commit id, and the bookmark it
+/// now lives on.
+struct LandResult: Equatable {
+    let commitID: String
+    let bookmark: String
 }
 
 @MainActor
 protocol WorkspaceEngineProviding: AnyObject {
     func createWorkspace(projectPath: String) async throws -> WorkspaceRow
     func deleteWorkspace(_ workspace: WorkspaceRow) async throws
+    func landWorkspace(_ workspace: WorkspaceRow, message: String, createTrunk: String?) async throws -> LandResult
 }
 
 /// Production conformer: drives the `agents-cli` babashka script as a
@@ -40,6 +53,7 @@ final class WorkspaceEngineCLI: WorkspaceEngineProviding {
     private struct Envelope: Decodable {
         let ok: Bool
         let workspace: WorkspacePayload?
+        let landed: LandedPayload?
         let error: ErrorPayload?
     }
 
@@ -48,6 +62,12 @@ final class WorkspaceEngineCLI: WorkspaceEngineProviding {
         let jj_name: String
         let path: String
         let project: String
+    }
+
+    private struct LandedPayload: Decodable {
+        let commit_id: String
+        let bookmark: String
+        let workspace: String
     }
 
     private struct ErrorPayload: Decodable {
@@ -60,6 +80,9 @@ final class WorkspaceEngineCLI: WorkspaceEngineProviding {
         case "not-a-jj-repo": return .notAJJRepo(payload.message)
         case "name-conflict": return .nameConflict(payload.message)
         case "dest-exists": return .destExists(payload.message)
+        case "no-trunk": return .noTrunk(payload.message)
+        case "land-conflict": return .landConflict(payload.message)
+        case "nothing-to-land": return .nothingToLand(payload.message)
         default: return .failed(payload.message)
         }
     }
@@ -187,5 +210,26 @@ final class WorkspaceEngineCLI: WorkspaceEngineProviding {
         let fm = FileManager.default
         guard fm.fileExists(atPath: workspace.path) else { return }
         try fm.trashItem(at: URL(fileURLWithPath: workspace.path), resultingItemURL: nil)
+    }
+
+    func landWorkspace(_ workspace: WorkspaceRow, message: String, createTrunk: String?) async throws -> LandResult {
+        var args = ["--project", workspace.projectPath, "--name", workspace.name, "--message", message]
+        if let createTrunk {
+            args += ["--create-trunk", createTrunk]
+        }
+        let envelope = try await run("workspace-land", args: args)
+        // workspace-land always includes a landed payload on success; a
+        // missing one here would mean the CLI contract was violated (same
+        // reasoning as createWorkspace's workspace-payload check above).
+        guard let payload = envelope.landed else {
+            throw EngineError.failed("agents-cli workspace-land returned ok with no landed payload")
+        }
+
+        let fm = FileManager.default
+        if fm.fileExists(atPath: workspace.path) {
+            try fm.trashItem(at: URL(fileURLWithPath: workspace.path), resultingItemURL: nil)
+        }
+
+        return LandResult(commitID: payload.commit_id, bookmark: payload.bookmark)
     }
 }
