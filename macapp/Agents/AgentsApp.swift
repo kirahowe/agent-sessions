@@ -52,7 +52,16 @@ struct AgentsApp: App {
     }
 
     var body: some Scene {
-        WindowGroup {
+        // `Window` (single-window), not `WindowGroup`: TerminalCenter caches
+        // exactly one NSView/TerminalController pair per session id, with no
+        // notion of "which window" it belongs to. WindowGroup can still spawn
+        // a second window (Dock re-open, window-tabbing affordances) even
+        // with File > New Window's menu item replaced above, and a second
+        // window hosting the same session would either steal its NSView out
+        // from under the first window (a view can only have one superview)
+        // or show a blank surface. Don't revert this to WindowGroup without
+        // first making TerminalCenter's cache window-aware.
+        Window("Agents", id: "main") {
             RootView(store: store, center: center, uiState: uiState)
                 .environment(\.appActions, actions)
         }
