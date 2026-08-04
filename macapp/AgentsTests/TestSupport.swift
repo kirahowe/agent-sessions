@@ -13,11 +13,17 @@ enum TestSupport {
     }
 
     /// Builds a fresh store backed by a fresh spy and a fresh temp state
-    /// file. No projects/sessions exist yet.
-    static func makeStore() -> (store: AppStore, spy: SpyTerminals, stateURL: URL) {
+    /// file. No projects/sessions exist yet. Defaults to a fresh
+    /// `FakeWorkspaceEngine()` so no test ever touches the real
+    /// `WorkspaceEngineCLI` (which would try to find bb/the CLI script and
+    /// is not hermetic); pass `engine:` explicitly when a test needs to
+    /// script/inspect it.
+    static func makeStore(
+        engine: (any WorkspaceEngineProviding)? = nil
+    ) -> (store: AppStore, spy: SpyTerminals, stateURL: URL) {
         let spy = SpyTerminals()
         let url = freshStateURL()
-        let store = AppStore(terminals: spy, stateURL: url)
+        let store = AppStore(terminals: spy, stateURL: url, engine: engine ?? FakeWorkspaceEngine())
         return (store, spy, url)
     }
 }

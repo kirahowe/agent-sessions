@@ -260,7 +260,7 @@ final class AppStoreTests: XCTestCase {
         let pathA = "/tmp/proj-A"
         let pathB = "/tmp/proj-B"
         store1.addProject(path: pathA)
-        store1.newSession(in: store1.projects.first { $0.path == pathA })
+        store1.newSession(in: store1.projects.first { $0.path == pathA }!)
         store1.addProject(path: pathB)
 
         let toRename = store1.sessions.first { $0.projectPath == pathA && $0.name == "Session 1" }!
@@ -276,7 +276,7 @@ final class AppStoreTests: XCTestCase {
         XCTAssertEqual(store2.selection, store1.selection)
 
         let raw = try String(contentsOf: url, encoding: .utf8)
-        XCTAssertTrue(raw.contains("\"version\":1"), "expected literal \"version\":1 in: \(raw)")
+        XCTAssertTrue(raw.contains("\"version\":2"), "expected literal \"version\":2 in: \(raw)")
     }
 
     // MARK: - 12
@@ -318,14 +318,15 @@ final class AppStoreTests: XCTestCase {
         let url = TestSupport.freshStateURL()
         let path = "/tmp/proj-restored"
         let restoredSessions = [
-            SessionRow(id: UUID().uuidString, projectPath: path, name: "Session 3"),
-            SessionRow(id: UUID().uuidString, projectPath: path, name: "Session 7"),
-            SessionRow(id: UUID().uuidString, projectPath: path, name: "build server"),
+            SessionRow(id: UUID().uuidString, target: .root(projectPath: path), name: "Session 3"),
+            SessionRow(id: UUID().uuidString, target: .root(projectPath: path), name: "Session 7"),
+            SessionRow(id: UUID().uuidString, target: .root(projectPath: path), name: "build server"),
         ]
         let state = PersistedState(
-            version: 1,
+            version: 2,
             projects: [path],
             sessions: restoredSessions,
+            workspaces: [],
             selection: restoredSessions[0].id
         )
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
@@ -460,5 +461,324 @@ final class AppStoreTests: XCTestCase {
 
         XCTAssertFalse(store.selectSession(at: 0))
         XCTAssertNil(store.selection)
+    }
+
+    // MARK: - 21
+
+    func test21_v1JSONMigratesToRootTargetsAndSavesAsV2() throws {
+        let url = TestSupport.freshStateURL()
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+
+        // Hand-written v1 shape (flat projectPath sessions, explicit
+        // "version":1), matching test16's literal-string style.
+        let legacyJSON = """
+        {"version":1,"projects":["/tmp/proj-v1"],"sessions":[{"id":"v1-1","projectPath":"/tmp/proj-v1","name":"Session 1"}],"selection":"v1-1"}
+        """
+        try Data(legacyJSON.utf8).write(to: url)
+
+        let spy = SpyTerminals()
+        let store = AppStore(terminals: spy, stateURL: url)
+
+        XCTAssertTrue(store.workspaces.isEmpty)
+        let session = store.sessions.first { $0.id == "v1-1" }!
+        XCTAssertEqual(session.target, .root(projectPath: "/tmp/proj-v1"))
+        XCTAssertEqual(session.projectPath, "/tmp/proj-v1")
+
+        // Any mutating call triggers a save; confirm it's written back as v2.
+        store.renameSession("v1-1", to: "renamed")
+
+        let raw = try String(contentsOf: url, encoding: .utf8)
+        XCTAssertTrue(raw.contains("\"version\":2"), "expected migrated save to be version 2: \(raw)")
+        XCTAssertTrue(raw.contains("\"workspaces\""), "expected migrated save to include a workspaces key: \(raw)")
+    }
+
+    // MARK: - 22
+
+    func test22_v2RoundTripPreservesWorkspacesSessionTargetsAndLabels() async throws {
+        let fake = FakeWorkspaceEngine()
+        let (store1, _, url) = TestSupport.makeStore(engine: fake)
+        let pathA = "/tmp/proj-A"
+        store1.addProject(path: pathA)
+
+        let wsRow = WorkspaceRow(projectPath: pathA, name: "feature-x", path: "/tmp/workspaces/feature-x", label: nil)
+        fake.nextCreateResult = .success(wsRow)
+        await store1.createWorkspace(in: pathA)
+        let workspace = store1.workspaces.first!
+        store1.setWorkspaceLabel(workspace.id, label: "My Feature")
+
+        let spy2 = SpyTerminals()
+        let store2 = AppStore(terminals: spy2, stateURL: url, engine: FakeWorkspaceEngine())
+
+        XCTAssertEqual(store2.workspaces, store1.workspaces)
+        XCTAssertEqual(store2.workspaces.first?.label, "My Feature")
+        XCTAssertEqual(Set(store2.sessions), Set(store1.sessions))
+        XCTAssertTrue(store2.sessions.contains { $0.target == .workspace(projectPath: pathA, name: "feature-x") })
+    }
+
+    // MARK: - 23
+
+    func test23_createWorkspaceSuccessAppendsRowCreatesAndSelectsSession() async throws {
+        let fake = FakeWorkspaceEngine()
+        let (store, _, url) = TestSupport.makeStore(engine: fake)
+        let pathA = "/tmp/proj-A"
+        store.addProject(path: pathA)
+
+        let expectedRow = WorkspaceRow(projectPath: pathA, name: "calm-river", path: "/tmp/workspaces/calm-river", label: nil)
+        fake.nextCreateResult = .success(expectedRow)
+
+        await store.createWorkspace(in: pathA)
+
+        XCTAssertEqual(fake.createCalls, [pathA])
+        XCTAssertEqual(store.workspaces, [expectedRow])
+        let wsSessions = store.sessions.filter { $0.target == .workspace(projectPath: pathA, name: "calm-river") }
+        XCTAssertEqual(wsSessions.count, 1)
+        XCTAssertEqual(wsSessions.first?.name, "Session 1")
+        XCTAssertEqual(store.selection, wsSessions.first?.id)
+
+        let spy2 = SpyTerminals()
+        let store2 = AppStore(terminals: spy2, stateURL: url, engine: FakeWorkspaceEngine())
+        XCTAssertEqual(store2.workspaces, [expectedRow])
+        XCTAssertTrue(store2.sessions.contains { $0.target == .workspace(projectPath: pathA, name: "calm-river") })
+    }
+
+    // MARK: - 24
+
+    func test24_createWorkspaceFailureLeavesStateUntouchedAndSetsLastError() async {
+        let fake = FakeWorkspaceEngine()
+        let (store, _, _) = TestSupport.makeStore(engine: fake)
+        let pathA = "/tmp/proj-A"
+        store.addProject(path: pathA)
+        let selectionBefore = store.selection
+        let sessionsBefore = store.sessions
+        let workspacesBefore = store.workspaces
+
+        fake.nextCreateResult = .failure(.nameConflict("jj workspace already exists: agents/calm-river"))
+
+        await store.createWorkspace(in: pathA)
+
+        XCTAssertEqual(store.workspaces, workspacesBefore)
+        XCTAssertEqual(store.sessions, sessionsBefore)
+        XCTAssertEqual(store.selection, selectionBefore)
+        XCTAssertEqual(store.lastError, "jj workspace already exists: agents/calm-river")
+    }
+
+    // MARK: - 25
+
+    func test25a_perTargetCounterWorkspaceStartsAtSessionOneRegardlessOfRootCounter() async {
+        let fake = FakeWorkspaceEngine()
+        let (store, _, _) = TestSupport.makeStore(engine: fake)
+        let pathA = "/tmp/proj-A"
+        store.addProject(path: pathA) // root: Session 1
+        let project = store.projects.first!
+        store.newSession(in: project) // root: Session 2
+        store.newSession(in: project) // root: Session 3
+        XCTAssertTrue(store.sessions.contains { $0.name == "Session 3" && $0.target == .root(projectPath: pathA) })
+
+        let wsRow = WorkspaceRow(projectPath: pathA, name: "ws-a", path: "/tmp/workspaces/ws-a", label: nil)
+        fake.nextCreateResult = .success(wsRow)
+        await store.createWorkspace(in: pathA)
+
+        let wsSession = store.sessions.first { $0.target == .workspace(projectPath: pathA, name: "ws-a") }!
+        XCTAssertEqual(wsSession.name, "Session 1", "a fresh workspace's counter must not inherit the project root's counter")
+    }
+
+    func test25b_restoredV2StateSeedsCountersIndependentlyPerTarget() throws {
+        let url = TestSupport.freshStateURL()
+        let pathA = "/tmp/proj-A"
+        let wsRow = WorkspaceRow(projectPath: pathA, name: "ws-a", path: "/tmp/workspaces/ws-a", label: nil)
+        let rootSessions = [
+            SessionRow(id: UUID().uuidString, target: .root(projectPath: pathA), name: "Session 1"),
+            SessionRow(id: UUID().uuidString, target: .root(projectPath: pathA), name: "Session 5"),
+        ]
+        let wsSessions = [
+            SessionRow(id: UUID().uuidString, target: .workspace(projectPath: pathA, name: "ws-a"), name: "Session 1"),
+            SessionRow(id: UUID().uuidString, target: .workspace(projectPath: pathA, name: "ws-a"), name: "Session 2"),
+        ]
+        let state = PersistedState(
+            version: 2,
+            projects: [pathA],
+            sessions: rootSessions + wsSessions,
+            workspaces: [wsRow],
+            selection: nil
+        )
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try JSONEncoder().encode(state).write(to: url)
+
+        let spy = SpyTerminals()
+        let store = AppStore(terminals: spy, stateURL: url)
+
+        store.newSession(in: .root(projectPath: pathA))
+        store.newSession(in: .workspace(projectPath: pathA, name: "ws-a"))
+
+        XCTAssertTrue(store.sessions.contains { $0.target == .root(projectPath: pathA) && $0.name == "Session 6" })
+        XCTAssertTrue(store.sessions.contains { $0.target == .workspace(projectPath: pathA, name: "ws-a") && $0.name == "Session 3" })
+    }
+
+    // MARK: - 26
+
+    func test26a_deleteWorkspaceTearsDownSessionsRemovesRowAndClearsSelectionWhenInside() async {
+        let fake = FakeWorkspaceEngine()
+        let (store, spy, _) = TestSupport.makeStore(engine: fake)
+        let pathA = "/tmp/proj-A"
+        store.addProject(path: pathA)
+
+        let wsRow = WorkspaceRow(projectPath: pathA, name: "ws-a", path: "/tmp/workspaces/ws-a", label: nil)
+        fake.nextCreateResult = .success(wsRow)
+        await store.createWorkspace(in: pathA) // ws: Session 1, selected
+        store.newSession(in: .workspace(projectPath: pathA, name: "ws-a")) // ws: Session 2, selected
+
+        let wsSessionIDs = store.sessions
+            .filter { $0.target == .workspace(projectPath: pathA, name: "ws-a") }
+            .map(\.id)
+        XCTAssertEqual(wsSessionIDs.count, 2)
+        XCTAssertTrue(wsSessionIDs.contains(store.selection!))
+
+        await store.deleteWorkspace(wsRow.id)
+
+        XCTAssertEqual(spy.closedIDs.count, wsSessionIDs.count, "each session must be closed exactly once")
+        XCTAssertEqual(Set(spy.closedIDs), Set(wsSessionIDs))
+        XCTAssertTrue(store.sessions.filter { $0.target == .workspace(projectPath: pathA, name: "ws-a") }.isEmpty)
+        XCTAssertFalse(store.workspaces.contains { $0.id == wsRow.id })
+        XCTAssertEqual(fake.deleteCalls, [wsRow])
+        XCTAssertNil(store.selection)
+    }
+
+    func test26b_deleteWorkspaceLeavesUnrelatedRootSelectionUntouched() async {
+        let fake = FakeWorkspaceEngine()
+        let (store, _, _) = TestSupport.makeStore(engine: fake)
+        let pathA = "/tmp/proj-A"
+        store.addProject(path: pathA) // root: Session 1, selected
+        let rootSelection = store.selection
+
+        let wsRow = WorkspaceRow(projectPath: pathA, name: "ws-a", path: "/tmp/workspaces/ws-a", label: nil)
+        fake.nextCreateResult = .success(wsRow)
+        await store.createWorkspace(in: pathA) // ws: Session 1, now selected
+
+        // Re-select the root session explicitly: createWorkspace moves
+        // selection to its new session, and this variant is about a
+        // pre-existing ROOT selection surviving an unrelated workspace's
+        // deletion, not about createWorkspace's own selection behavior
+        // (already covered by test23).
+        store.selection = rootSelection
+
+        await store.deleteWorkspace(wsRow.id)
+
+        XCTAssertEqual(store.selection, rootSelection)
+        XCTAssertTrue(store.workspaces.isEmpty)
+    }
+
+    // MARK: - 27
+
+    func test27_deleteWorkspaceEngineFailureKeepsWorkspaceRowAsRetryMarker() async {
+        let fake = FakeWorkspaceEngine()
+        let (store, spy, _) = TestSupport.makeStore(engine: fake)
+        let pathA = "/tmp/proj-A"
+        store.addProject(path: pathA)
+
+        let wsRow = WorkspaceRow(projectPath: pathA, name: "ws-a", path: "/tmp/workspaces/ws-a", label: nil)
+        fake.nextCreateResult = .success(wsRow)
+        await store.createWorkspace(in: pathA)
+        let wsSessionID = store.sessions.first { $0.target == .workspace(projectPath: pathA, name: "ws-a") }!.id
+
+        fake.nextDeleteResult = .failure(.failed("jj workspace forget failed"))
+
+        await store.deleteWorkspace(wsRow.id)
+
+        XCTAssertTrue(spy.closedIDs.contains(wsSessionID), "the session was already torn down before the engine call")
+        XCTAssertFalse(store.sessions.contains { $0.id == wsSessionID })
+        XCTAssertTrue(store.workspaces.contains { $0.id == wsRow.id }, "engine failure must leave the row as a visible retry marker")
+        XCTAssertEqual(store.lastError, "jj workspace forget failed")
+    }
+
+    // MARK: - 28
+
+    func test28_orderedTargetsGroupsRootBeforeWorkspacesPerProjectInCreationOrder() async {
+        let fake = FakeWorkspaceEngine()
+        let (store, _, _) = TestSupport.makeStore(engine: fake)
+        let pathA = "/tmp/proj-A"
+        let pathB = "/tmp/proj-B"
+        store.addProject(path: pathA)
+        store.addProject(path: pathB)
+
+        fake.nextCreateResult = .success(WorkspaceRow(projectPath: pathA, name: "a1", path: "/tmp/workspaces/a1", label: nil))
+        await store.createWorkspace(in: pathA)
+        fake.nextCreateResult = .success(WorkspaceRow(projectPath: pathA, name: "a2", path: "/tmp/workspaces/a2", label: nil))
+        await store.createWorkspace(in: pathA)
+        fake.nextCreateResult = .success(WorkspaceRow(projectPath: pathB, name: "b1", path: "/tmp/workspaces/b1", label: nil))
+        await store.createWorkspace(in: pathB)
+
+        let expectedTargets: [TargetRef] = [
+            .root(projectPath: pathA),
+            .workspace(projectPath: pathA, name: "a1"),
+            .workspace(projectPath: pathA, name: "a2"),
+            .root(projectPath: pathB),
+            .workspace(projectPath: pathB, name: "b1"),
+        ]
+        XCTAssertEqual(store.orderedTargets, expectedTargets)
+
+        // Each target above has exactly one session ("Session 1"), created
+        // in the same order, so orderedSessions must mirror orderedTargets.
+        XCTAssertEqual(store.orderedSessions.map(\.target), expectedTargets)
+    }
+
+    // MARK: - 29
+
+    func test29_removeProjectDropsWorkspacesLocallyWithoutTouchingEngine() async {
+        let fake = FakeWorkspaceEngine()
+        let (store, _, _) = TestSupport.makeStore(engine: fake)
+        let pathA = "/tmp/proj-A"
+        store.addProject(path: pathA)
+
+        let wsRow = WorkspaceRow(projectPath: pathA, name: "ws-a", path: "/tmp/workspaces/ws-a", label: nil)
+        fake.nextCreateResult = .success(wsRow)
+        await store.createWorkspace(in: pathA)
+        let wsSessionID = store.sessions.first { $0.target == .workspace(projectPath: pathA, name: "ws-a") }!.id
+
+        let project = store.projects.first(where: { $0.path == pathA })!
+        store.removeProject(project)
+
+        XCTAssertTrue(fake.deleteCalls.isEmpty, "removing a project locally must never touch the engine")
+        XCTAssertFalse(store.sessions.contains { $0.id == wsSessionID })
+        XCTAssertTrue(store.workspaces.isEmpty)
+    }
+
+    // MARK: - 30
+
+    func test30a_newSessionNilWithSelectionInsideWorkspaceTargetsThatWorkspace() async {
+        let fake = FakeWorkspaceEngine()
+        let (store, _, _) = TestSupport.makeStore(engine: fake)
+        let pathA = "/tmp/proj-A"
+        store.addProject(path: pathA)
+
+        let wsRow = WorkspaceRow(projectPath: pathA, name: "ws-a", path: "/tmp/workspaces/ws-a", label: nil)
+        fake.nextCreateResult = .success(wsRow)
+        await store.createWorkspace(in: pathA) // ws: Session 1, selected
+
+        store.newSession(in: nil)
+
+        let wsSessionNames = store.sessions
+            .filter { $0.target == .workspace(projectPath: pathA, name: "ws-a") }
+            .map(\.name)
+            .sorted()
+        XCTAssertEqual(wsSessionNames, ["Session 1", "Session 2"])
+        XCTAssertEqual(
+            store.sessions.filter { $0.target == .root(projectPath: pathA) }.count, 1,
+            "the project's root target must be untouched"
+        )
+    }
+
+    func test30b_newSessionNilWithNoSelectionTargetsFirstOrderedTarget() {
+        let (store, _, _) = TestSupport.makeStore()
+        let pathA = "/tmp/proj-A"
+        let pathB = "/tmp/proj-B"
+        store.addProject(path: pathA)
+        store.addProject(path: pathB)
+        store.selection = nil
+
+        store.newSession(in: nil)
+
+        XCTAssertEqual(store.orderedTargets.first, .root(projectPath: pathA))
+        XCTAssertEqual(store.sessions.filter { $0.target == .root(projectPath: pathA) }.count, 2)
+        XCTAssertEqual(store.sessions.filter { $0.target == .root(projectPath: pathB) }.count, 1)
     }
 }

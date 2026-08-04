@@ -5,13 +5,16 @@ import Foundation
 final class AppStore: ObservableObject {
     @Published var projects: [Project] = []
     @Published var sessions: [SessionRow] = []
+    @Published var workspaces: [WorkspaceRow] = []
     @Published var selection: String?
+    @Published var lastError: String?
 
     let terminals: any SessionTerminating
+    private let engine: any WorkspaceEngineProviding
 
-    /// Per-project session-number counters, in-memory only. Seeded from
+    /// Per-target session-number counters, in-memory only. Seeded from
     /// restored session names on launch; on relaunch max+1 is fine, no need
-    /// to persist the counter itself.
+    /// to persist the counter itself. Keyed by `TargetRef.id`.
     private var sessionCounters: [String: Int] = [:]
 
     private let stateURL: URL
@@ -28,9 +31,14 @@ final class AppStore: ObservableObject {
             .appendingPathComponent("state.json")
     }()
 
-    init(terminals: any SessionTerminating, stateURL: URL) {
+    init(
+        terminals: any SessionTerminating,
+        stateURL: URL,
+        engine: any WorkspaceEngineProviding = WorkspaceEngineCLI()
+    ) {
         self.terminals = terminals
         self.stateURL = stateURL
+        self.engine = engine
         terminals.onProcessExit = { [weak self] id in
             self?.closeSession(id)
         }
@@ -60,34 +68,100 @@ final class AppStore: ObservableObject {
         }
         sessions.removeAll { $0.projectPath == project.path }
         projects.removeAll { $0.path == project.path }
+        // Local bookkeeping only: removing a project from the app must never
+        // destroy the user's on-disk jj workspaces, so we drop our local
+        // WorkspaceRow records without ever calling engine.deleteWorkspace.
+        workspaces.removeAll { $0.projectPath == project.path }
         if let selection, removedIDs.contains(selection) {
             self.selection = nil
         }
         save()
     }
 
+    // MARK: - Workspace management
+
+    func createWorkspace(in projectPath: String) async {
+        do {
+            let row = try await engine.createWorkspace(projectPath: projectPath)
+            workspaces.append(row)
+            newSession(in: .workspace(projectPath: row.projectPath, name: row.name))
+            // newSession already calls save() at the end, so no extra save()
+            // call needed here.
+        } catch let error as EngineError {
+            lastError = error.message
+        } catch {
+            lastError = "\(error)"
+        }
+    }
+
+    func deleteWorkspace(_ id: WorkspaceRow.ID) async {
+        guard let workspace = workspaces.first(where: { $0.id == id }) else { return }
+        let target = TargetRef.workspace(projectPath: workspace.projectPath, name: workspace.name)
+
+        let removedIDs = sessions.filter { $0.target == target }.map(\.id)
+        for sessionID in removedIDs {
+            terminals.closeSession(sessionID)
+        }
+        sessions.removeAll { $0.target == target }
+        if let selection, removedIDs.contains(selection) {
+            self.selection = nil
+        }
+
+        do {
+            try await engine.deleteWorkspace(workspace)
+            workspaces.removeAll { $0.id == id }
+        } catch let error as EngineError {
+            // The terminals/session rows are already torn down above; restoring
+            // them would just desync the app from reality. Leave the
+            // WorkspaceRow in place instead, as a visible "retry me" marker.
+            lastError = error.message
+        } catch {
+            lastError = "\(error)"
+        }
+        save()
+    }
+
+    func setWorkspaceLabel(_ id: WorkspaceRow.ID, label: String?) {
+        guard let index = workspaces.firstIndex(where: { $0.id == id }) else { return }
+        let trimmed = label?.trimmingCharacters(in: .whitespacesAndNewlines)
+        workspaces[index].label = (trimmed?.isEmpty ?? true) ? nil : trimmed
+        save()
+    }
+
     // MARK: - Session management
 
-    func newSession(in project: Project?) {
-        let target: Project?
-        if let project {
-            target = project
+    /// Primary API: create a session on an explicit target, or (nil) resolve
+    /// one — selection's target, else the first ordered target, else no-op.
+    func newSession(in target: TargetRef?) {
+        let resolvedTarget: TargetRef?
+        if let target {
+            resolvedTarget = target
         } else if let selection,
                   let owningRow = sessions.first(where: { $0.id == selection })
         {
-            target = projects.first(where: { $0.path == owningRow.projectPath })
+            resolvedTarget = owningRow.target
         } else {
-            target = projects.first
+            resolvedTarget = orderedTargets.first
         }
-        guard let target else { return }
+        guard let resolvedTarget else { return }
 
-        let number = sessionCounters[target.path, default: 1]
-        sessionCounters[target.path] = number + 1
+        let number = sessionCounters[resolvedTarget.id, default: 1]
+        sessionCounters[resolvedTarget.id] = number + 1
 
-        let row = SessionRow(id: UUID().uuidString, projectPath: target.path, name: "Session \(number)")
+        let row = SessionRow(id: UUID().uuidString, target: resolvedTarget, name: "Session \(number)")
         sessions.append(row)
         selection = row.id
         save()
+    }
+
+    /// Compat shim for existing call sites that still think in terms of
+    /// `Project` (SidebarView's per-project "+" button, `addProject`). Always
+    /// resolves to that project's root target. Deliberately non-optional Project
+    /// (not Project?) — an optional-Project overload here would make the
+    /// existing bare `store.newSession(in: nil)` call sites in AppActions.swift
+    /// ambiguous against the TargetRef? overload above.
+    func newSession(in project: Project) {
+        newSession(in: .root(projectPath: project.path))
     }
 
     func closeSession(_ id: String) {
@@ -99,7 +173,7 @@ final class AppStore: ObservableObject {
         sessions.remove(at: index)
 
         if wasSelected {
-            let siblings = sessions.enumerated().filter { $0.element.projectPath == row.projectPath }
+            let siblings = sessions.enumerated().filter { $0.element.target == row.target }
             if siblings.isEmpty {
                 selection = nil
             } else if let next = siblings.first(where: { $0.offset >= index }) {
@@ -122,13 +196,26 @@ final class AppStore: ObservableObject {
 
     // MARK: - Navigation
 
-    /// Sidebar display order: for each project in `projects` order, its
+    /// For each project in `projects` order: its root target, then its
+    /// workspaces in `workspaces` array order (not re-sorted).
+    var orderedTargets: [TargetRef] {
+        projects.flatMap { project -> [TargetRef] in
+            let root = TargetRef.root(projectPath: project.path)
+            let workspaceTargets = workspaces
+                .filter { $0.projectPath == project.path }
+                .map { TargetRef.workspace(projectPath: $0.projectPath, name: $0.name) }
+            return [root] + workspaceTargets
+        }
+    }
+
+    /// Sidebar display order: for each ordered target, that target's
     /// sessions in `sessions` array order. Mirrors exactly what SidebarView
     /// renders — project A's sessions all before project B's, even when
-    /// insertion interleaved the two projects.
+    /// insertion interleaved the two projects. With zero workspaces this
+    /// produces exactly what the old project-based version did.
     var orderedSessions: [SessionRow] {
-        projects.flatMap { project in
-            sessions.filter { $0.projectPath == project.path }
+        orderedTargets.flatMap { target in
+            sessions.filter { $0.target == target }
         }
     }
 
@@ -183,14 +270,16 @@ final class AppStore: ObservableObject {
 
         projects = state.projects.map { Project(path: $0) }
         sessions = state.sessions
+        workspaces = state.workspaces
         selection = state.selection
     }
 
     private func save() {
         let state = PersistedState(
-            version: 1,
+            version: 2,
             projects: projects.map(\.path),
             sessions: sessions,
+            workspaces: workspaces,
             selection: selection
         )
         do {
@@ -204,15 +293,15 @@ final class AppStore: ObservableObject {
     }
 
     private func seedSessionCounters() {
-        for project in projects {
+        for target in orderedTargets {
             let maxNumber = sessions
-                .filter { $0.projectPath == project.path }
+                .filter { $0.target == target }
                 .compactMap { row -> Int? in
                     guard row.name.hasPrefix("Session ") else { return nil }
                     return Int(row.name.dropFirst("Session ".count))
                 }
                 .max() ?? 0
-            sessionCounters[project.path] = maxNumber + 1
+            sessionCounters[target.id] = maxNumber + 1
         }
     }
 }

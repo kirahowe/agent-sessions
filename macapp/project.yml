@@ -20,6 +20,8 @@ targets:
     platform: macOS
     sources:
       - path: Agents
+      - path: ../cli/agents-cli
+        buildPhase: resources
     dependencies:
       - package: libghostty-spm
         product: GhosttyTerminal

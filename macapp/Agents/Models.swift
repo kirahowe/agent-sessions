@@ -6,34 +6,93 @@ struct Project: Identifiable, Hashable {
     var name: String { (path as NSString).lastPathComponent }
 }
 
+/// A session's terminal attaches to a target: either a project's root
+/// directory, or one of its jj workspaces. `id` is the stable string used
+/// for terminal-view keying (TerminalCenter's cache key) and session-counter
+/// keying, so it must never change shape once persisted.
+enum TargetRef: Hashable, Codable {
+    case root(projectPath: String)
+    case workspace(projectPath: String, name: String)
+
+    var projectPath: String {
+        switch self {
+        case .root(let projectPath): return projectPath
+        case .workspace(let projectPath, _): return projectPath
+        }
+    }
+
+    var id: String {
+        switch self {
+        case .root(let projectPath): return "root|\(projectPath)"
+        case .workspace(let projectPath, let name): return "ws|\(projectPath)|\(name)"
+        }
+    }
+}
+
+/// A jj workspace of a project. `name`/`path` are immutable identity set at
+/// creation time by the engine (jj workspace name + its directory);
+/// `label` is a purely cosmetic display alias — renaming NEVER touches
+/// `name`, `path`, or the underlying jj workspace.
+struct WorkspaceRow: Identifiable, Codable, Hashable {
+    var projectPath: String
+    var name: String
+    var path: String
+    var label: String?
+
+    // Deliberately the same "ws|<path>|<name>" shape as TargetRef.workspace's
+    // id — the two are meant to key identically.
+    var id: String { "ws|\(projectPath)|\(name)" }
+    var displayName: String { label ?? name }
+}
+
 struct SessionRow: Identifiable, Codable, Hashable {
     let id: String        // UUID string
-    var projectPath: String
+    var target: TargetRef
     var name: String      // "Session 1", "Session 2", ... renameable
+
+    var projectPath: String { target.projectPath }
 }
 
 struct PersistedState: Codable {
     var version: Int
     var projects: [String]        // absolute paths
     var sessions: [SessionRow]
+    var workspaces: [WorkspaceRow]
     var selection: String?        // session id
 
-    init(version: Int, projects: [String], sessions: [SessionRow], selection: String?) {
+    init(version: Int, projects: [String], sessions: [SessionRow], workspaces: [WorkspaceRow], selection: String?) {
         self.version = version
         self.projects = projects
         self.sessions = sessions
+        self.workspaces = workspaces
         self.selection = selection
     }
 
     private enum CodingKeys: String, CodingKey {
-        case version, projects, sessions, selection
+        case version, projects, sessions, workspaces, selection
+    }
+
+    /// The pre-v2 on-disk shape: sessions carried a flat `projectPath`
+    /// instead of a `TargetRef`, and there was no `workspaces` array.
+    private struct LegacySessionV1: Codable {
+        let id: String
+        let projectPath: String
+        let name: String
     }
 
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         version = try container.decodeIfPresent(Int.self, forKey: .version) ?? 1
         projects = try container.decode([String].self, forKey: .projects)
-        sessions = try container.decode([SessionRow].self, forKey: .sessions)
         selection = try container.decodeIfPresent(String.self, forKey: .selection)
+
+        if version >= 2 {
+            sessions = try container.decode([SessionRow].self, forKey: .sessions)
+            workspaces = try container.decodeIfPresent([WorkspaceRow].self, forKey: .workspaces) ?? []
+        } else {
+            let legacy = try container.decode([LegacySessionV1].self, forKey: .sessions)
+            sessions = legacy.map { SessionRow(id: $0.id, target: .root(projectPath: $0.projectPath), name: $0.name) }
+            workspaces = []
+        }
     }
 }
