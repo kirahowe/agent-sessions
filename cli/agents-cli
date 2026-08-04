@@ -63,6 +63,7 @@
 ;; required flag) never touches this and can't fail merely because jj is
 ;; absent.
 
+;; Kept in sync with ToolPreflight.swift's jj-resolution logic (macOS app) — see that file for why.
 (defn resolve-jj []
   (let [env-path (System/getenv "AGENTS_JJ")]
     (or (when (and (not (str/blank? env-path)) (fs/executable? env-path))

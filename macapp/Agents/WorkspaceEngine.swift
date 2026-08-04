@@ -109,6 +109,7 @@ final class WorkspaceEngineCLI: WorkspaceEngineProviding {
         )
     }
 
+    // Kept in sync with ToolPreflight.swift's bb-resolution logic — see that file for why.
     /// Locates the `bb` (babashka) binary.
     private static func resolveBBPath() throws -> String {
         let fm = FileManager.default

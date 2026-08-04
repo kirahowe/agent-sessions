@@ -43,6 +43,16 @@ struct RootView: View {
             }
         }
         .navigationTitle(windowTitle)
+        .task {
+            // Runs once at launch: a non-blocking, informational check for
+            // bb/jj. Terminals work fine without either — only workspace
+            // operations need them — so a miss here only queues an alert,
+            // never anything that gates app usage.
+            let missing = ToolPreflight.missingTools()
+            if !missing.isEmpty {
+                uiState.missingToolsNotice = ToolPreflight.guidance(for: missing)
+            }
+        }
         .sheet(isPresented: $uiState.showShortcutHelp) {
             ShortcutHelpView()
         }
@@ -79,6 +89,21 @@ struct RootView: View {
             Button("Cancel", role: .cancel) {
                 store.pendingTrunkBootstrap = nil
             }
+        }
+        .alert(
+            "Some features need extra tools",
+            isPresented: Binding(
+                get: { uiState.missingToolsNotice != nil },
+                set: { isPresented in
+                    if !isPresented { uiState.missingToolsNotice = nil }
+                }
+            )
+        ) {
+            Button("OK") {
+                uiState.missingToolsNotice = nil
+            }
+        } message: {
+            Text(uiState.missingToolsNotice ?? "")
         }
     }
 }
