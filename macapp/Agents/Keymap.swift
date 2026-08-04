@@ -14,6 +14,9 @@ enum AppAction: Hashable {
     case previousSession
     case nextSession
     case selectSession(Int)
+    case newWorkspace
+    case deleteWorkspace
+    case showShortcutHelp
 }
 
 extension AppAction: CaseIterable {
@@ -22,8 +25,51 @@ extension AppAction: CaseIterable {
     /// cases (0...8, for the ⌘1–⌘9 bindings) explicitly alongside the
     /// simple cases.
     static var allCases: [AppAction] {
-        [.newSession, .closeSession, .closeWindow, .addProject, .removeProject, .previousSession, .nextSession]
+        [
+            .newSession, .closeSession, .closeWindow, .addProject, .removeProject,
+            .previousSession, .nextSession, .newWorkspace, .deleteWorkspace, .showShortcutHelp,
+        ]
             + (0..<9).map { AppAction.selectSession($0) }
+    }
+}
+
+extension AppAction {
+    /// Human-facing label for the ⌘? shortcut-help sheet, which is
+    /// GENERATED from this + `Keymap.standard` rather than hand-maintained
+    /// (see ShortcutHelpView). `selectSession`'s nine cases deliberately all
+    /// share this same title, which is how they collapse into one display
+    /// row (see ShortcutHelpView.rows(in:)).
+    var helpTitle: String {
+        switch self {
+        case .newSession: return "New Session"
+        case .closeSession: return "Close Session"
+        case .closeWindow: return "Close Window"
+        case .addProject: return "Add Project…"
+        case .removeProject: return "Remove Project…"
+        case .previousSession: return "Previous Session"
+        case .nextSession: return "Next Session"
+        case .selectSession: return "Jump to session"
+        case .newWorkspace: return "New Workspace"
+        case .deleteWorkspace: return "Delete Workspace…"
+        case .showShortcutHelp: return "Keyboard Shortcuts"
+        }
+    }
+
+    /// Which section of the shortcut-help sheet this action's row renders
+    /// under. Sheet section order is fixed in `ShortcutHelpView`.
+    var helpGroup: String {
+        switch self {
+        case .newSession, .closeSession, .previousSession, .nextSession, .selectSession:
+            return "Sessions"
+        case .newWorkspace, .deleteWorkspace:
+            return "Workspaces"
+        case .addProject, .removeProject:
+            return "Projects"
+        case .closeWindow:
+            return "Window"
+        case .showShortcutHelp:
+            return "Help"
+        }
     }
 }
 
@@ -92,6 +138,23 @@ struct Shortcut: Hashable {
 
         return (keyEquivalent, eventModifiers)
     }
+
+    /// Human-facing rendering for the shortcut-help sheet, e.g. "⌘T",
+    /// "⇧⌘W", "⌥⌘↓", "⌘1". Glyph order follows the conventional ⌃⌥⇧⌘
+    /// (control, option, shift, command) ordering.
+    var displayString: String {
+        var result = ""
+        if modifiers.contains(.control) { result += "⌃" }
+        if modifiers.contains(.option) { result += "⌥" }
+        if modifiers.contains(.shift) { result += "⇧" }
+        if modifiers.contains(.command) { result += "⌘" }
+        switch key {
+        case .char(let character): result += String(character).uppercased()
+        case .upArrow: result += "↑"
+        case .downArrow: result += "↓"
+        }
+        return result
+    }
 }
 
 /// THE single source of truth for every keyboard shortcut in the app.
@@ -107,7 +170,9 @@ enum Keymap {
             .addProject: Shortcut(key: .char("n"), modifiers: [.command, .shift]),
             .previousSession: Shortcut(key: .upArrow, modifiers: [.command, .option]),
             .nextSession: Shortcut(key: .downArrow, modifiers: [.command, .option]),
-            // .removeProject intentionally has no entry: menu-only, no shortcut.
+            .newWorkspace: Shortcut(key: .char("n"), modifiers: [.command]),
+            .showShortcutHelp: Shortcut(key: .char("?"), modifiers: [.command, .shift]),
+            // .removeProject, .deleteWorkspace intentionally have no entry: menu-only, no shortcut.
         ]
         for index in 0..<9 {
             let digit = Character("\(index + 1)")

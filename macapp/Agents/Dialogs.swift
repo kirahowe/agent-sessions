@@ -31,11 +31,13 @@ enum Dialogs {
         return alert.runModal() == .alertFirstButtonReturn
     }
 
-    /// Prompts for a new session name, pre-filled with `currentName`. Returns
-    /// the (untrimmed) field value iff "Rename" was clicked, else nil.
-    static func promptRename(currentName: String) -> String? {
+    /// Prompts for a new name, pre-filled with `currentName`. Returns the
+    /// (untrimmed) field value iff the primary button was clicked, else
+    /// nil. `title` lets callers reuse this for renaming things other than
+    /// a session (e.g. a workspace) with the right dialog heading.
+    static func promptRename(currentName: String, title: String = "Rename Session") -> String? {
         let alert = NSAlert()
-        alert.messageText = "Rename Session"
+        alert.messageText = title
         alert.addButton(withTitle: "Rename")
         alert.addButton(withTitle: "Cancel")
 
@@ -46,5 +48,20 @@ enum Dialogs {
 
         guard alert.runModal() == .alertFirstButtonReturn else { return nil }
         return textField.stringValue
+    }
+
+    /// Confirms deleting a jj workspace. Returns true iff the user picked
+    /// the destructive "Delete" option.
+    static func confirmDeleteWorkspace(_ ws: WorkspaceRow) -> Bool {
+        let alert = NSAlert()
+        alert.messageText = "Delete Workspace \u{201C}\(ws.displayName)\u{201D}?"
+        alert.informativeText =
+            "This moves the workspace directory to the Bin and tells jj to forget the workspace. Commits and bookmarks remain in the repo."
+        alert.alertStyle = .warning
+        let deleteButton = alert.addButton(withTitle: "Delete")
+        deleteButton.hasDestructiveAction = true
+        alert.addButton(withTitle: "Cancel")
+
+        return alert.runModal() == .alertFirstButtonReturn
     }
 }

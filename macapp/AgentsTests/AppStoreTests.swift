@@ -781,4 +781,78 @@ final class AppStoreTests: XCTestCase {
         XCTAssertEqual(store.sessions.filter { $0.target == .root(projectPath: pathA) }.count, 2)
         XCTAssertEqual(store.sessions.filter { $0.target == .root(projectPath: pathB) }.count, 1)
     }
+
+    // MARK: - 31
+
+    func test31a_workingDirectoryForRootSessionIsProjectPath() {
+        let (store, _, _) = TestSupport.makeStore()
+        let pathA = "/tmp/proj-A"
+        store.addProject(path: pathA)
+        let session = store.sessions.first { $0.target == .root(projectPath: pathA) }!
+
+        XCTAssertEqual(store.workingDirectory(for: session), pathA)
+    }
+
+    func test31b_workingDirectoryForWorkspaceSessionIsWorkspacePath() async {
+        let fake = FakeWorkspaceEngine()
+        let (store, _, _) = TestSupport.makeStore(engine: fake)
+        let pathA = "/tmp/proj-A"
+        store.addProject(path: pathA)
+
+        let wsRow = WorkspaceRow(projectPath: pathA, name: "ws-a", path: "/tmp/workspaces/ws-a", label: nil)
+        fake.nextCreateResult = .success(wsRow)
+        await store.createWorkspace(in: pathA)
+        let wsSession = store.sessions.first { $0.target == .workspace(projectPath: pathA, name: "ws-a") }!
+
+        XCTAssertEqual(store.workingDirectory(for: wsSession), wsRow.path)
+    }
+
+    func test31c_workingDirectoryFallsBackToProjectPathWhenWorkspaceRowIsMissing() {
+        let (store, _, _) = TestSupport.makeStore()
+        let pathA = "/tmp/proj-A"
+        store.addProject(path: pathA)
+        // Deliberately not created through createWorkspace, so no matching
+        // WorkspaceRow exists — the "shouldn't happen" desync case.
+        let orphan = SessionRow(id: UUID().uuidString, target: .workspace(projectPath: pathA, name: "ghost"), name: "Session 1")
+
+        XCTAssertEqual(store.workingDirectory(for: orphan), pathA)
+    }
+
+    // MARK: - 32
+
+    func test32a_selectOrCreateSessionSelectsExistingFirstSessionWithoutCreatingANewOne() async {
+        let fake = FakeWorkspaceEngine()
+        let (store, _, _) = TestSupport.makeStore(engine: fake)
+        let pathA = "/tmp/proj-A"
+        store.addProject(path: pathA)
+
+        let wsRow = WorkspaceRow(projectPath: pathA, name: "ws-a", path: "/tmp/workspaces/ws-a", label: nil)
+        fake.nextCreateResult = .success(wsRow)
+        await store.createWorkspace(in: pathA) // ws: Session 1
+        let target = TargetRef.workspace(projectPath: pathA, name: "ws-a")
+        let existingSession = store.sessions.first { $0.target == target }!
+        store.newSession(in: .root(projectPath: pathA)) // move selection elsewhere
+        XCTAssertNotEqual(store.selection, existingSession.id)
+
+        store.selectOrCreateSession(in: target)
+
+        XCTAssertEqual(store.selection, existingSession.id)
+        XCTAssertEqual(store.sessions.filter { $0.target == target }.count, 1, "must not create a new session when one already exists")
+    }
+
+    func test32b_selectOrCreateSessionCreatesASessionWhenTargetHasNone() {
+        let (store, _, _) = TestSupport.makeStore()
+        let pathA = "/tmp/proj-A"
+        store.addProject(path: pathA)
+        let target = TargetRef.root(projectPath: pathA)
+        let onlySession = store.sessions.first { $0.target == target }!
+        store.closeSession(onlySession.id)
+        XCTAssertTrue(store.sessions.filter { $0.target == target }.isEmpty)
+
+        store.selectOrCreateSession(in: target)
+
+        let created = store.sessions.first { $0.target == target }
+        XCTAssertNotNil(created)
+        XCTAssertEqual(store.selection, created?.id)
+    }
 }

@@ -3,6 +3,7 @@ import SwiftUI
 struct RootView: View {
     @ObservedObject var store: AppStore
     let center: TerminalCenter
+    @ObservedObject var uiState: UIState
 
     private var windowTitle: String {
         if let selectedID = store.selection,
@@ -42,5 +43,23 @@ struct RootView: View {
             }
         }
         .navigationTitle(windowTitle)
+        .sheet(isPresented: $uiState.showShortcutHelp) {
+            ShortcutHelpView()
+        }
+        .alert(
+            "Workspace Error",
+            isPresented: Binding(
+                get: { store.lastError != nil },
+                set: { isPresented in
+                    if !isPresented { store.lastError = nil }
+                }
+            )
+        ) {
+            Button("OK") {
+                store.lastError = nil
+            }
+        } message: {
+            Text(store.lastError ?? "")
+        }
     }
 }

@@ -59,4 +59,18 @@ final class KeymapTests: XCTestCase {
     func test_controlCommandT_extraModifier_isNil() {
         XCTAssertNil(Keymap.action(for: keyEvent(characters: "t", modifiers: [.command, .control])))
     }
+
+    func test_commandN_mapsToNewWorkspace() {
+        XCTAssertEqual(Keymap.action(for: keyEvent(characters: "n", modifiers: [.command])), .newWorkspace)
+    }
+
+    func test_shiftCommandSlash_mapsToShowShortcutHelp() {
+        XCTAssertEqual(Keymap.action(for: keyEvent(characters: "?", modifiers: [.command, .shift])), .showShortcutHelp)
+    }
+
+    func test_everyKeymapActionHasNonEmptyHelpTitle() {
+        for action in Keymap.standard.keys {
+            XCTAssertFalse(action.helpTitle.isEmpty, "\(action) is missing a non-empty helpTitle for the shortcut-help sheet")
+        }
+    }
 }

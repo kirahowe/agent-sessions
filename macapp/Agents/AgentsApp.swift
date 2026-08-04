@@ -1,11 +1,21 @@
 import AppKit
 import SwiftUI
 
+/// Tiny UI-only state that doesn't belong in AppStore's persisted model —
+/// currently just whether the ⌘? shortcut-help sheet is showing. Owned by
+/// AgentsApp alongside AppActions: AppActions.perform(.showShortcutHelp)
+/// toggles it, RootView observes it to drive its `.sheet`.
+@MainActor
+final class UIState: ObservableObject {
+    @Published var showShortcutHelp = false
+}
+
 @main
 struct AgentsApp: App {
     let center: TerminalCenter
     let actions: AppActions
     let router: ShortcutRouter
+    let uiState: UIState
     @StateObject private var store: AppStore
 
     init() {
@@ -14,7 +24,10 @@ struct AgentsApp: App {
         let store = AppStore(terminals: center, stateURL: AppStore.defaultStateURL)
         _store = StateObject(wrappedValue: store)
 
-        let actions = AppActions(store: store)
+        let uiState = UIState()
+        self.uiState = uiState
+
+        let actions = AppActions(store: store, uiState: uiState)
         self.actions = actions
         let router = ShortcutRouter { actions.perform($0) }
         self.router = router
@@ -28,15 +41,23 @@ struct AgentsApp: App {
 
     var body: some Scene {
         WindowGroup {
-            RootView(store: store, center: center)
+            RootView(store: store, center: center, uiState: uiState)
                 .environment(\.appActions, actions)
         }
         .commands {
-            CommandGroup(after: .newItem) {
+            // Replaces (rather than extends) the system File > New Window
+            // group: New Window (⌘N) makes no sense for this app, and ⌘N is
+            // repurposed below for New Workspace.
+            CommandGroup(replacing: .newItem) {
                 Button("New Session") {
                     actions.perform(.newSession)
                 }
                 .keymapShortcut(.newSession)
+
+                Button("New Workspace") {
+                    actions.perform(.newWorkspace)
+                }
+                .keymapShortcut(.newWorkspace)
 
                 Button("Add Project…") {
                     actions.perform(.addProject)
@@ -47,6 +68,11 @@ struct AgentsApp: App {
                     actions.perform(.removeProject)
                 }
                 // No .keymapShortcut: removeProject has no Keymap entry (menu-only).
+
+                Button("Delete Workspace…") {
+                    actions.perform(.deleteWorkspace)
+                }
+                // No .keymapShortcut: deleteWorkspace has no Keymap entry (menu-only).
             }
 
             CommandGroup(replacing: .saveItem) {
@@ -72,6 +98,13 @@ struct AgentsApp: App {
                     actions.perform(.nextSession)
                 }
                 .keymapShortcut(.nextSession)
+            }
+
+            CommandGroup(replacing: .help) {
+                Button("Keyboard Shortcuts") {
+                    actions.perform(.showShortcutHelp)
+                }
+                .keymapShortcut(.showShortcutHelp)
             }
         }
     }

@@ -31,7 +31,7 @@ struct TerminalHostView: NSViewRepresentable {
 
         let terminalView = center.terminalView(
             for: selectedID,
-            workingDirectory: row.projectPath
+            workingDirectory: store.workingDirectory(for: row)
         )
 
         if terminalView.superview !== containerView {

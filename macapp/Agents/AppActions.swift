@@ -7,9 +7,11 @@ import SwiftUI
 @MainActor
 final class AppActions {
     let store: AppStore
+    let uiState: UIState
 
-    init(store: AppStore) {
+    init(store: AppStore, uiState: UIState) {
         self.store = store
+        self.uiState = uiState
     }
 
     @discardableResult
@@ -39,7 +41,7 @@ final class AppActions {
             return true
 
         case .removeProject:
-            let project = resolveProjectForRemoval()
+            let project = resolveProject()
             guard let project else { return false }
             // Once a project is resolved we opened the confirm dialog, so
             // the shortcut/menu-item did its job regardless of the user's
@@ -61,13 +63,40 @@ final class AppActions {
 
         case .selectSession(let index):
             return store.selectSession(at: index)
+
+        case .newWorkspace:
+            guard let project = resolveProject() else { return false }
+            Task { await store.createWorkspace(in: project.path) }
+            return true
+
+        case .deleteWorkspace:
+            guard let selection = store.selection,
+                  let row = store.sessions.first(where: { $0.id == selection }),
+                  case .workspace(let projectPath, let name) = row.target,
+                  let workspace = store.workspaces.first(where: { $0.projectPath == projectPath && $0.name == name })
+            else { return false }
+            // Once a workspace is resolved we opened the confirm dialog, so
+            // the shortcut/menu-item did its job regardless of the user's
+            // choice (same "cancel still counts as handled" reasoning as addProject/removeProject).
+            if Dialogs.confirmDeleteWorkspace(workspace) {
+                Task { await store.deleteWorkspace(workspace.id) }
+            }
+            return true
+
+        case .showShortcutHelp:
+            uiState.showShortcutHelp.toggle()
+            return true
         }
     }
 
-    /// Resolves which project `.removeProject` targets: the selected
-    /// session's project, or (with no selection) the single project if
-    /// exactly one exists. Anything more ambiguous resolves to nil.
-    private func resolveProjectForRemoval() -> Project? {
+    /// Resolves which project an unqualified, selection-driven action
+    /// targets: the selected session's project, or (with no selection) the
+    /// single project if exactly one exists. Anything more ambiguous
+    /// resolves to nil. Shared by `.removeProject` and `.newWorkspace` —
+    /// both need "the project implied by current context," not a
+    /// row-targeted project (row-targeted creation/removal goes straight
+    /// through the store from SidebarView instead).
+    private func resolveProject() -> Project? {
         if let selection = store.selection,
            let row = store.sessions.first(where: { $0.id == selection })
         {

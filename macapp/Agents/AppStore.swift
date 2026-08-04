@@ -164,6 +164,18 @@ final class AppStore: ObservableObject {
         newSession(in: .root(projectPath: project.path))
     }
 
+    /// Used by the sidebar's workspace-row tap: selects that workspace's
+    /// first (`sessions` array order) session if it has one, else creates a
+    /// fresh one via `newSession(in:)` (which also selects and saves).
+    func selectOrCreateSession(in target: TargetRef) {
+        if let first = sessions.first(where: { $0.target == target }) {
+            selection = first.id
+            save()
+        } else {
+            newSession(in: target)
+        }
+    }
+
     func closeSession(_ id: String) {
         guard let index = sessions.firstIndex(where: { $0.id == id }) else { return }
         let row = sessions[index]
@@ -259,6 +271,26 @@ final class AppStore: ObservableObject {
         selection = ordered[index].id
         save()
         return true
+    }
+
+    // MARK: - Terminal working directory
+
+    /// Resolves the working directory a session's terminal should spawn
+    /// into: the project root for a root-targeted session, or the matching
+    /// `WorkspaceRow`'s `path` for a workspace-targeted one. Falls back to
+    /// the project path if the `WorkspaceRow` is missing — shouldn't happen
+    /// in practice, but a terminal must still spawn somewhere sane rather
+    /// than crash/fail if local state ever desyncs from the workspace list.
+    func workingDirectory(for session: SessionRow) -> String {
+        switch session.target {
+        case .root(let projectPath):
+            return projectPath
+        case .workspace(let projectPath, let name):
+            if let workspace = workspaces.first(where: { $0.projectPath == projectPath && $0.name == name }) {
+                return workspace.path
+            }
+            return projectPath
+        }
     }
 
     // MARK: - Persistence
