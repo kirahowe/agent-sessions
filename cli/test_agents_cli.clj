@@ -20,6 +20,11 @@
 
 (def cli-path (str (fs/path (fs/parent (fs/absolutize *file*)) "agents-cli")))
 
+;; bb's own absolute path, resolved once via this process's own (full) PATH
+;; -- lets the stripped-PATH test below invoke bb explicitly, bypassing PATH
+;; entirely for the subprocess it launches.
+(def bb-path (str (fs/which "bb")))
+
 (defn sh
   "Run a real subprocess, capturing stdout/stderr/exit separately."
   [& args]
@@ -317,7 +322,28 @@
       (is (= "bad-args" (get-in json [:error :code]))))))
 
 ;; -----------------------------------------------------------------------
-;; 10. workspace-land: happy path, existing main
+;; 10. jj resolution: fallback candidates under a stripped PATH
+
+(deftest workspace-add-jj-fallback-path-test
+  (testing "with PATH stripped to /usr/bin:/bin (no jj on it), agents-cli still finds jj via its /opt/homebrew/bin or /usr/local/bin fallback candidates"
+    (let [{:keys [root project]} (fresh-jj-project!)]
+      (try
+        (let [{:keys [exit out err]}
+              @(p/process [bb-path cli-path "workspace-add" "--project" project "--name" "pathless"]
+                          {:out :string :err :string :extra-env {"PATH" "/usr/bin:/bin"}})
+              lines (remove str/blank? (str/split-lines out))]
+          (is (= 1 (count lines))
+              (str "stdout must be exactly one JSON line; got " (pr-str out)
+                   " (stderr: " (pr-str err) ")"))
+          (is (= 0 exit))
+          (let [json (json/parse-string (str/trim out) true)]
+            (is (true? (:ok json)))
+            (is (str/includes? (direct-jj-workspace-list project) "agents/pathless")
+                "jj workspace list (run directly) should show the new workspace")))
+        (finally (cleanup! root))))))
+
+;; -----------------------------------------------------------------------
+;; 11. workspace-land: happy path, existing main
 
 (deftest workspace-land-happy-path-main-test
   (testing "landing a single uncommitted edit onto an existing main bookmark"
@@ -359,7 +385,7 @@
         (finally (cleanup! root))))))
 
 ;; -----------------------------------------------------------------------
-;; 11. workspace-land: multi-commit chain plus trailing uncommitted edit
+;; 12. workspace-land: multi-commit chain plus trailing uncommitted edit
 
 (deftest workspace-land-multi-commit-chain-test
   (testing "landing squashes a multi-commit chain plus a trailing uncommitted edit into one commit"
@@ -385,7 +411,7 @@
         (finally (cleanup! root))))))
 
 ;; -----------------------------------------------------------------------
-;; 12. workspace-land: trunk advanced concurrently
+;; 13. workspace-land: trunk advanced concurrently
 
 (deftest workspace-land-concurrent-advance-test
   (testing "landing rebases onto a trunk that moved forward concurrently, keeping both sides' changes"
@@ -416,7 +442,7 @@
         (finally (cleanup! root))))))
 
 ;; -----------------------------------------------------------------------
-;; 13. workspace-land: conflict rolls back cleanly
+;; 14. workspace-land: conflict rolls back cleanly
 
 (deftest workspace-land-conflict-test
   (testing "a genuine content conflict rolls back cleanly and reports land-conflict"
@@ -453,7 +479,7 @@
         (finally (cleanup! root))))))
 
 ;; -----------------------------------------------------------------------
-;; 14. workspace-land: no trunk, no --create-trunk
+;; 15. workspace-land: no trunk, no --create-trunk
 
 (deftest workspace-land-no-trunk-test
   (testing "no bookmarks at all and no --create-trunk -> no-trunk, nothing mutated"
@@ -471,7 +497,7 @@
         (finally (cleanup! root))))))
 
 ;; -----------------------------------------------------------------------
-;; 15. workspace-land: no trunk, --create-trunk main
+;; 16. workspace-land: no trunk, --create-trunk main
 
 (deftest workspace-land-create-trunk-test
   (testing "no existing trunk, --create-trunk creates one at the landed commit"
@@ -511,7 +537,7 @@
         (finally (cleanup! root))))))
 
 ;; -----------------------------------------------------------------------
-;; 16. workspace-land: fresh workspace, zero changes
+;; 17. workspace-land: fresh workspace, zero changes
 
 (deftest workspace-land-nothing-to-land-test
   (testing "a fresh workspace with zero changes -> nothing-to-land"
@@ -529,7 +555,7 @@
         (finally (cleanup! root))))))
 
 ;; -----------------------------------------------------------------------
-;; 17. workspace-land: missing --message
+;; 18. workspace-land: missing --message
 
 (deftest workspace-land-missing-message-test
   (testing "missing --message -> bad-args"
@@ -544,7 +570,7 @@
         (finally (cleanup! root))))))
 
 ;; -----------------------------------------------------------------------
-;; 18. workspace-land: unregistered workspace name
+;; 19. workspace-land: unregistered workspace name
 
 (deftest workspace-land-unregistered-workspace-test
   (testing "--name referring to a never-added workspace -> jj-failed"

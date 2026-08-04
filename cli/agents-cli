@@ -49,12 +49,39 @@
   (throw (ex-info message {:code code :message message})))
 
 ;; -----------------------------------------------------------------------
+;; Resolving the jj binary. The macOS app launches this script via an
+;; absolute-path bb, but when the app is started from Finder/Dock (not a
+;; terminal) the process inherits launchd's minimal PATH
+;; (/usr/bin:/bin:/usr/sbin:/sbin — no /opt/homebrew/bin), so a bare "jj"
+;; resolved via PATH fails with "Cannot run program jj". We resolve jj to an
+;; absolute path ourselves instead of trusting PATH: first AGENTS_JJ (an
+;; explicit override), then `fs/which` (covers normal terminal use, where
+;; PATH is a real login-shell PATH), then a couple of well-known Homebrew
+;; install locations as a last resort. Wrapped in a delay so resolution runs
+;; at most once, and only when some code path actually tries to run jj --
+;; a bad-args error (missing subcommand, unknown subcommand, missing
+;; required flag) never touches this and can't fail merely because jj is
+;; absent.
+
+(defn resolve-jj []
+  (let [env-path (System/getenv "AGENTS_JJ")]
+    (or (when (and (not (str/blank? env-path)) (fs/executable? env-path))
+          env-path)
+        (some-> (fs/which "jj") str)
+        (some #(when (fs/executable? %) %) ["/opt/homebrew/bin/jj" "/usr/local/bin/jj"])
+        (cli-error "jj-failed"
+                   (str "jj not found — set AGENTS_JJ or install jj "
+                        "(looked in PATH, /opt/homebrew/bin, /usr/local/bin)")))))
+
+(def jj-path (delay (resolve-jj)))
+
+;; -----------------------------------------------------------------------
 ;; Shelling out to jj. Global flags (-R, --no-pager) always go before the
 ;; subcommand — jj is picky about that ordering for some subcommands, so we
 ;; do it consistently everywhere rather than relying on it not mattering.
 
 (defn run-jj [args]
-  (let [result @(p/process (into ["jj"] args) {:out :string :err :string})]
+  (let [result @(p/process (into [@jj-path] args) {:out :string :err :string})]
     {:exit (:exit result) :out (:out result) :err (:err result)}))
 
 (defn stderr-tail
@@ -74,7 +101,7 @@
    the load-bearing safety property that keeps this command from ever
    touching the default workspace's working copy."
   [dir args]
-  (let [result @(p/process (into ["jj"] args) {:dir dir :out :string :err :string})]
+  (let [result @(p/process (into [@jj-path] args) {:dir dir :out :string :err :string})]
     {:exit (:exit result) :out (:out result) :err (:err result)}))
 
 ;; -----------------------------------------------------------------------
