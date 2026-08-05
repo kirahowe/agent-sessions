@@ -97,13 +97,13 @@ struct SidebarView: View {
 }
 
 /// A session row in the sidebar. Owns its own hover state so its trailing
-/// accessories (ellipsis menu, close button) can hover-reveal without
-/// disturbing the rest of the row's layout — `.opacity` rather than
-/// conditional insertion keeps row height stable as the accessories
-/// appear/disappear. No enclosing `Button` here (unlike `WorkspaceRowView`
-/// below): this row was already tag-based (`List`'s own selection), so the
-/// new Menu/Button accessories are just sibling controls within it and don't
-/// risk swallowing the row's tap-to-select the way a wrapping Button would.
+/// ellipsis menu can hover-reveal without disturbing the rest of the row's
+/// layout — `.opacity` rather than conditional insertion keeps row height
+/// stable as the menu appears/disappears. No enclosing `Button` here (unlike
+/// `WorkspaceRowView` below): this row was already tag-based (`List`'s own
+/// selection), so the Menu accessory is just a sibling control within it and
+/// doesn't risk swallowing the row's tap-to-select the way a wrapping Button
+/// would.
 private struct SessionRowView: View {
     let store: AppStore
     let session: SessionRow
@@ -117,33 +117,17 @@ private struct SessionRowView: View {
                 .foregroundStyle(.secondary)
             Text(session.name)
             Spacer()
-            HStack(spacing: 4) {
-                Menu {
-                    menuItems
-                } label: {
-                    Image(systemName: "ellipsis.circle")
-                        .imageScale(.small)
-                        .foregroundStyle(.secondary)
-                }
-                .menuStyle(.borderlessButton)
-                .menuIndicator(.hidden)
-                .fixedSize()
-                .accessibilityLabel("More Actions")
-
-                // Direct store call, not actions.perform: this closes the
-                // specific row's session, not the app's global selection
-                // (see comment on the context menu below). No confirm here:
-                // matches ⌘W's behavior (AppActions' .closeSession case).
-                Button {
-                    store.closeSession(session.id)
-                } label: {
-                    Image(systemName: "xmark")
-                        .imageScale(.small)
-                        .foregroundStyle(.secondary)
-                }
-                .buttonStyle(.borderless)
-                .accessibilityLabel("Close Session")
+            Menu {
+                menuItems
+            } label: {
+                Image(systemName: "ellipsis.circle")
+                    .imageScale(.small)
+                    .foregroundStyle(.secondary)
             }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .fixedSize()
+            .accessibilityLabel("More Actions")
             .opacity(isHovered ? 1 : 0)
         }
         .padding(.vertical, 5)
@@ -179,12 +163,12 @@ private struct SessionRowView: View {
 
 /// A workspace row in the sidebar. Owns its own hover state the same way
 /// `SessionRowView` does. Unlike that row, this one's entire tap target IS a
-/// `Button` (selects-or-creates a session on tap) — so the trailing
-/// accessories live in their own `HStack`, as a SIBLING of that `Button`
-/// rather than nested inside its label. Nesting them inside the label would
-/// mean two overlapping tap handlers fighting over the same click; keeping
-/// them outside means the `Button`'s frame simply doesn't extend under the
-/// accessories, so each control only ever receives clicks meant for it.
+/// `Button` (selects-or-creates a session on tap) — so the trailing ellipsis
+/// menu is a SIBLING of that `Button` rather than nested inside its label.
+/// Nesting it inside the label would mean two overlapping tap handlers
+/// fighting over the same click; keeping it outside means the `Button`'s
+/// frame simply doesn't extend under the menu, so each control only ever
+/// receives clicks meant for it.
 private struct WorkspaceRowView: View {
     let store: AppStore
     let workspace: WorkspaceRow
@@ -218,35 +202,17 @@ private struct WorkspaceRowView: View {
             // resolves to that workspace's first session, or creates one.
             .buttonStyle(.plain)
 
-            HStack(spacing: 4) {
-                Menu {
-                    menuItems
-                } label: {
-                    Image(systemName: "ellipsis.circle")
-                        .imageScale(.small)
-                        .foregroundStyle(.secondary)
-                }
-                .menuStyle(.borderlessButton)
-                .menuIndicator(.hidden)
-                .fixedSize()
-                .accessibilityLabel("More Actions")
-
-                // Direct store/Dialogs call, not actions.perform: same
-                // confirm flow as "Delete Workspace…" in the context menu
-                // below, just row-targeted via a visible button instead of
-                // a right-click.
-                Button {
-                    if Dialogs.confirmDeleteWorkspace(workspace) {
-                        Task { await store.deleteWorkspace(workspace.id) }
-                    }
-                } label: {
-                    Image(systemName: "xmark")
-                        .imageScale(.small)
-                        .foregroundStyle(.secondary)
-                }
-                .buttonStyle(.borderless)
-                .accessibilityLabel("Delete Workspace")
+            Menu {
+                menuItems
+            } label: {
+                Image(systemName: "ellipsis.circle")
+                    .imageScale(.small)
+                    .foregroundStyle(.secondary)
             }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .fixedSize()
+            .accessibilityLabel("More Actions")
             .opacity(isHovered ? 1 : 0)
         }
         .onHover { isHovered = $0 }
