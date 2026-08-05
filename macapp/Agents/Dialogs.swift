@@ -89,21 +89,25 @@ enum Dialogs {
         return textField.stringValue
     }
 
-    /// Prompts for the landing commit message when keeping (landing) a
-    /// workspace's changes. Returns the trimmed message iff the user
-    /// confirmed with non-blank input; nil on Cancel OR on blank input (a
-    /// blank message is treated the same as cancelling — never lands with
-    /// an empty commit message).
+    /// Prompts for the landing message when keeping (landing) a
+    /// workspace's changes. The session's own commits land with their own
+    /// messages (merge model — see agents-cli's workspace-land); this
+    /// message only ever describes trailing uncommitted work, and even then
+    /// only when the agent didn't describe it itself. It's still required:
+    /// whether it will be needed isn't knowable before landing. Returns the
+    /// trimmed message iff the user confirmed with non-blank input; nil on
+    /// Cancel OR on blank input (a blank message is treated the same as
+    /// cancelling — never risks landing an undescribed commit).
     static func promptLandMessage(workspace: WorkspaceRow) -> String? {
         let alert = NSAlert()
         alert.messageText = "Keep Changes in \u{201C}\(workspace.displayName)\u{201D}?"
         alert.informativeText =
-            "Lands the workspace's changes as one commit on main, then removes the workspace and moves its directory to the Bin."
+            "Lands the session's commits on main as they are, then removes the workspace and moves its directory to the Bin. The message below is only used to describe changes the session left uncommitted."
         alert.addButton(withTitle: "Keep Changes")
         alert.addButton(withTitle: "Cancel")
 
         let textField = NSTextField(frame: NSRect(x: 0, y: 0, width: 240, height: 24))
-        textField.placeholderString = "Describe the change…"
+        textField.placeholderString = "Describe any uncommitted changes…"
         alert.accessoryView = textField
         alert.window.initialFirstResponder = textField
 
