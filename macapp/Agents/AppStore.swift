@@ -14,6 +14,13 @@ final class AppStore: ObservableObject {
     /// dead-end error message. Carries the original workspace id + message
     /// so the retry doesn't require the user to retype anything.
     @Published var pendingTrunkBootstrap: (workspaceID: String, message: String)?
+    /// What each live session's agent is currently doing, as reported by
+    /// Claude Code hooks via desktop-notification OSC sequences (see
+    /// `SessionActivity`). Deliberately NOT part of `PersistedState`/
+    /// `save()`/`load()`: this describes a live process's current state,
+    /// which has no meaningful value to restore after a relaunch — see
+    /// `SessionActivity`'s doc comment.
+    @Published private(set) var sessionActivity: [String: SessionActivity] = [:]
 
     let terminals: any SessionTerminating
     private let engine: any WorkspaceEngineProviding
@@ -76,6 +83,9 @@ final class AppStore: ObservableObject {
         terminals.onProcessExit = { [weak self] id in
             self?.closeSession(id)
         }
+        terminals.onSessionActivity = { [weak self] id, activity in
+            self?.setSessionActivity(activity, for: id)
+        }
         load()
         seedSessionCounters()
     }
@@ -101,6 +111,7 @@ final class AppStore: ObservableObject {
             terminals.closeSession(id)
         }
         sessions.removeAll { $0.projectPath == project.path }
+        pruneSessionActivity()
         projects.removeAll { $0.path == project.path }
         // Local bookkeeping only: removing a project from the app must never
         // destroy the user's on-disk jj workspaces, so we drop our local
@@ -144,6 +155,7 @@ final class AppStore: ObservableObject {
             terminals.closeSession(sessionID)
         }
         sessions.removeAll { $0.target == target }
+        pruneSessionActivity()
         if let selection, removedIDs.contains(selection) {
             self.selection = nil
         }
@@ -205,6 +217,7 @@ final class AppStore: ObservableObject {
             terminals.closeSession(sessionID)
         }
         sessions.removeAll { $0.target == target }
+        pruneSessionActivity()
         workspaces.removeAll { $0.id == id }
         if let selection, removedIDs.contains(selection) {
             self.selection = nil
@@ -301,6 +314,7 @@ final class AppStore: ObservableObject {
 
         terminals.closeSession(id)
         sessions.remove(at: index)
+        pruneSessionActivity()
 
         if wasSelected {
             let siblings = sessions.enumerated().filter { $0.element.target == row.target }
@@ -313,6 +327,31 @@ final class AppStore: ObservableObject {
             }
         }
         save()
+    }
+
+    /// Sets (or, when `activity` is nil, clears) a session's activity
+    /// indicator. Ignores ids with no matching row in `sessions` — a status
+    /// update racing that session's own teardown is a normal, harmless
+    /// race, not an error to surface. Deliberately never calls `save()`:
+    /// this state is not persisted (see `sessionActivity`'s doc comment).
+    func setSessionActivity(_ activity: SessionActivity?, for sessionID: String) {
+        guard sessions.contains(where: { $0.id == sessionID }) else { return }
+        if let activity {
+            sessionActivity[sessionID] = activity
+        } else {
+            sessionActivity.removeValue(forKey: sessionID)
+        }
+    }
+
+    /// Drops any `sessionActivity` entry whose session no longer exists.
+    /// Called from every site that removes rows from `sessions`
+    /// (`closeSession`, `removeProject`, `deleteWorkspace`,
+    /// `landWorkspace`) so an indicator can never outlive the session it
+    /// describes. One shared helper instead of duplicating this removal
+    /// logic at each call site.
+    private func pruneSessionActivity() {
+        let liveIDs = Set(sessions.map(\.id))
+        sessionActivity = sessionActivity.filter { liveIDs.contains($0.key) }
     }
 
     func renameSession(_ id: String, to name: String) {

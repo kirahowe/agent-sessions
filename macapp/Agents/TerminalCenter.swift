@@ -19,6 +19,12 @@ final class TerminalCenter: SessionTerminating {
     /// and the terminal has already been torn down.
     var onProcessExit: ((String) -> Void)?
 
+    /// Invoked with the session id and parsed activity whenever a session's
+    /// terminal reports (or clears) a status via
+    /// `SessionDelegateProxy.terminalDidRequestDesktopNotification`. A nil
+    /// activity means "clear."
+    var onSessionActivity: ((String, SessionActivity?) -> Void)?
+
     /// Lazily creates (on first call) or returns the cached `TerminalView`
     /// for a session, spawning the user's login shell rooted at
     /// `workingDirectory`.
@@ -72,6 +78,13 @@ final class TerminalCenter: SessionTerminating {
         closeSession(sessionID)
         onProcessExit?(sessionID)
     }
+
+    /// Called by a session's delegate proxy when it parses a recognised
+    /// `agents:status` notification off the tty. Just forwards — no
+    /// terminal-lifecycle teardown needed here, unlike `handleProcessExit`.
+    func handleSessionActivity(sessionID: String, activity: SessionActivity?) {
+        onSessionActivity?(sessionID, activity)
+    }
 }
 
 /// Small per-session delegate that closes over a session id and forwards to
@@ -80,7 +93,7 @@ final class TerminalCenter: SessionTerminating {
 /// is weak, so `TerminalCenter` retains this object itself (alongside the
 /// view/controller in its cache entry).
 @MainActor
-final class SessionDelegateProxy: TerminalSurfaceTitleDelegate, TerminalSurfaceCloseDelegate {
+final class SessionDelegateProxy: TerminalSurfaceTitleDelegate, TerminalSurfaceCloseDelegate, TerminalSurfaceDesktopNotificationDelegate {
     let sessionID: String
     weak var center: TerminalCenter?
 
@@ -96,5 +109,28 @@ final class SessionDelegateProxy: TerminalSurfaceTitleDelegate, TerminalSurfaceC
 
     func terminalDidClose(processAlive: Bool) {
         center?.handleProcessExit(sessionID: sessionID)
+    }
+
+    /// The package dispatches every specialized delegate by conditional-
+    /// casting the single `view.delegate` object (see
+    /// `TerminalCallbackBridge.handleAction`), so this conformance alone is
+    /// all the registration this proxy needs — nothing else has to opt it
+    /// in.
+    ///
+    /// A nil parse result means a genuine desktop notification from some
+    /// other program running in the shell (e.g. an npm build finishing) —
+    /// the app doesn't surface those at all today, so ignoring it here is
+    /// correct for now, not a silent drop of something we should have
+    /// handled.
+    func terminalDidRequestDesktopNotification(title: String, body: String) {
+        guard let message = SessionActivity.parseStatusMessage(title: title, body: body) else {
+            return
+        }
+        switch message {
+        case .set(let activity):
+            center?.handleSessionActivity(sessionID: sessionID, activity: activity)
+        case .clear:
+            center?.handleSessionActivity(sessionID: sessionID, activity: nil)
+        }
     }
 }

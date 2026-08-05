@@ -9,14 +9,14 @@ struct SidebarView: View {
             ForEach(store.projects) { project in
                 Section {
                     ForEach(store.sessions.filter { $0.target == .root(projectPath: project.path) }) { session in
-                        SessionRowView(store: store, session: session)
+                        SessionRowView(store: store, session: session, activity: store.sessionActivity[session.id])
                     }
 
                     ForEach(store.workspaces.filter { $0.projectPath == project.path }) { workspace in
                         WorkspaceRowView(store: store, workspace: workspace)
 
                         ForEach(sessions(in: workspace)) { session in
-                            SessionRowView(store: store, session: session, indent: 16)
+                            SessionRowView(store: store, session: session, activity: store.sessionActivity[session.id], indent: 16)
                         }
                     }
                 } header: {
@@ -111,6 +111,7 @@ struct SidebarView: View {
 private struct SessionRowView: View {
     let store: AppStore
     let session: SessionRow
+    var activity: SessionActivity?
     var indent: CGFloat = 0
 
     @State private var isHovered = false
@@ -120,6 +121,17 @@ private struct SessionRowView: View {
             Image(systemName: "terminal")
                 .foregroundStyle(.secondary)
             Text(session.name)
+            if let activity {
+                // Placed before the trailing Spacer()/ellipsis-menu area
+                // (not after) so this dot never collides with the
+                // ellipsis "More Actions" menu, which hover-reveals in
+                // that trailing space — the two occupy disjoint regions
+                // of the row.
+                Image(systemName: "circle.fill")
+                    .font(.system(size: 7))
+                    .foregroundStyle(activity.tint)
+                    .accessibilityLabel(activity.accessibilityLabel)
+            }
             Spacer()
             Menu {
                 menuItems
@@ -257,6 +269,29 @@ private struct WorkspaceRowView: View {
             if Dialogs.confirmDeleteWorkspace(workspace) {
                 Task { await store.deleteWorkspace(workspace.id) }
             }
+        }
+    }
+}
+
+/// Colour + accessibility mapping for the sidebar's activity dot. Lives
+/// here (not in SessionActivity.swift) because SessionActivity.swift is
+/// deliberately Foundation-only/SwiftUI-free so it stays trivially
+/// unit-testable.
+private extension SessionActivity {
+    // These exact RGB values are deliberate, not arbitrary: they match
+    // the user's existing iTerm2 tab-colour script, so the two tools
+    // signal the same states with the same colours.
+    var tint: Color {
+        switch self {
+        case .yourTurn: return Color(red: 210 / 255, green: 158 / 255, blue: 90 / 255)
+        case .blocked: return Color(red: 200 / 255, green: 50 / 255, blue: 50 / 255)
+        }
+    }
+
+    var accessibilityLabel: String {
+        switch self {
+        case .yourTurn: return "Waiting for you"
+        case .blocked: return "Blocked on you"
         }
     }
 }

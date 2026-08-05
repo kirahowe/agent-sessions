@@ -7,6 +7,10 @@ import Foundation
 @MainActor
 final class SpyTerminals: SessionTerminating {
     var onProcessExit: ((String) -> Void)?
+    /// Tests fire this directly (`spy.onSessionActivity?(id, .blocked)`) to
+    /// simulate a terminal reporting a status change, the same way
+    /// `onProcessExit` simulates process exit.
+    var onSessionActivity: ((String, SessionActivity?) -> Void)?
     private(set) var closedIDs: [String] = []
 
     func closeSession(_ id: String) {

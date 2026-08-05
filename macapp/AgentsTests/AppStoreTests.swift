@@ -1235,4 +1235,100 @@ final class AppStoreTests: XCTestCase {
         let store2 = AppStore(terminals: spy2, stateURL: url, engine: FakeWorkspaceEngine())
         XCTAssertEqual(store2.workspaces.first { $0.name == "calm-river" }?.label, "my label")
     }
+
+    // MARK: - 45
+
+    func test45_setSessionActivityOnRealSessionIsReadableViaStore() {
+        let (store, _, _) = TestSupport.makeStore()
+        store.addProject(path: "/tmp/proj-A")
+        let session = store.sessions.first!
+
+        store.setSessionActivity(.blocked, for: session.id)
+
+        XCTAssertEqual(store.sessionActivity[session.id], .blocked)
+    }
+
+    // MARK: - 46
+
+    func test46_setSessionActivityNilClearsEntry() {
+        let (store, _, _) = TestSupport.makeStore()
+        store.addProject(path: "/tmp/proj-A")
+        let session = store.sessions.first!
+        store.setSessionActivity(.yourTurn, for: session.id)
+
+        store.setSessionActivity(nil, for: session.id)
+
+        XCTAssertNil(store.sessionActivity[session.id])
+    }
+
+    // MARK: - 47
+
+    func test47_setSessionActivityUnknownIDIsIgnored() {
+        let (store, _, _) = TestSupport.makeStore()
+        store.addProject(path: "/tmp/proj-A")
+
+        store.setSessionActivity(.blocked, for: "not-a-real-id")
+
+        XCTAssertTrue(store.sessionActivity.isEmpty)
+    }
+
+    // MARK: - 48
+
+    func test48_closingSessionDropsItsActivityEntry() {
+        let (store, _, _) = TestSupport.makeStore()
+        store.addProject(path: "/tmp/proj-A")
+        let session = store.sessions.first!
+        store.setSessionActivity(.blocked, for: session.id)
+
+        store.closeSession(session.id)
+
+        XCTAssertNil(store.sessionActivity[session.id])
+    }
+
+    // MARK: - 49
+
+    func test49_removeProjectDropsActivityForAllItsSessions() {
+        let (store, _, _) = TestSupport.makeStore()
+        let path = "/tmp/proj-A"
+        store.addProject(path: path)
+        store.newSession(in: store.projects.first!)
+        let sessions = store.sessions.filter { $0.projectPath == path }
+        for session in sessions {
+            store.setSessionActivity(.yourTurn, for: session.id)
+        }
+        XCTAssertEqual(store.sessionActivity.count, sessions.count)
+
+        store.removeProject(store.projects.first!)
+
+        XCTAssertTrue(store.sessionActivity.isEmpty)
+    }
+
+    // MARK: - 50
+
+    func test50_activityDoesNotSurviveSaveReloadRoundTrip() {
+        let url = TestSupport.freshStateURL()
+        let spy1 = SpyTerminals()
+        let store1 = AppStore(terminals: spy1, stateURL: url)
+        store1.addProject(path: "/tmp/proj-A")
+        let session = store1.sessions.first!
+        store1.setSessionActivity(.blocked, for: session.id)
+        XCTAssertFalse(store1.sessionActivity.isEmpty)
+
+        let spy2 = SpyTerminals()
+        let store2 = AppStore(terminals: spy2, stateURL: url)
+
+        XCTAssertTrue(store2.sessionActivity.isEmpty, "activity must never be persisted")
+    }
+
+    // MARK: - 51
+
+    func test51_onSessionActivityCallbackWiredInInitReachesStore() {
+        let (store, spy, _) = TestSupport.makeStore()
+        store.addProject(path: "/tmp/proj-A")
+        let session = store.sessions.first!
+
+        spy.onSessionActivity?(session.id, .blocked)
+
+        XCTAssertEqual(store.sessionActivity[session.id], .blocked)
+    }
 }
