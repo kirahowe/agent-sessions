@@ -121,9 +121,17 @@
     {:root root :project project}))
 
 (defn direct-jj-workspace-list
-  "Ground truth: run `jj workspace list` directly (not through the CLI)."
+  "Ground truth: run `jj workspace list` directly (not through the CLI).
+
+   --ignore-working-copy: several staleness tests below deliberately leave
+   the DEFAULT workspace's own working copy stale on purpose (that's the
+   scenario under test), and this ground-truth read -- a pure registry
+   query, same as the CLI's own list-workspace-names -- must still succeed
+   regardless. Safe for every other (non-stale) test too: the data this
+   returns comes from the repo's View, not from live on-disk state, so the
+   flag never changes what's reported."
   [project]
-  (:out (sh "jj" "--no-pager" "-R" project "workspace" "list")))
+  (:out (sh "jj" "--ignore-working-copy" "--no-pager" "-R" project "workspace" "list")))
 
 ;; commit_id / change_id templates for the ground-truth log/id helpers below
 ;; -- same escaping idiom the CLI itself uses for -T arguments.
@@ -145,9 +153,14 @@
    directly against `dir` via -R. `path` is wrapped in a `root:\"...\"`
    fileset pattern -- plain relative paths are resolved against CWD (not
    the repo root), which fails whenever `dir` isn't also the process's CWD
-   (e.g. any -R call from outside the repo, as all of these are)."
+   (e.g. any -R call from outside the repo, as all of these are).
+
+   --ignore-working-copy, for the same reason as direct-jj-workspace-list:
+   this reads a NAMED revset (e.g. \"main\"), never `dir`'s own current `@`,
+   so skipping the live snapshot of the possibly-stale current workspace is
+   always safe and never changes the historical content returned."
   [dir revset path]
-  (:out (sh "jj" "--no-pager" "-R" dir "file" "show" "-r" revset (str "root:\"" path "\""))))
+  (:out (sh "jj" "--ignore-working-copy" "--no-pager" "-R" dir "file" "show" "-r" revset (str "root:\"" path "\""))))
 
 (defn direct-jj-bookmark-list
   "Ground truth: run `jj bookmark list` directly (not through the CLI)."
@@ -581,6 +594,130 @@
           (is (= 1 exit))
           (is (false? (:ok json)))
           (is (= "jj-failed" (get-in json [:error :code]))))
+        (finally (cleanup! root))))))
+
+;; -----------------------------------------------------------------------
+;; Staleness hardening (Phase 1). Shared background for all three tests
+;; below: jj auto-heals a workspace's OWN checkout being abandoned when
+;; that checkout is trivial (empty, no description) -- it silently
+;; replaces it with a fresh empty commit in the SAME operation, and the
+;; workspace never goes stale at all. Genuine staleness (an actual
+;; `The working copy is stale` error, requiring `jj workspace update-stale`
+;; to recover) only happens when the abandoned checkout had real content
+;; that diverged from its parent at the moment it was abandoned. Verified
+;; directly against this machine's jj 0.43.0 by reproducing both outcomes
+;; before writing these tests -- see this file's companion report for
+;; specifics. So every scenario below deliberately gives the
+;; soon-to-be-abandoned `@` some real (snapshotted) content first, even
+;; where that content is otherwise irrelevant to the test, purely to
+;; trigger genuine staleness rather than silent self-healing.
+
+;; -----------------------------------------------------------------------
+;; 20. workspace-forget: default workspace's own working copy is stale
+
+(deftest workspace-forget-stale-default-test
+  (testing "forget succeeds even when the DEFAULT workspace's own working copy is stale"
+    (let [{:keys [root project]} (fresh-jj-project-on-main!)]
+      (try
+        (let [add (run-cli "workspace-add" "--project" project "--name" "foo")
+              ws-dir (get-in add [:json :workspace :path])]
+          (is (true? (get-in add [:json :ok])) "sanity: workspace-add succeeded")
+          ;; Give default's own @ real content (see the staleness-hardening
+          ;; note above for why), then abandon it from a DIFFERENT
+          ;; workspace's context (foo's) -- this is the same shape of
+          ;; mistake the incident hit: some jj activity elsewhere rewrites
+          ;; the default workspace's own checkout out from under it.
+          (spit (str (fs/path project "default-edit.txt")) "DEFAULT_EDIT\n")
+          (is (zero? (:exit (sh "jj" "-R" project "st")))
+              "sanity: snapshot default's own real edit")
+          (let [default-id (direct-jj-log ws-dir "default@" commit-id-tpl)]
+            (is (zero? (:exit (sh "jj" "-R" ws-dir "abandon" default-id)))
+                "sanity: direct abandon of default's @ (from foo's context) succeeded"))
+          (let [{:keys [exit err]} (sh "jj" "--no-pager" "-R" project "st")]
+            (is (not (zero? exit)) "sanity precondition: default workspace should now be stale")
+            (is (str/includes? err "stale") "sanity precondition: jj st should mention staleness"))
+          (let [{:keys [exit json]} (run-cli "workspace-forget" "--project" project "--name" "foo")]
+            (is (= 0 exit))
+            (is (= {:ok true} json)))
+          (is (not (str/includes? (direct-jj-workspace-list project) "agents/foo"))
+              "jj workspace list (direct) should no longer show the forgotten workspace"))
+        (finally (cleanup! root))))))
+
+;; -----------------------------------------------------------------------
+;; 21. workspace-land: default workspace's own working copy is stale
+;;     (the incident scenario -- a completed land must not report failure)
+
+(deftest workspace-land-stale-default-test
+  (testing "landing succeeds end-to-end even when the DEFAULT workspace's own working copy is stale"
+    (let [{:keys [root project]} (fresh-jj-project-on-main!)]
+      (try
+        (let [add (run-cli "workspace-add" "--project" project "--name" "foo")
+              ws-dir (get-in add [:json :workspace :path])]
+          (is (true? (get-in add [:json :ok])) "sanity: workspace-add succeeded")
+          ;; A real edit in the SESSION workspace -- this is the content
+          ;; that must actually reach main below.
+          (spit (str (fs/path ws-dir "edit.txt")) "STALE_LAND_CONTENT\n")
+          (is (zero? (:exit (sh "jj" "-R" ws-dir "st")))
+              "sanity: snapshot the workspace's own edit")
+          ;; Make DEFAULT genuinely stale -- same recipe and reasoning as
+          ;; workspace-forget-stale-default-test above.
+          (spit (str (fs/path project "default-edit.txt")) "DEFAULT_EDIT\n")
+          (is (zero? (:exit (sh "jj" "-R" project "st")))
+              "sanity: snapshot default's own real edit")
+          (let [default-id (direct-jj-log ws-dir "default@" commit-id-tpl)]
+            (is (zero? (:exit (sh "jj" "-R" ws-dir "abandon" default-id)))
+                "sanity: direct abandon of default's @ succeeded"))
+          (let [{:keys [exit err]} (sh "jj" "--no-pager" "-R" project "st")]
+            (is (not (zero? exit)) "sanity precondition: default workspace should now be stale")
+            (is (str/includes? err "stale") "sanity precondition: jj st should mention staleness"))
+          (let [{:keys [exit json]} (run-cli "workspace-land" "--project" project "--name" "foo"
+                                              "--message" "landed despite stale default")]
+            (is (= 0 exit)
+                "THE INCIDENT: a land that actually succeeded must not be reported as a failure")
+            (is (true? (:ok json)))
+            (is (nil? (:warning json))
+                "no :warning expected -- --ignore-working-copy on the final forget makes it succeed regardless of default's staleness")
+            (is (= "STALE_LAND_CONTENT\n" (direct-jj-file-show project "main" "edit.txt"))
+                "the landed content must be present at main"))
+          (is (not (str/includes? (direct-jj-workspace-list project) "agents/foo"))
+              "workspace should be deregistered like any other successful land"))
+        (finally (cleanup! root))))))
+
+;; -----------------------------------------------------------------------
+;; 22. workspace-land: the SESSION workspace's own working copy is stale,
+;;     and the step-0.5 update-stale preflight recovers it
+
+(deftest workspace-land-stale-workspace-recovers-test
+  (testing "landing recovers a stale SESSION workspace via the update-stale preflight"
+    (let [{:keys [root project]} (fresh-jj-project-on-main!)]
+      (try
+        (let [add (run-cli "workspace-add" "--project" project "--name" "foo")
+              ws-dir (get-in add [:json :workspace :path])]
+          (is (true? (get-in add [:json :ok])) "sanity: workspace-add succeeded")
+          ;; c1's content goes safely into a chain commit; @ becomes a
+          ;; fresh commit on top of it.
+          (spit (str (fs/path ws-dir "one.txt")) "C1_CONTENT\n")
+          (is (zero? (:exit (sh "jj" "-R" ws-dir "commit" "-m" "c1")))
+              "sanity: c1 committed, leaving a fresh @ on top")
+          ;; That fresh @ is trivial (empty, undescribed) -- give it real
+          ;; content first so abandoning it below produces genuine
+          ;; staleness rather than silent self-healing (see the
+          ;; staleness-hardening note above). This throwaway content is
+          ;; expected to be LOST by the update-stale recovery -- only c1's
+          ;; already-committed content is asserted on below.
+          (spit (str (fs/path ws-dir "throwaway.txt")) "THROWAWAY\n")
+          (let [ws-head-id (direct-jj-log ws-dir "@" commit-id-tpl)]
+            (is (zero? (:exit (sh "jj" "-R" project "abandon" ws-head-id)))
+                "sanity: direct abandon of the workspace's own @, from the PROJECT side, succeeded"))
+          (let [{:keys [exit err]} (sh "jj" "--no-pager" "-R" ws-dir "st")]
+            (is (not (zero? exit)) "sanity precondition: the workspace should now be stale")
+            (is (str/includes? err "stale") "sanity precondition: jj st should mention staleness"))
+          (let [{:keys [exit json]} (run-cli "workspace-land" "--project" project "--name" "foo"
+                                              "--message" "landed after workspace recovery")]
+            (is (= 0 exit))
+            (is (true? (:ok json)))
+            (is (= "C1_CONTENT\n" (direct-jj-file-show project "main" "one.txt"))
+                "c1's content must be present at main despite the workspace having been stale")))
         (finally (cleanup! root))))))
 
 ;; -----------------------------------------------------------------------

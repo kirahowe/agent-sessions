@@ -62,6 +62,14 @@ final class WorkspaceEngineCLI: WorkspaceEngineProviding {
         let workspace: WorkspacePayload?
         let landed: LandedPayload?
         let error: ErrorPayload?
+        // Present only on workspace-land's success envelope, and only when
+        // the land itself irreversibly succeeded (squash done, bookmark
+        // advanced) but the final `jj workspace forget` afterward failed —
+        // most plausibly because the default workspace's own working copy
+        // was stale (see agents-cli's cmd-workspace-land comment block).
+        // landWorkspace below treats its presence as a signal to skip the
+        // usual directory cleanup, not as a failure.
+        let warning: String?
     }
 
     private struct WorkspacePayload: Decodable {
@@ -322,20 +330,31 @@ final class WorkspaceEngineCLI: WorkspaceEngineProviding {
         }
 
         // By this point the CLI envelope has already reported success: jj
-        // has forgotten the workspace and advanced the bookmark server-side,
-        // irreversibly. A trash failure here is purely cosmetic (a leftover
-        // directory), so it must never turn a successful land into a thrown
-        // error — that would desync app state from reality (AppStore would
-        // treat the land as failed and keep sessions/rows around for a
-        // workspace jj no longer knows about). This is the deliberate
-        // ASYMMETRY with deleteWorkspace's trashItem above: forgetting a
-        // workspace is idempotent/retryable, so letting that one throw and
-        // leave a retry marker is safe; landing is not retryable, so the
-        // same treatment here would strand the app in a false "still needs
-        // landing" state.
+        // has advanced the bookmark server-side, irreversibly. A trash
+        // failure here is purely cosmetic (a leftover directory), so it must
+        // never turn a successful land into a thrown error — that would
+        // desync app state from reality (AppStore would treat the land as
+        // failed and keep sessions/rows around for a workspace jj no longer
+        // knows about). This is the deliberate ASYMMETRY with
+        // deleteWorkspace's trashItem above: forgetting a workspace is
+        // idempotent/retryable, so letting that one throw and leave a retry
+        // marker is safe; landing is not retryable, so the same treatment
+        // here would strand the app in a false "still needs landing" state.
         let fm = FileManager.default
         var cleanupWarning: String? = nil
-        if fm.fileExists(atPath: workspace.path) {
+        if let cliWarning = envelope.warning {
+            // The CLI's own :warning means the final `jj workspace forget`
+            // failed, so jj STILL HAS this workspace registered pointing at
+            // workspace.path. Trashing the directory here would leave jj's
+            // registry referencing a path that no longer exists — a state
+            // strictly worse than a merely-undeleted folder, and one the
+            // user's own follow-up `jj workspace forget` (named in the
+            // message) would then be unable to clean up properly either.
+            // So the trash step is skipped entirely, not just its errors
+            // swallowed, and the CLI's own message — which already names the
+            // real workspace/project — is passed straight through.
+            cleanupWarning = cliWarning
+        } else if fm.fileExists(atPath: workspace.path) {
             do {
                 try fm.trashItem(at: URL(fileURLWithPath: workspace.path), resultingItemURL: nil)
             } catch {

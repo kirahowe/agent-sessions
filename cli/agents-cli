@@ -8,6 +8,11 @@
 ;;   success: {"ok":true, ...payload}
 ;;   error:   {"ok":false,"error":{"code":"<code>","message":"<message>"}}
 ;;
+;; workspace-land's success envelope may additionally carry a top-level
+;; "warning" string -- present only when the land itself irreversibly
+;; succeeded but a non-essential cleanup step afterward failed. Still
+;; {"ok":true}; see cmd-workspace-land's comment block for when/why.
+;;
 ;; This is deliberately a single flat script (no internal namespaces) so it
 ;; stays easy to read as it grows into a bigger engine.
 
@@ -132,9 +137,17 @@
 
 (defn list-workspace-names
   "Raw `jj workspace list` output, as a seq of just the name on each line
-   (the part before the first ':'), e.g. \"default\", \"agents/foo\"."
+   (the part before the first ':'), e.g. \"default\", \"agents/foo\".
+
+   --ignore-working-copy: this is a pure registry read that runs with -R
+   from OUTSIDE the repo, which makes jj snapshot the DEFAULT workspace's
+   working copy as a side effect -- and, if that working copy happens to be
+   stale (its `@` was abandoned by an operation done from some other
+   workspace), fail with jj's stale-working-copy error even though this call
+   never needed the working copy at all. This read must never trip over (or
+   cause) that."
   [project]
-  (let [{:keys [exit out err]} (run-jj ["--no-pager" "-R" project "workspace" "list"])]
+  (let [{:keys [exit out err]} (run-jj ["--ignore-working-copy" "--no-pager" "-R" project "workspace" "list"])]
     (when-not (zero? exit) (jj-failed! err))
     (->> (str/split-lines out)
          (remove str/blank?)
@@ -229,12 +242,18 @@
 ;; NOT a jj failure. So this command reports {"ok":true} whenever jj itself
 ;; exits 0, and jj-failed only on a genuine nonzero exit, same as every
 ;; other subcommand. This command never touches the directory on disk.
+;;
+;; --ignore-working-copy, same reasoning as list-workspace-names: this is a
+;; repo-level op run with -R from outside the repo, so it snapshots (and can
+;; trip over the staleness of) the DEFAULT workspace's working copy as a
+;; side effect, even though forgetting a workspace never needed that
+;; working copy at all.
 
 (defn cmd-workspace-forget [flags]
   (require-flags! flags :project :name)
   (let [project (str (fs/absolutize (:project flags)))
         name (:name flags)
-        {:keys [exit err]} (run-jj ["--no-pager" "-R" project "workspace" "forget" (jj-name name)])]
+        {:keys [exit err]} (run-jj ["--ignore-working-copy" "--no-pager" "-R" project "workspace" "forget" (jj-name name)])]
     (when-not (zero? exit) (jj-failed! err))
     {:ok true}))
 
@@ -265,9 +284,12 @@
 ;; ONE commit on top of the trunk bookmark, advances the bookmark to it, and
 ;; forgets the workspace (directory stays on disk, same non-destructive
 ;; convention as workspace-forget). On any conflict or unexpected jj failure
-;; partway through, every bit of prior state (trunk position, workspace
-;; registration, the workspace's commit chain, its directory) is restored via
-;; `jj op restore` -- nothing partially mutated is ever left behind.
+;; UP THROUGH the bookmark move (steps 1-7 below), every bit of prior state
+;; (trunk position, workspace registration, the workspace's commit chain, its
+;; directory) is restored via `jj op restore` -- nothing partially mutated is
+;; ever left behind. Once the squash and bookmark move have gone through,
+;; though, the land is irreversibly done; see step 8's own comment for what
+;; that means for its failure handling.
 ;;
 ;; CWD (not -R) is what selects which workspace's `@` a jj command targets,
 ;; so every jj call below that needs to act on the WORKSPACE's own `@` runs
@@ -276,7 +298,20 @@
 ;; run-jj + -R project, exactly like cmd-workspace-forget) since forgetting
 ;; while it's the cwd is asking for trouble and it's a repo-level op anyway.
 ;; This cwd discipline is the load-bearing property that keeps the DEFAULT
-;; workspace's own working copy from ever being touched by this command.
+;; workspace's own working copy from ever being touched by MOST of this
+;; command -- the final forget is a deliberate, flagged exception (see step
+;; 8), same as list-workspace-names and cmd-workspace-forget.
+;;
+;; Staleness hardening (the reason for step 0.5 and step 8's flag/failure
+;; handling below): jj commands run with -R from outside a repo snapshot the
+;; DEFAULT workspace's working copy as a side effect, and fail outright if
+;; that working copy is stale. Separately, THIS workspace's own `@` can be
+;; made stale by jj activity elsewhere (most plausibly the user's own jj
+;; commands in the default workspace, but any workspace could do it). Left
+;; unhandled, either kind of staleness can turn a perfectly landable
+;; workspace into a reported failure -- including, in the worst case, AFTER
+;; the squash and bookmark move already succeeded, which is exactly the
+;; incident this hardening fixes: a completed land reported back as failed.
 
 (defn jj!
   "run-jj-in, but throws jj-failed! on nonzero exit. Used throughout
@@ -327,84 +362,118 @@
     ;; letting some later jj command fail organically inside ws-dir.
     (when-not (contains? (set (list-workspace-names project)) full-name)
       (cli-error "jj-failed" (str "workspace not registered: " full-name)))
-    (let [ws-dir (dest-path project name)
-          trunk (find-trunk ws-dir)]
-      (when (and (not trunk) (str/blank? create-trunk))
-        (cli-error "no-trunk"
-                   (str "No trunk bookmark found (looked for main, master, trunk). "
-                        "Pass --create-trunk <name> to have the app create one.")))
-      (let [bookmark-name (or trunk create-trunk)
-            ;; Step 1: merge-base of trunk (or, in the --create-trunk case,
-            ;; the default workspace) vs @. Needed for the nothing-to-land
-            ;; check, and -- only in the --create-trunk branch, which has no
-            ;; named trunk to rebase onto -- as the base of the squash/
-            ;; conflict-check revsets too.
-            base (jj-line! ws-dir
-                            ["--no-pager" "log" "--no-graph" "-r"
-                             (if trunk
-                               (str "heads(::" trunk " & ::@)")
-                               "heads(::@ & ::default@)")
-                             "-T" commit-id-template])
-            diff-out (:out (jj! ws-dir ["--no-pager" "diff" "--from" base "--to" "@"]))]
-        ;; Step 2: nothing-to-land check, still entirely read-only.
-        (when (str/blank? diff-out)
-          (cli-error "nothing-to-land"
-                     (str "Nothing to land: " name " has no content changes since it diverged.")))
-        ;; Step 3: capture the operation id -- the rollback point for
-        ;; everything from here on.
-        (let [opid (jj-line! ws-dir ["--no-pager" "op" "log" "--no-graph" "-n" "1" "-T" op-id-template])
-              commit-id
-              (try
-                ;; Step 3.5: rebase the workspace's chain onto trunk. Only
-                ;; when an existing trunk was found; always safe to run even
-                ;; if @ is already directly on top of it (jj no-ops).
-                (when trunk
-                  (jj! ws-dir ["--no-pager" "rebase" "-s" (str "roots(" trunk "..@)") "-d" trunk]))
-                ;; Step 4: conflict check.
-                (let [conflict-revset (if trunk
-                                        (str "(" trunk "..@) & conflicts()")
-                                        (str "(" base "..@) & conflicts()"))
-                      conflicts (:out (jj! ws-dir ["--no-pager" "log" "--no-graph" "-r" conflict-revset
-                                                    "-T" commit-id-template]))]
-                  (when-not (str/blank? conflicts)
-                    (cli-error "land-conflict"
-                               (str "Landing conflicts with " bookmark-name
-                                    "; rolled back — trunk and workspace are unchanged. "
-                                    "Resolve the conflict and try again."))))
-                ;; Step 5: squash the whole chain into one commit. -m is
-                ;; passed directly on the squash (5a); an unconditional
-                ;; describe (5b) always follows, since squash silently drops
-                ;; -m when --from/--into resolve to the same single commit
-                ;; (a one-revision chain) -- 5b is what actually sets the
-                ;; message in that case, and is a harmless no-op otherwise.
-                (let [from-revset (if trunk (str trunk "..@") (str base "..@"))]
-                  (jj! ws-dir ["--no-pager" "squash" "--from" from-revset "--into" "@" "-m" message])
-                  (jj! ws-dir ["--no-pager" "describe" "-r" "@" "-m" message]))
-                ;; Step 6 (must follow 5b -- describing rewrites the commit
-                ;; id) then step 7: advance/create the trunk bookmark.
-                (let [cid (jj-line! ws-dir ["--no-pager" "log" "--no-graph" "-r" "@" "-T" commit-id-template])]
-                  (if trunk
-                    (jj! ws-dir ["--no-pager" "bookmark" "set" trunk "-r" "@"])
-                    (jj! ws-dir ["--no-pager" "bookmark" "create" create-trunk "-r" "@"]))
-                  cid)
-                (catch Throwable t
-                  ;; Best-effort rollback: restore, then rethrow the
-                  ;; ORIGINAL exception unchanged so -main reports the
-                  ;; correct error code/message regardless of whether the
-                  ;; restore itself succeeds.
-                  (try (run-jj-in ws-dir ["--no-pager" "op" "restore" opid])
-                       (catch Throwable _ nil))
-                  (throw t)))]
-          ;; Step 8: forget the workspace. Deliberately OUTSIDE ws-dir (-R
-          ;; project via ordinary run-jj), same as cmd-workspace-forget --
-          ;; this is a repo-level op and running it with ws-dir as cwd risks
-          ;; forgetting the very workspace jj thinks it's standing in.
-          (let [{:keys [exit err]} (run-jj ["--no-pager" "-R" project "workspace" "forget" full-name])]
-            (when-not (zero? exit) (jj-failed! err)))
-          {:ok true
-           :landed {:commit_id commit-id
-                    :bookmark bookmark-name
-                    :workspace name}})))))
+    (let [ws-dir (dest-path project name)]
+      ;; Step 0.5: recover the SESSION workspace's own working copy if it
+      ;; was made stale by jj activity elsewhere. Every jj call below runs
+      ;; with ws-dir as cwd, so a stale ws-dir would otherwise make
+      ;; find-trunk (and everything after it) fail organically with jj's
+      ;; stale-working-copy error, turning a perfectly landable workspace
+      ;; into a jj-failed. Empirically verified as a safe, exit-0 no-op
+      ;; ("Attempted recovery, but the working copy is not stale") when
+      ;; ws-dir is already fresh, so this runs unconditionally rather than
+      ;; trying to detect staleness first.
+      (jj! ws-dir ["--no-pager" "workspace" "update-stale"])
+      (let [trunk (find-trunk ws-dir)]
+        (when (and (not trunk) (str/blank? create-trunk))
+          (cli-error "no-trunk"
+                     (str "No trunk bookmark found (looked for main, master, trunk). "
+                          "Pass --create-trunk <name> to have the app create one.")))
+        (let [bookmark-name (or trunk create-trunk)
+              ;; Step 1: merge-base of trunk (or, in the --create-trunk case,
+              ;; the default workspace) vs @. Needed for the nothing-to-land
+              ;; check, and -- only in the --create-trunk branch, which has no
+              ;; named trunk to rebase onto -- as the base of the squash/
+              ;; conflict-check revsets too.
+              base (jj-line! ws-dir
+                              ["--no-pager" "log" "--no-graph" "-r"
+                               (if trunk
+                                 (str "heads(::" trunk " & ::@)")
+                                 "heads(::@ & ::default@)")
+                               "-T" commit-id-template])
+              diff-out (:out (jj! ws-dir ["--no-pager" "diff" "--from" base "--to" "@"]))]
+          ;; Step 2: nothing-to-land check, still entirely read-only.
+          (when (str/blank? diff-out)
+            (cli-error "nothing-to-land"
+                       (str "Nothing to land: " name " has no content changes since it diverged.")))
+          ;; Step 3: capture the operation id -- the rollback point for
+          ;; everything from here on.
+          (let [opid (jj-line! ws-dir ["--no-pager" "op" "log" "--no-graph" "-n" "1" "-T" op-id-template])
+                commit-id
+                (try
+                  ;; Step 3.5: rebase the workspace's chain onto trunk. Only
+                  ;; when an existing trunk was found; always safe to run even
+                  ;; if @ is already directly on top of it (jj no-ops).
+                  (when trunk
+                    (jj! ws-dir ["--no-pager" "rebase" "-s" (str "roots(" trunk "..@)") "-d" trunk]))
+                  ;; Step 4: conflict check.
+                  (let [conflict-revset (if trunk
+                                          (str "(" trunk "..@) & conflicts()")
+                                          (str "(" base "..@) & conflicts()"))
+                        conflicts (:out (jj! ws-dir ["--no-pager" "log" "--no-graph" "-r" conflict-revset
+                                                      "-T" commit-id-template]))]
+                    (when-not (str/blank? conflicts)
+                      (cli-error "land-conflict"
+                                 (str "Landing conflicts with " bookmark-name
+                                      "; rolled back — trunk and workspace are unchanged. "
+                                      "Resolve the conflict and try again."))))
+                  ;; Step 5: squash the whole chain into one commit. -m is
+                  ;; passed directly on the squash (5a); an unconditional
+                  ;; describe (5b) always follows, since squash silently drops
+                  ;; -m when --from/--into resolve to the same single commit
+                  ;; (a one-revision chain) -- 5b is what actually sets the
+                  ;; message in that case, and is a harmless no-op otherwise.
+                  (let [from-revset (if trunk (str trunk "..@") (str base "..@"))]
+                    (jj! ws-dir ["--no-pager" "squash" "--from" from-revset "--into" "@" "-m" message])
+                    (jj! ws-dir ["--no-pager" "describe" "-r" "@" "-m" message]))
+                  ;; Step 6 (must follow 5b -- describing rewrites the commit
+                  ;; id) then step 7: advance/create the trunk bookmark.
+                  (let [cid (jj-line! ws-dir ["--no-pager" "log" "--no-graph" "-r" "@" "-T" commit-id-template])]
+                    (if trunk
+                      (jj! ws-dir ["--no-pager" "bookmark" "set" trunk "-r" "@"])
+                      (jj! ws-dir ["--no-pager" "bookmark" "create" create-trunk "-r" "@"]))
+                    cid)
+                  (catch Throwable t
+                    ;; Best-effort rollback: restore, then rethrow the
+                    ;; ORIGINAL exception unchanged so -main reports the
+                    ;; correct error code/message regardless of whether the
+                    ;; restore itself succeeds.
+                    (try (run-jj-in ws-dir ["--no-pager" "op" "restore" opid])
+                         (catch Throwable _ nil))
+                    (throw t)))
+                landed {:commit_id commit-id
+                        :bookmark bookmark-name
+                        :workspace name}]
+            ;; Step 8: forget the workspace. Deliberately OUTSIDE ws-dir (-R
+            ;; project via ordinary run-jj), same as cmd-workspace-forget --
+            ;; this is a repo-level op and running it with ws-dir as cwd risks
+            ;; forgetting the very workspace jj thinks it's standing in.
+            ;; --ignore-working-copy for the same reason as
+            ;; list-workspace-names/cmd-workspace-forget: this call runs with
+            ;; -R from outside the repo, which snapshots the DEFAULT
+            ;; workspace's working copy as a side effect -- if that happens
+            ;; to be stale, an unflagged forget would fail here even though
+            ;; forgetting never needed the working copy at all.
+            ;;
+            ;; By this point steps 5-7 above have already irreversibly
+            ;; succeeded -- the squash is done and the bookmark has moved, so
+            ;; the land itself HAS HAPPENED. A forget failure here (jj
+            ;; hiccup, or something --ignore-working-copy doesn't cover)
+            ;; therefore must NOT be reported as a jj-failed error: the
+            ;; caller would see {"ok":false} for a land that actually
+            ;; succeeded, which is precisely the incident this hardening
+            ;; exists to fix (a completed land reported back as failed).
+            ;; Instead this returns the normal success envelope plus a
+            ;; top-level :warning describing the manual cleanup step, and
+            ;; leaves the workspace registered in jj for the user (or a
+            ;; retried workspace-forget) to deal with later.
+            (let [{:keys [exit err]} (run-jj ["--ignore-working-copy" "--no-pager" "-R" project "workspace" "forget" full-name])]
+              (if (zero? exit)
+                {:ok true :landed landed}
+                {:ok true
+                 :landed landed
+                 :warning (str "Changes were kept, but the workspace couldn't be deregistered — "
+                               "run `jj workspace forget " full-name "` in " project
+                               " to finish cleaning up (jj said: " (stderr-tail err) ").")}))))))))
 
 ;; -----------------------------------------------------------------------
 ;; Dispatch + top-level error handling.
