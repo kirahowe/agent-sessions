@@ -111,4 +111,50 @@ enum Dialogs {
         let trimmed = textField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? nil : trimmed
     }
+
+    /// Prompts for a new workspace's sidebar label. Returns nil iff the user
+    /// cancelled — in that case no workspace should be created at all.
+    /// Otherwise returns the (untrimmed) field value as-is, including when
+    /// it's blank: unlike `promptLandMessage` above, blank input here is NOT
+    /// collapsed to nil, because blank is a meaningful "no label, use the
+    /// generated name" answer, distinct from cancelling. It's on the caller
+    /// (`AppStore.createWorkspace`) to trim and decide what blank means.
+    static func promptNewWorkspaceLabel() -> String? {
+        let alert = NSAlert()
+        alert.messageText = "New Workspace"
+        alert.informativeText =
+            "This sets a sidebar label only — the workspace keeps its own generated name on disk. Leave blank to use that generated name."
+        alert.addButton(withTitle: "Create")
+        alert.addButton(withTitle: "Cancel")
+
+        let textField = NSTextField(frame: NSRect(x: 0, y: 0, width: 240, height: 24))
+        textField.placeholderString = "Sidebar label (optional)"
+        alert.accessoryView = textField
+        alert.window.initialFirstResponder = textField
+
+        guard alert.runModal() == .alertFirstButtonReturn else { return nil }
+        return textField.stringValue
+    }
+
+    /// Prompts for a workspace's sidebar label, pre-filled with
+    /// `currentLabel`. Returns the (untrimmed) field value iff the user
+    /// confirmed, else nil on Cancel. Clearing the field and saving reverts
+    /// the sidebar to the workspace's generated name — that's what
+    /// `AppStore.setWorkspaceLabel` already does with blank input.
+    static func promptWorkspaceLabel(currentLabel: String?) -> String? {
+        let alert = NSAlert()
+        alert.messageText = "Workspace Label"
+        alert.informativeText =
+            "This sets a sidebar label only — it doesn't rename the workspace itself. Clear the field to revert the sidebar to the workspace's generated name."
+        alert.addButton(withTitle: "Save")
+        alert.addButton(withTitle: "Cancel")
+
+        let textField = NSTextField(frame: NSRect(x: 0, y: 0, width: 240, height: 24))
+        textField.stringValue = currentLabel ?? ""
+        alert.accessoryView = textField
+        alert.window.initialFirstResponder = textField
+
+        guard alert.runModal() == .alertFirstButtonReturn else { return nil }
+        return textField.stringValue
+    }
 }

@@ -114,9 +114,16 @@ final class AppStore: ObservableObject {
 
     // MARK: - Workspace management
 
-    func createWorkspace(in projectPath: String) async {
+    /// `label`, when non-blank after trimming, becomes the new row's sidebar
+    /// label. A nil/blank `label` (the default) leaves `label` nil, so
+    /// `displayName` falls through to the engine-generated name.
+    func createWorkspace(in projectPath: String, label: String? = nil) async {
         do {
-            let row = try await engine.createWorkspace(projectPath: projectPath)
+            var row = try await engine.createWorkspace(projectPath: projectPath)
+            let trimmedLabel = label?.trimmingCharacters(in: .whitespacesAndNewlines)
+            if let trimmedLabel, !trimmedLabel.isEmpty {
+                row.label = trimmedLabel
+            }
             workspaces.append(row)
             newSession(in: .workspace(projectPath: row.projectPath, name: row.name))
             // newSession already calls save() at the end, so no extra save()

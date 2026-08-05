@@ -87,7 +87,12 @@ final class AppActions {
 
         case .newWorkspace:
             guard let project = resolveProject() else { return false }
-            Task { await store.createWorkspace(in: project.path) }
+            // Cancel still counts as handled, same reasoning as .newSession
+            // above: once the dialog is opened the shortcut/menu item did
+            // its job regardless of the user's choice.
+            if let label = dialogs.promptNewWorkspaceLabel() {
+                Task { await store.createWorkspace(in: project.path, label: label) }
+            }
             return true
 
         case .deleteWorkspace:

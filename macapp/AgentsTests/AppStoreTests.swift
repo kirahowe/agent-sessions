@@ -1184,4 +1184,55 @@ final class AppStoreTests: XCTestCase {
         XCTAssertEqual(sessions.count, 1)
         XCTAssertEqual(sessions.first?.name, "Session 1")
     }
+
+    // MARK: - 42
+
+    func test42_createWorkspaceWithLabelSetsLabelAndDisplayNameReturnsIt() async {
+        let fake = FakeWorkspaceEngine()
+        let (store, _, _) = TestSupport.makeStore(engine: fake)
+        let pathA = "/tmp/proj-A"
+        store.addProject(path: pathA)
+        let expectedRow = WorkspaceRow(projectPath: pathA, name: "calm-river", path: "/tmp/workspaces/calm-river", label: nil)
+        fake.nextCreateResult = .success(expectedRow)
+
+        await store.createWorkspace(in: pathA, label: "my label")
+
+        let workspace = store.workspaces.first { $0.name == "calm-river" }
+        XCTAssertEqual(workspace?.label, "my label")
+        XCTAssertEqual(workspace?.displayName, "my label")
+    }
+
+    // MARK: - 43
+
+    func test43_createWorkspaceWithBlankLabelLeavesLabelNilAndDisplayNameFallsBackToGeneratedName() async {
+        let fake = FakeWorkspaceEngine()
+        let (store, _, _) = TestSupport.makeStore(engine: fake)
+        let pathA = "/tmp/proj-A"
+        store.addProject(path: pathA)
+        let expectedRow = WorkspaceRow(projectPath: pathA, name: "calm-river", path: "/tmp/workspaces/calm-river", label: nil)
+        fake.nextCreateResult = .success(expectedRow)
+
+        await store.createWorkspace(in: pathA, label: "   ")
+
+        let workspace = store.workspaces.first { $0.name == "calm-river" }
+        XCTAssertNil(workspace?.label)
+        XCTAssertEqual(workspace?.displayName, "calm-river")
+    }
+
+    // MARK: - 44
+
+    func test44_createWorkspaceLabelSurvivesSaveReloadRoundTrip() async {
+        let fake = FakeWorkspaceEngine()
+        let (store, _, url) = TestSupport.makeStore(engine: fake)
+        let pathA = "/tmp/proj-A"
+        store.addProject(path: pathA)
+        let expectedRow = WorkspaceRow(projectPath: pathA, name: "calm-river", path: "/tmp/workspaces/calm-river", label: nil)
+        fake.nextCreateResult = .success(expectedRow)
+
+        await store.createWorkspace(in: pathA, label: "my label")
+
+        let spy2 = SpyTerminals()
+        let store2 = AppStore(terminals: spy2, stateURL: url, engine: FakeWorkspaceEngine())
+        XCTAssertEqual(store2.workspaces.first { $0.name == "calm-river" }?.label, "my label")
+    }
 }

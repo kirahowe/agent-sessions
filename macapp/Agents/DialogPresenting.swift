@@ -5,7 +5,7 @@ import AppKit
 /// loop — mirrors the `SessionTerminating`/`WorkspaceEngineProviding` seams
 /// already used by `AppStore`. `LiveDialogPresenter` (below) is the
 /// production conformer, forwarding to the real `Dialogs` enum; tests
-/// inject a fake. Covers the 6 operations `AppActions` actually calls.
+/// inject a fake. Covers the 7 operations `AppActions` actually calls.
 /// `promptRename` has two callers: this seam, for the selection-targeted
 /// menu item/shortcut routed through `AppActions`, and a direct call from
 /// SidebarView's row-targeted "Rename…" context-menu item, which acts on a
@@ -14,7 +14,15 @@ import AppKit
 /// shape: this seam for the global `.newSession` action, plus direct
 /// `Dialogs.promptNewSessionName()` calls from SidebarView's project-header
 /// "+" button and workspace context-menu "New Session" item, which act on a
-/// specific project/workspace rather than app-wide state.
+/// specific project/workspace rather than app-wide state. `promptNewWorkspaceLabel`
+/// is the same shape again: this seam for the global `.newWorkspace` action,
+/// plus a direct `Dialogs.promptNewWorkspaceLabel()` call from SidebarView's
+/// project-header "New Workspace" item, which acts on a specific project
+/// rather than app-wide state. `promptWorkspaceLabel(currentLabel:)` is the
+/// odd one out, like `promptRename`'s second caller: it's called ONLY from
+/// SidebarView's row-targeted "Change Label…" context-menu item, which acts
+/// on a specific workspace row rather than `store.selection`, so it has no
+/// need of `AppActions` or this seam at all.
 @MainActor
 protocol DialogPresenting {
     func chooseProjectDirectory() -> String?
@@ -23,6 +31,7 @@ protocol DialogPresenting {
     func promptLandMessage(workspace: WorkspaceRow) -> String?
     func promptRename(currentName: String) -> String?
     func promptNewSessionName() -> String?
+    func promptNewWorkspaceLabel() -> String?
 }
 
 /// Production conformer: forwards straight through to `Dialogs`.
@@ -44,4 +53,5 @@ struct LiveDialogPresenter: DialogPresenting {
     func promptLandMessage(workspace: WorkspaceRow) -> String? { Dialogs.promptLandMessage(workspace: workspace) }
     func promptRename(currentName: String) -> String? { Dialogs.promptRename(currentName: currentName) }
     func promptNewSessionName() -> String? { Dialogs.promptNewSessionName() }
+    func promptNewWorkspaceLabel() -> String? { Dialogs.promptNewWorkspaceLabel() }
 }

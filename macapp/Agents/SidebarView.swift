@@ -79,12 +79,14 @@ struct SidebarView: View {
     /// button, so the two presentations can never drift apart.
     @ViewBuilder
     private func projectHeaderMenuItems(_ project: Project) -> some View {
-        // Direct store call, not actions.perform: this creates a
+        // Direct store/Dialogs call, not actions.perform: this creates a
         // workspace in the specific right-clicked project, not
         // whatever project AppActions' .newWorkspace would resolve
         // from selection (see design rationale in AppActions.swift).
         Button("New Workspace") {
-            Task { await store.createWorkspace(in: project.path) }
+            if let label = Dialogs.promptNewWorkspaceLabel() {
+                Task { await store.createWorkspace(in: project.path, label: label) }
+            }
         }
         // Direct store/Dialogs call, not actions.perform: this
         // targets the specific right-clicked project, not the
@@ -243,9 +245,12 @@ private struct WorkspaceRowView: View {
                 store.newSession(in: .workspace(projectPath: workspace.projectPath, name: workspace.name), name: name)
             }
         }
-        Button("Rename…") {
-            if let name = Dialogs.promptRename(currentName: workspace.displayName, title: "Rename Workspace") {
-                store.setWorkspaceLabel(workspace.id, label: name)
+        // Passes workspace.label (not displayName): an unlabelled workspace
+        // should open this dialog with an empty field, not pre-filled with
+        // a generated name the user never chose.
+        Button("Change Label…") {
+            if let label = Dialogs.promptWorkspaceLabel(currentLabel: workspace.label) {
+                store.setWorkspaceLabel(workspace.id, label: label)
             }
         }
         Button("Delete Workspace…") {

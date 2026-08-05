@@ -18,6 +18,10 @@ final class FakeDialogs: DialogPresenting {
     /// tests already assume when they don't touch this fake. A nil default
     /// would silently turn every one of those into a cancel and break them.
     var nextNewSessionName: String? = ""
+    /// Defaults to "" (NOT nil) — same reasoning as `nextNewSessionName`
+    /// above: existing `.newWorkspace` tests don't touch this fake, and a
+    /// nil default would silently convert every one of them into a cancel.
+    var nextNewWorkspaceLabel: String? = ""
 
     private(set) var chooseProjectDirectoryCallCount: Int = 0
     private(set) var confirmRemoveCalls: [Project] = []
@@ -25,6 +29,7 @@ final class FakeDialogs: DialogPresenting {
     private(set) var promptLandMessageCalls: [WorkspaceRow] = []
     private(set) var promptRenameCalls: [String] = []
     private(set) var promptNewSessionNameCallCount: Int = 0
+    private(set) var promptNewWorkspaceLabelCallCount: Int = 0
 
     func chooseProjectDirectory() -> String? {
         chooseProjectDirectoryCallCount += 1
@@ -54,5 +59,10 @@ final class FakeDialogs: DialogPresenting {
     func promptNewSessionName() -> String? {
         promptNewSessionNameCallCount += 1
         return nextNewSessionName
+    }
+
+    func promptNewWorkspaceLabel() -> String? {
+        promptNewWorkspaceLabelCallCount += 1
+        return nextNewWorkspaceLabel
     }
 }

@@ -212,6 +212,41 @@ final class AppActionsTests: XCTestCase {
         XCTAssertTrue(fake.createCalls.isEmpty)
     }
 
+    func test05d_newWorkspaceCancelReturnsTrueButCreatesNoWorkspace() {
+        let fake = FakeWorkspaceEngine()
+        let (store, _, _) = TestSupport.makeStore(engine: fake)
+        let dialogs = FakeDialogs()
+        dialogs.nextNewWorkspaceLabel = nil
+        let actions = AppActions(store: store, uiState: UIState(), dialogs: dialogs)
+        store.addProject(path: "/tmp/proj-A")
+
+        XCTAssertTrue(actions.perform(.newWorkspace), "cancel still counts as handled")
+
+        // A cancelled dialog never even schedules the Task, so this is safe
+        // to assert synchronously without the polling helper.
+        XCTAssertTrue(fake.createCalls.isEmpty)
+    }
+
+    func test05e_newWorkspaceConfirmWithLabelCreatesWorkspaceCarryingThatLabel() async {
+        let fake = FakeWorkspaceEngine()
+        let (store, _, _) = TestSupport.makeStore(engine: fake)
+        let dialogs = FakeDialogs()
+        dialogs.nextNewWorkspaceLabel = "my label"
+        let actions = AppActions(store: store, uiState: UIState(), dialogs: dialogs)
+        store.addProject(path: "/tmp/proj-A")
+        let wsRow = WorkspaceRow(projectPath: "/tmp/proj-A", name: "calm-river", path: "/tmp/workspaces/calm-river", label: nil)
+        fake.nextCreateResult = .success(wsRow)
+
+        XCTAssertTrue(actions.perform(.newWorkspace))
+
+        // Waits on the store state this test actually asserts, not on the
+        // engine call that precedes it: the append happens after the
+        // `await engine.createWorkspace`, so a createCalls-based wait would
+        // only be safe while the fake happens never to suspend.
+        await waitUntil { !store.workspaces.isEmpty }
+        XCTAssertEqual(store.workspaces.first?.label, "my label")
+    }
+
     // MARK: - 6: .deleteWorkspace
 
     func test06a_deleteWorkspaceFalseWhenSelectionIsNotAWorkspaceSession() {
