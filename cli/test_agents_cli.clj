@@ -94,17 +94,23 @@
    `jj commit -m \"seed\"`, not just `jj st`) and a `main` bookmark is
    created at that seed commit.
 
-   This is required for workspace-land tests that add workspaces via the
-   CLI (`run-cli \"workspace-add\" ...`): `jj workspace add` (no -r) forks
-   the new workspace from the SAME PARENT(S) as the current workspace's @,
-   not from wherever a bookmark points. If the default workspace's own @
-   were still an undescribed snapshot sitting on the root commit (as in
-   fresh-jj-project!), a workspace added from it would fork from the ROOT,
-   completely empty, with `main` (if created at that snapshot) pointing
-   somewhere the new workspace never descends from. Finalizing the seed via
-   `jj commit` first -- which also advances the default workspace's own @ to
-   a fresh empty commit on top -- and creating `main` at the now-finalized
-   seed commit (@-) means workspace-add forks correctly from `main`."
+   Originally this existed because `jj workspace add` (no -r) forks the new
+   workspace from the SAME PARENT(S) as the invoking workspace's own @, not
+   from wherever a bookmark points -- so a `main` bookmark created over an
+   undescribed root-commit snapshot (as fresh-jj-project! leaves default's
+   own @) would point somewhere a plain workspace-add's fork never
+   descended from.
+
+   cmd-workspace-add now passes `-r <trunk>` itself whenever a trunk
+   bookmark exists (see agents-cli's cmd-workspace-add), which sidesteps
+   that forking behavior for every CLI-driven `run-cli \"workspace-add\"
+   ...` call below -- but a properly committed `main` with real content is
+   still needed for landing/diffing to have something concrete to compare
+   against. And the OLD no-r forking behavior is still very much alive for
+   any test that calls `jj workspace add` DIRECTLY rather than through the
+   CLI: see workspace-land-shared-history-test, which deliberately uses
+   that direct, hazardous form to reenact the incident this whole feature
+   exists to prevent."
   []
   (let [root (str (fs/create-temp-dir))
         project (str (fs/path root "project"))
@@ -401,7 +407,7 @@
 ;; 12. workspace-land: multi-commit chain plus trailing uncommitted edit
 
 (deftest workspace-land-multi-commit-chain-test
-  (testing "landing squashes a multi-commit chain plus a trailing uncommitted edit into one commit"
+  (testing "landing preserves a multi-commit chain plus a trailing uncommitted edit as distinct commits (merge model, not squash)"
     (let [{:keys [root project]} (fresh-jj-project-on-main!)]
       (try
         (let [add (run-cli "workspace-add" "--project" project "--name" "foo")
@@ -420,7 +426,16 @@
             (is (true? (:ok json)))
             (is (= "ONE_CONTENT\n" (direct-jj-file-show project "main" "one.txt")))
             (is (= "TWO_CONTENT\n" (direct-jj-file-show project "main" "two.txt")))
-            (is (= "THREE_CONTENT\n" (direct-jj-file-show project "main" "three.txt")))))
+            (is (= "THREE_CONTENT\n" (direct-jj-file-show project "main" "three.txt")))
+            ;; THE MERGE-MODEL INVARIANT: the chain survives intact instead
+            ;; of being squashed into one commit -- main is the described
+            ;; trailing edit, main- is still c2, main-- is still c1.
+            (is (str/includes? (direct-jj-log project "main" "description") "landed all three")
+                "main should carry the --message description of the trailing edit")
+            (is (str/includes? (direct-jj-log project "main-" "description") "c2")
+                "main's parent should still be the c2 commit, with its own message intact")
+            (is (str/includes? (direct-jj-log project "main--" "description") "c1")
+                "main's grandparent should still be the c1 commit, with its own message intact")))
         (finally (cleanup! root))))))
 
 ;; -----------------------------------------------------------------------
@@ -718,6 +733,106 @@
             (is (true? (:ok json)))
             (is (= "C1_CONTENT\n" (direct-jj-file-show project "main" "one.txt"))
                 "c1's content must be present at main despite the workspace having been stale")))
+        (finally (cleanup! root))))))
+
+;; -----------------------------------------------------------------------
+;; Phase 2 (merge-model landing). Shared background for the three tests
+;; below: the incident this phase exists to prevent was plain `jj workspace
+;; add` (no -r) forking a new workspace from the invoking workspace's own
+;; @-parent -- i.e. the tip of the user's in-flight stack, not trunk -- and
+;; a squash-based land then flattening whatever unlanded user commits
+;; happened to sit in between. cmd-workspace-add now bases new workspaces
+;; on trunk (23), and cmd-workspace-land refuses outright, before touching
+;; anything, if a workspace's landing range shares history with any other
+;; workspace's line anyway (24) -- two independent layers against the same
+;; failure mode. 25 covers the merge model's other behavior change: land's
+;; --message now only ever describes a trailing UNCOMMITTED edit, never a
+;; chain commit the agent already described itself.
+
+;; -----------------------------------------------------------------------
+;; 23. workspace-add: bases the new workspace on trunk
+
+(deftest workspace-add-bases-on-trunk-test
+  (testing "workspace-add bases the new workspace on trunk, not on the default workspace's own unlanded stack"
+    (let [{:keys [root project]} (fresh-jj-project-on-main!)]
+      (try
+        ;; Advance the DEFAULT workspace's own stack WITHOUT moving main --
+        ;; exactly the shape of the incident: the user has unlanded work of
+        ;; their own in flight when a new session workspace gets created.
+        (is (zero? (:exit (sh "jj" "-R" project "commit" "-m" "unlanded user work")))
+            "sanity: advance default's own stack without moving main")
+        (let [main-id (direct-jj-log project "main" commit-id-tpl)
+              add (run-cli "workspace-add" "--project" project "--name" "foo")]
+          (is (true? (get-in add [:json :ok])))
+          (let [ws-dir (get-in add [:json :workspace :path])]
+            (is (= main-id (direct-jj-log ws-dir "@-" commit-id-tpl))
+                "the new workspace's parent must be main -- NOT the unlanded commit sitting on top of it")))
+        (finally (cleanup! root))))))
+
+;; -----------------------------------------------------------------------
+;; 24. workspace-land: shared-history guard (the incident reenactment)
+
+(deftest workspace-land-shared-history-test
+  (testing "landing refuses, with nothing mutated, when its chain shares history with another workspace's line"
+    (let [{:keys [root project]} (fresh-jj-project-on-main!)
+          ws-dir (str root "/workspaces/foo")]
+      (try
+        ;; main NOT moved -- this unlanded commit is what the workspace
+        ;; below will hazardously fork on top of.
+        (is (zero? (:exit (sh "jj" "-R" project "commit" "-m" "unlanded user work")))
+            "sanity: advance default's own stack without moving main")
+        ;; Create the workspace the OLD HAZARDOUS way: a direct `jj
+        ;; workspace add` (bypassing the CLI, and its own trunk-basing)
+        ;; forks from the invoking (default) workspace's own @-parent --
+        ;; the unlanded commit above, not main. jj doesn't create
+        ;; intermediate directories for `workspace add` (same as
+        ;; cmd-workspace-add's own comment notes), so workspaces/ is made
+        ;; by hand first.
+        (fs/create-dirs (str root "/workspaces"))
+        (is (zero? (:exit (sh "jj" "-R" project "workspace" "add" "--name" "agents/foo" ws-dir)))
+            "sanity: direct workspace add (old hazardous form, no -r) succeeded")
+        (spit (str (fs/path ws-dir "edit.txt")) "EDIT_CONTENT\n")
+        (is (zero? (:exit (sh "jj" "-R" ws-dir "st")))
+            "sanity: snapshot a real edit in the workspace")
+        (let [ws-change-before (direct-jj-log ws-dir "@" change-id-tpl)
+              main-before (direct-jj-log project "main" commit-id-tpl)
+              {:keys [exit json]} (run-cli "workspace-land" "--project" project "--name" "foo"
+                                            "--message" "should refuse")]
+          (is (= 1 exit))
+          (is (false? (:ok json)))
+          (is (= "shared-history" (get-in json [:error :code])))
+          (is (= main-before (direct-jj-log project "main" commit-id-tpl))
+              "main must be unchanged -- the guard runs before any mutation")
+          (is (str/includes? (direct-jj-workspace-list project) "agents/foo")
+              "workspace must still be registered after refusal")
+          (is (= ws-change-before (direct-jj-log ws-dir "@" change-id-tpl))
+              "workspace's own @ change id must be unchanged after refusal"))
+        (finally (cleanup! root))))))
+
+;; -----------------------------------------------------------------------
+;; 25. workspace-land: a trailing @ the agent already described keeps its
+;;     own message, not --message
+
+(deftest workspace-land-preserves-agent-own-description-test
+  (testing "a described (but uncommitted) trailing @ keeps its own message -- --message is ignored for it"
+    (let [{:keys [root project]} (fresh-jj-project-on-main!)]
+      (try
+        (let [add (run-cli "workspace-add" "--project" project "--name" "foo")
+              ws-dir (get-in add [:json :workspace :path])]
+          (is (true? (get-in add [:json :ok])))
+          (spit (str (fs/path ws-dir "edit.txt")) "EDIT_CONTENT\n")
+          (is (zero? (:exit (sh "jj" "-R" ws-dir "describe" "-m" "agent's own message")))
+              "sanity: the agent described its own trailing @ before land")
+          (let [{:keys [exit json]} (run-cli "workspace-land" "--project" project "--name" "foo"
+                                              "--message" "should be ignored")]
+            (is (= 0 exit))
+            (is (true? (:ok json)))
+            (is (str/includes? (direct-jj-log project "main" "description") "agent's own message")
+                "main's description should be the agent's own, not --message")
+            (is (not (str/includes? (direct-jj-log project "main" "description") "should be ignored"))
+                "--message's value must not appear anywhere -- it was never used")
+            (is (= "EDIT_CONTENT\n" (direct-jj-file-show project "main" "edit.txt"))
+                "the described edit's content should still land at main")))
         (finally (cleanup! root))))))
 
 ;; -----------------------------------------------------------------------

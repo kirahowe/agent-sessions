@@ -44,10 +44,10 @@
 ;; -----------------------------------------------------------------------
 ;; Errors. Every failure path throws ex-info carrying {:code :message}; the
 ;; top-level handler in -main turns that into the error envelope. `code`
-;; must always be one of the five contract codes.
+;; must always be one of the codes in error-codes below.
 
 (def error-codes #{"not-a-jj-repo" "dest-exists" "name-conflict" "bad-args" "jj-failed"
-                    "no-trunk" "land-conflict" "nothing-to-land"})
+                    "no-trunk" "land-conflict" "nothing-to-land" "shared-history"})
 
 (defn cli-error [code message]
   (assert (contains? error-codes code) (str "internal: unknown error code " code))
@@ -135,6 +135,32 @@
                  (str "'" project "' is not a jj repo — jj repos only (for now); "
                       "git-worktree support is deliberately deferred.")))))
 
+(defn parse-colon-prefixed-names
+  "Shared parsing idiom for jj registry-listing output (`jj workspace list`,
+   `jj bookmark list`): each non-blank line looks like `<name>: ...trailing
+   info...`; this returns just the name from each line, in order. Used by
+   list-workspace-names, list-bookmark-names, and
+   list-bookmark-names-outside below -- all three read the same shape of
+   output from different jj registries/contexts."
+  [out]
+  (->> (str/split-lines out)
+       (remove str/blank?)
+       (map (fn [line]
+              (let [idx (str/index-of line ":")]
+                (if idx (subs line 0 idx) line))))))
+
+(defn pick-trunk
+  "The first of main/master/trunk present in `bookmark-names` (a coll of
+   local bookmark name strings), in that priority order, or nil if none are
+   present. Shared priority logic for find-trunk (workspace-land, reading
+   via ws-dir once the workspace exists) and cmd-workspace-add's own trunk
+   lookup (reading via -R from outside, before any workspace/ws-dir
+   exists) -- both need the exact same main/master/trunk preference, just
+   sourced from different jj invocations."
+  [bookmark-names]
+  (let [names (set bookmark-names)]
+    (first (filter names ["main" "master" "trunk"]))))
+
 (defn list-workspace-names
   "Raw `jj workspace list` output, as a seq of just the name on each line
    (the part before the first ':'), e.g. \"default\", \"agents/foo\".
@@ -149,11 +175,7 @@
   [project]
   (let [{:keys [exit out err]} (run-jj ["--ignore-working-copy" "--no-pager" "-R" project "workspace" "list"])]
     (when-not (zero? exit) (jj-failed! err))
-    (->> (str/split-lines out)
-         (remove str/blank?)
-         (map (fn [line]
-                (let [idx (str/index-of line ":")]
-                  (if idx (subs line 0 idx) line)))))))
+    (parse-colon-prefixed-names out)))
 
 (defn workspace-name-taken? [project full-name]
   (contains? (set (list-workspace-names project)) full-name))
@@ -214,19 +236,55 @@
           (< attempt 5) (recur (inc attempt))
           :else (throw outcome))))))
 
+(defn list-bookmark-names-outside
+  "Local bookmark names for `project`, read via -R from OUTSIDE the repo --
+   used by cmd-workspace-add's trunk lookup below, which runs BEFORE any
+   workspace directory exists to cd into, so (unlike workspace-land's own
+   list-bookmark-names, further down, which runs via cwd once a ws-dir
+   exists) this can't use the cwd-based run-jj-in/jj! path.
+
+   --ignore-working-copy, same reasoning as list-workspace-names above: this
+   is a pure registry read that runs with -R from outside the repo, which
+   makes jj snapshot the DEFAULT workspace's working copy as a side effect,
+   and this call must never trip over (or cause) that workspace's
+   staleness."
+  [project]
+  (let [{:keys [exit out err]} (run-jj ["--ignore-working-copy" "--no-pager" "-R" project "bookmark" "list"])]
+    (when-not (zero? exit) (jj-failed! err))
+    (parse-colon-prefixed-names out)))
+
 (defn cmd-workspace-add [flags]
   (require-flags! flags :project)
   (let [project (str (fs/absolutize (:project flags)))]
     (assert-jj-repo! project)
     (let [name (pick-name project (:name flags))
           dest (dest-path project name)
-          root (workspaces-root project)]
+          root (workspaces-root project)
+          ;; Base the new workspace on trunk rather than on the invoking
+          ;; workspace's own @-parent, which is what plain `jj workspace
+          ;; add` (no -r) does by default. That default is exactly what
+          ;; caused the incident this exists to prevent: a workspace added
+          ;; while the user had their own unlanded commits in flight forked
+          ;; ON TOP of that unlanded work, and a later land (see
+          ;; cmd-workspace-land's shared-history guard) had to be taught to
+          ;; refuse rather than sweep those commits up as if they belonged
+          ;; to the session. Basing on trunk from the moment of creation
+          ;; keeps a session's chain disjoint from the user's own in-flight
+          ;; stack in the first place. When no trunk bookmark exists yet,
+          ;; this falls back to today's exact behavior (no -r at all) --
+          ;; cmd-workspace-land's --create-trunk path handles that case.
+          trunk (pick-trunk (list-bookmark-names-outside project))]
       ;; jj does NOT create intermediate directories for `workspace add`
       ;; (verified empirically), so we make the workspaces/ parent ourselves.
       (fs/create-dirs root)
-      (let [{:keys [exit err]}
-            (run-jj ["--no-pager" "-R" project "workspace" "add"
-                     "--name" (jj-name name) dest])]
+      ;; NOTE (verified against jj 0.43.0): `workspace add` itself REFUSES
+      ;; --ignore-working-copy ("This command must be able to update the
+      ;; working copy") -- unlike the bookmark-list read just above, this
+      ;; call never gets that flag.
+      (let [add-args (concat ["--no-pager" "-R" project "workspace" "add" "--name" (jj-name name)]
+                              (when trunk ["-r" trunk])
+                              [dest])
+            {:keys [exit err]} (run-jj add-args)]
         (when-not (zero? exit) (jj-failed! err))
         {:ok true
          :workspace {:name name
@@ -278,18 +336,55 @@
 ;; -----------------------------------------------------------------------
 ;; workspace-land
 ;;
-;; "Land" squashes the workspace's entire net change -- its committed chain
-;; of `jj commit`s AND any currently-uncommitted working-copy edit (jj's
-;; working copy is itself a commit, so no special-casing is needed) -- into
-;; ONE commit on top of the trunk bookmark, advances the bookmark to it, and
-;; forgets the workspace (directory stays on disk, same non-destructive
-;; convention as workspace-forget). On any conflict or unexpected jj failure
-;; UP THROUGH the bookmark move (steps 1-7 below), every bit of prior state
-;; (trunk position, workspace registration, the workspace's commit chain, its
-;; directory) is restored via `jj op restore` -- nothing partially mutated is
-;; ever left behind. Once the squash and bookmark move have gone through,
-;; though, the land is irreversibly done; see step 8's own comment for what
-;; that means for its failure handling.
+;; "Land" is a MERGE, not a squash: the whole chain lands AS-IS, commit by
+;; commit, with its own messages intact -- like merging a branch to main in
+;; git via a fast-forward. Advancing the trunk bookmark to the tip of the
+;; (now-trunk-based) chain is what actually lands every commit in between;
+;; nothing in the chain is rewritten or flattened. This replaced an earlier
+;; squash-everything-into-one-commit model, which is what caused the
+;; incident this file's staleness hardening and the shared-history guard
+;; below both exist to prevent: a squash-based land silently flattened
+;; commits that predated the session and were never the session's to
+;; rewrite, because `jj workspace add` (no -r) had based the session on the
+;; user's own in-flight stack rather than trunk. cmd-workspace-add now bases
+;; new workspaces on trunk for exactly this reason (see its own comment),
+;; and the shared-history guard below is a second, independent line of
+;; defense for any chain that ends up sharing history with another
+;; workspace anyway.
+;;
+;; --message's role is narrower than the flag name suggests, and than it
+;; was under the old squash model: it is NEVER used to overwrite the
+;; session's own commit messages. It describes ONLY trailing UNCOMMITTED
+;; work sitting in `@` at land time, and only when that `@` has no
+;; description of its own yet (an agent that already ran `jj describe` on
+;; its own `@` keeps its own message; --message is ignored for it in that
+;; case). It remains a REQUIRED flag regardless, because the app always
+;; sends one and there's no way to know in advance whether `@` will need it
+;; -- see the landing steps below for exactly when it is and isn't used.
+;;
+;; ASSUMPTION: the session's own chain is linear. A multi-parent `@` (the
+;; workspace's own history containing a merge commit) is out of scope and
+;; not handled specially -- the tip/rebase logic below assumes a single
+;; line of descent from trunk to `@`.
+;;
+;; jj auto-abandons a trivial (empty, undescribed) working-copy commit when
+;; you move off it, so after the final forget below, an empty undescribed
+;; leftover `@` (the common case: no trailing edit at land time) simply
+;; vanishes on its own. An empty but DESCRIBED `@` (rare: the agent
+;; described it but never gave it real content) doesn't get that automatic
+;; cleanup and may linger as a harmless dangling commit -- deliberately not
+;; worth adding cleanup machinery for.
+;;
+;; On any conflict, shared-history refusal, or unexpected jj failure UP
+;; THROUGH the bookmark move, every bit of prior state (trunk position,
+;; workspace registration, the workspace's commit chain, its directory) is
+;; either never touched at all -- the nothing-to-land check and the
+;; shared-history guard are both read-only and run before any mutation
+;; begins -- or restored via `jj op restore` for the mutating steps (3.5
+;; onward, inside the try/catch). Nothing partially mutated is ever left
+;; behind. Once the bookmark move has gone through, though, the land is
+;; irreversibly done; see step 8's own comment for what that means for its
+;; failure handling.
 ;;
 ;; CWD (not -R) is what selects which workspace's `@` a jj command targets,
 ;; so every jj call below that needs to act on the WORKSPACE's own `@` runs
@@ -310,8 +405,8 @@
 ;; commands in the default workspace, but any workspace could do it). Left
 ;; unhandled, either kind of staleness can turn a perfectly landable
 ;; workspace into a reported failure -- including, in the worst case, AFTER
-;; the squash and bookmark move already succeeded, which is exactly the
-;; incident this hardening fixes: a completed land reported back as failed.
+;; the bookmark move already succeeded, which is exactly the incident this
+;; hardening fixes: a completed land reported back as failed.
 
 (defn jj!
   "run-jj-in, but throws jj-failed! on nonzero exit. Used throughout
@@ -333,22 +428,18 @@
 
 (defn list-bookmark-names
   "Local bookmark names (`jj bookmark list`, no -a -- this deliberately
-   excludes remote-tracking pseudo-entries like @git), using the same
-   'split each line on the first :' idiom as list-workspace-names."
+   excludes remote-tracking pseudo-entries like @git), via cwd-based jj! on
+   ws-dir (the workspace already exists by the time this is called, unlike
+   cmd-workspace-add's list-bookmark-names-outside above)."
   [dir]
   (let [{:keys [out]} (jj! dir ["--no-pager" "bookmark" "list"])]
-    (->> (str/split-lines out)
-         (remove str/blank?)
-         (map (fn [line]
-                (let [idx (str/index-of line ":")]
-                  (if idx (subs line 0 idx) line)))))))
+    (parse-colon-prefixed-names out)))
 
 (defn find-trunk
   "The first of main/master/trunk that exists as a LOCAL bookmark in
    ws-dir, in that priority order, or nil if none do."
   [ws-dir]
-  (let [names (set (list-bookmark-names ws-dir))]
-    (first (filter names ["main" "master" "trunk"]))))
+  (pick-trunk (list-bookmark-names ws-dir)))
 
 (defn cmd-workspace-land [flags]
   (require-flags! flags :project :name :message)
@@ -382,8 +473,8 @@
               ;; Step 1: merge-base of trunk (or, in the --create-trunk case,
               ;; the default workspace) vs @. Needed for the nothing-to-land
               ;; check, and -- only in the --create-trunk branch, which has no
-              ;; named trunk to rebase onto -- as the base of the squash/
-              ;; conflict-check revsets too.
+              ;; named trunk to rebase onto -- as the base of the
+              ;; landing-range/conflict-check revsets too.
               base (jj-line! ws-dir
                               ["--no-pager" "log" "--no-graph" "-r"
                                (if trunk
@@ -395,6 +486,48 @@
           (when (str/blank? diff-out)
             (cli-error "nothing-to-land"
                        (str "Nothing to land: " name " has no content changes since it diverged.")))
+          ;; Step 2.5 (NEW): the shared-history guard -- still entirely
+          ;; read-only, and runs BEFORE the opid capture / mutation phase
+          ;; below, so a refusal here leaves EVERYTHING untouched. This is
+          ;; the incident's own reenactment check: the landing range
+          ;; (trunk..@, or base..@ when there's no trunk yet) is intersected
+          ;; against the ancestors of every OTHER workspace's own
+          ;; working-copy commit -- default's, other agents/* sessions', and
+          ;; any workspace the user added by hand, straight from jj's own
+          ;; registry. A non-empty intersection means landing
+          ;; would sweep up commits that are ALSO part of another
+          ;; workspace's line -- almost always because this workspace was
+          ;; itself created on top of unlanded work (the exact scenario
+          ;; cmd-workspace-add's trunk-basing now prevents at creation time;
+          ;; this is the second, independent line of defense for any chain
+          ;; that ends up sharing history anyway, e.g. one added the old
+          ;; hazardous way).
+          ;;
+          ;; `"agents/foo"@` (a quoted workspace name followed by `@`) is
+          ;; valid jj revset syntax for that workspace's own working-copy
+          ;; commit -- verified empirically against this machine's jj
+          ;; 0.43.0 -- so each other workspace's `@` is referenced directly
+          ;; in the combined revset string below, with no need to resolve
+          ;; it to a commit id first.
+          (let [landing-range (if trunk (str trunk "..@") (str base "..@"))
+                ;; EVERY other workspace's line counts, not just default's
+                ;; and other agents/* sessions': a workspace the user added
+                ;; by hand shares history just as easily, and jj's registry
+                ;; already tells us about all of them.
+                other-ws-ats (->> (list-workspace-names project)
+                                  (remove #(= % full-name))
+                                  (map #(str "::\"" % "\"@")))
+                shared-revset (str "(" landing-range ") & (" (str/join " | " other-ws-ats) ")")
+                shared-out (:out (jj! ws-dir ["--no-pager" "log" "--no-graph" "-r" shared-revset
+                                              "-T" "commit_id.short() ++ \" \" ++ description.first_line() ++ \"\\n\""]))]
+            (when-not (str/blank? shared-out)
+              (cli-error "shared-history"
+                         (str "Landing " name " would sweep up commits that are also part of "
+                              "another workspace's line (usually a workspace created on top of "
+                              "unlanded work): "
+                              (str/join "; " (str/split-lines (str/trim shared-out)))
+                              ". Rebase " name "'s chain onto " bookmark-name
+                              ", or land the shared work first."))))
           ;; Step 3: capture the operation id -- the rollback point for
           ;; everything from here on.
           (let [opid (jj-line! ws-dir ["--no-pager" "op" "log" "--no-graph" "-n" "1" "-T" op-id-template])
@@ -416,22 +549,38 @@
                                  (str "Landing conflicts with " bookmark-name
                                       "; rolled back — trunk and workspace are unchanged. "
                                       "Resolve the conflict and try again."))))
-                  ;; Step 5: squash the whole chain into one commit. -m is
-                  ;; passed directly on the squash (5a); an unconditional
-                  ;; describe (5b) always follows, since squash silently drops
-                  ;; -m when --from/--into resolve to the same single commit
-                  ;; (a one-revision chain) -- 5b is what actually sets the
-                  ;; message in that case, and is a harmless no-op otherwise.
-                  (let [from-revset (if trunk (str trunk "..@") (str base "..@"))]
-                    (jj! ws-dir ["--no-pager" "squash" "--from" from-revset "--into" "@" "-m" message])
-                    (jj! ws-dir ["--no-pager" "describe" "-r" "@" "-m" message]))
-                  ;; Step 6 (must follow 5b -- describing rewrites the commit
-                  ;; id) then step 7: advance/create the trunk bookmark.
-                  (let [cid (jj-line! ws-dir ["--no-pager" "log" "--no-graph" "-r" "@" "-T" commit-id-template])]
-                    (if trunk
-                      (jj! ws-dir ["--no-pager" "bookmark" "set" trunk "-r" "@"])
-                      (jj! ws-dir ["--no-pager" "bookmark" "create" create-trunk "-r" "@"]))
-                    cid)
+                  ;; Step 5 (NEW landing model, replacing the old squash):
+                  ;; find the tip of the chain to advance the bookmark to.
+                  ;; If @ is non-empty (trailing uncommitted work), it
+                  ;; becomes the tip and joins the landed chain: describe it
+                  ;; with --message ONLY if it has no description of its own
+                  ;; yet (an agent that already described its own @ keeps
+                  ;; that message, and --message is ignored for it). If @ is
+                  ;; empty, there is no trailing work to land -- @- (the
+                  ;; last real chain commit) is the tip instead, and the
+                  ;; empty @ itself is left alone rather than landed (see
+                  ;; this section's header comment for what becomes of it
+                  ;; after the final forget).
+                  (let [at-empty? (= "true" (jj-line! ws-dir ["--no-pager" "log" "--no-graph" "-r" "@"
+                                                              "-T" "if(empty, \"true\", \"false\")"]))
+                        tip-revset (if at-empty? "@-" "@")]
+                    (when-not at-empty?
+                      (let [at-desc (jj-line! ws-dir ["--no-pager" "log" "--no-graph" "-r" "@" "-T" "description"])]
+                        (when (str/blank? at-desc)
+                          (jj! ws-dir ["--no-pager" "describe" "-r" "@" "-m" message]))))
+                    ;; Step 6: advance/create the trunk bookmark at the tip's
+                    ;; commit id, captured from the SAME tip-revset used for
+                    ;; the bookmark move itself, AFTER the describe above (if
+                    ;; any ran) -- describing rewrites the commit id, so this
+                    ;; must come after it, not before. This bookmark move is
+                    ;; what actually lands the whole chain: everything
+                    ;; between trunk and the tip goes along for the ride,
+                    ;; as-is, the same as a fast-forward merge in git.
+                    (let [cid (jj-line! ws-dir ["--no-pager" "log" "--no-graph" "-r" tip-revset "-T" commit-id-template])]
+                      (if trunk
+                        (jj! ws-dir ["--no-pager" "bookmark" "set" trunk "-r" tip-revset])
+                        (jj! ws-dir ["--no-pager" "bookmark" "create" create-trunk "-r" tip-revset]))
+                      cid))
                   (catch Throwable t
                     ;; Best-effort rollback: restore, then rethrow the
                     ;; ORIGINAL exception unchanged so -main reports the
@@ -454,9 +603,9 @@
             ;; to be stale, an unflagged forget would fail here even though
             ;; forgetting never needed the working copy at all.
             ;;
-            ;; By this point steps 5-7 above have already irreversibly
-            ;; succeeded -- the squash is done and the bookmark has moved, so
-            ;; the land itself HAS HAPPENED. A forget failure here (jj
+            ;; By this point steps 5-6 above have already irreversibly
+            ;; succeeded -- the chain is rebased and the bookmark has moved,
+            ;; so the land itself HAS HAPPENED. A forget failure here (jj
             ;; hiccup, or something --ignore-working-copy doesn't cover)
             ;; therefore must NOT be reported as a jj-failed error: the
             ;; caller would see {"ok":false} for a land that actually

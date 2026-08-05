@@ -8,11 +8,12 @@ enum EngineError: Error, Equatable {
     case noTrunk(String)
     case landConflict(String)
     case nothingToLand(String)
+    case sharedHistory(String)
 
     var message: String {
         switch self {
         case .notAJJRepo(let m), .nameConflict(let m), .destExists(let m), .failed(let m),
-             .noTrunk(let m), .landConflict(let m), .nothingToLand(let m):
+             .noTrunk(let m), .landConflict(let m), .nothingToLand(let m), .sharedHistory(let m):
             return m
         }
     }
@@ -98,6 +99,7 @@ final class WorkspaceEngineCLI: WorkspaceEngineProviding {
         case "no-trunk": return .noTrunk(payload.message)
         case "land-conflict": return .landConflict(payload.message)
         case "nothing-to-land": return .nothingToLand(payload.message)
+        case "shared-history": return .sharedHistory(payload.message)
         default: return .failed(payload.message)
         }
     }
