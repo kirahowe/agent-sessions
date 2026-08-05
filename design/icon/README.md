@@ -20,9 +20,36 @@ colour this is built around. `#64D1DD` is the same hue (186° against 189°)
 lifted and desaturated so it can carry on a dark ground — a dark-on-dark mark
 measures about 2:1 and dissolves, so the dark appearance inverts instead.
 
-`#64D1DD` is also the app's UI tint: selected sidebar rows, focus rings, the
-shell prompt. It's the one value in the palette bright enough to read against
-the terminal's own near-black.
+## The app's palette
+
+`macapp/Agents/Theme.swift` wires these same values into the UI. This file is
+the source of truth; `Theme.swift` is just the Swift end of it.
+
+| Role                          | Value                 |
+| ----------------------------- | --------------------- |
+| Accent, light appearance      | `#00778C`             |
+| Accent, dark appearance       | `#0D8AA1`             |
+| Terminal cursor               | `#64D1DD`             |
+| Terminal cursor text          | `#06222A`             |
+| Terminal selection background | `#14515E`             |
+| Terminal selection foreground | `#EDF3F4`             |
+
+The accent is deliberately **not** `#64D1DD`, even though that is the brightest
+and most characterful value here. macOS fills a selected sidebar row with the
+accent colour and draws a white label on top; `#64D1DD` against white is about
+1.8:1, which is unreadable. `#00778C` gives 5.2:1 and `#0D8AA1` gives 4.1:1.
+
+`#64D1DD` is reserved for the terminal, where we control what sits on it — the
+cursor (with `#06222A` for the character underneath it) and nothing else. The
+terminal's `background` and `foreground` are deliberately left unset, because
+those belong to whatever shell theme is configured; only the cursor and
+selection are ours to brand.
+
+The accent is stored as an `AccentColor` colorset with a dark-appearance
+variant, and applied twice: `ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME`
+makes it the app's default, and an explicit `.tint()` in `AgentsApp` reapplies
+it — the asset-catalog route alone only takes effect when the user's system
+accent preference is "Multicolor".
 
 ## Geometry
 

@@ -89,6 +89,15 @@ struct AgentsApp: App {
         Window("Agents", id: "main") {
             RootView(store: store, center: center, uiState: uiState)
                 .environment(\.appActions, actions)
+                // Forced explicitly rather than left to the asset catalog
+                // alone: ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME (set
+                // in project.yml) only takes effect when the user's system
+                // accent colour preference is "Multicolor" — any other
+                // choice overrides it app-wide. This app's tint is part of
+                // its identity, not a preference we want the system to
+                // override, so `.tint` reapplies `Theme.accent` regardless
+                // of that setting.
+                .tint(Theme.accent)
         }
         .commands {
             // Deliberately does NOT route through AppActions/Keymap the way
