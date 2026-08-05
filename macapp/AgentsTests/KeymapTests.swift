@@ -35,6 +35,13 @@ final class KeymapTests: XCTestCase {
         XCTAssertEqual(Keymap.action(for: keyEvent(characters: "w", modifiers: [.command])), .closeSession)
     }
 
+    // Uppercase "R" because that is what a real ⇧⌘R keydown carries — the
+    // shift modifier uppercases charactersIgnoringModifiers. Matching
+    // lowercases both sides, so this also pins that behavior.
+    func test_shiftCommandR_mapsToRenameSession() {
+        XCTAssertEqual(Keymap.action(for: keyEvent(characters: "R", modifiers: [.command, .shift])), .renameSession)
+    }
+
     func test_shiftCommandW_mapsToCloseWindowNotCloseSession() {
         let action = Keymap.action(for: keyEvent(characters: "W", modifiers: [.command, .shift]))
         XCTAssertEqual(action, .closeWindow)

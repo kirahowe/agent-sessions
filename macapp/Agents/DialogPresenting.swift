@@ -5,15 +5,19 @@ import AppKit
 /// loop — mirrors the `SessionTerminating`/`WorkspaceEngineProviding` seams
 /// already used by `AppStore`. `LiveDialogPresenter` (below) is the
 /// production conformer, forwarding to the real `Dialogs` enum; tests
-/// inject a fake. Deliberately covers only the 4 operations `AppActions`
-/// actually calls — `Dialogs.promptRename` is called directly from
-/// SidebarView and has no seam here.
+/// inject a fake. Covers the 5 operations `AppActions` actually calls.
+/// `promptRename` has two callers: this seam, for the selection-targeted
+/// menu item/shortcut routed through `AppActions`, and a direct call from
+/// SidebarView's row-targeted "Rename…" context-menu item, which acts on a
+/// specific row rather than `store.selection` and so has no need of
+/// `AppActions` or this seam at all.
 @MainActor
 protocol DialogPresenting {
     func chooseProjectDirectory() -> String?
     func confirmRemove(_ project: Project) -> Bool
     func confirmDeleteWorkspace(_ ws: WorkspaceRow) -> Bool
     func promptLandMessage(workspace: WorkspaceRow) -> String?
+    func promptRename(currentName: String) -> String?
 }
 
 /// Production conformer: forwards straight through to `Dialogs`.
@@ -33,4 +37,5 @@ struct LiveDialogPresenter: DialogPresenting {
     func confirmRemove(_ project: Project) -> Bool { Dialogs.confirmRemove(project) }
     func confirmDeleteWorkspace(_ ws: WorkspaceRow) -> Bool { Dialogs.confirmDeleteWorkspace(ws) }
     func promptLandMessage(workspace: WorkspaceRow) -> String? { Dialogs.promptLandMessage(workspace: workspace) }
+    func promptRename(currentName: String) -> String? { Dialogs.promptRename(currentName: currentName) }
 }

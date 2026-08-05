@@ -29,6 +29,19 @@ final class AppActions {
             store.closeSession(selection)
             return true
 
+        case .renameSession:
+            guard let selection = store.selection,
+                  let row = store.sessions.first(where: { $0.id == selection })
+            else { return false }
+            // Cancel still counts as handled, same reasoning as
+            // .deleteWorkspace/.keepWorkspaceChanges above: once the row is
+            // resolved we opened the prompt, so the shortcut/menu item did
+            // its job regardless of the user's choice.
+            if let name = dialogs.promptRename(currentName: row.name) {
+                store.renameSession(selection, to: name)
+            }
+            return true
+
         case .closeWindow:
             guard let window = NSApp.keyWindow else { return false }
             window.performClose(nil)

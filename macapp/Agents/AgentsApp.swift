@@ -155,6 +155,12 @@ struct AgentsApp: App {
             }
 
             CommandMenu("Session") {
+                Button("Rename Session…") {
+                    actions.perform(.renameSession)
+                }
+                .keymapShortcut(.renameSession)
+                .disabled(store.selection == nil)
+
                 Button("Previous Session") {
                     actions.perform(.previousSession)
                 }

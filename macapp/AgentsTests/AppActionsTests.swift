@@ -308,4 +308,42 @@ final class AppActionsTests: XCTestCase {
         XCTAssertTrue(actions.perform(.showShortcutHelp))
         XCTAssertFalse(uiState.showShortcutHelp)
     }
+
+    // MARK: - 10: .renameSession
+
+    func test10a_renameSessionFalseWithNoSelection() {
+        let (store, _, _) = TestSupport.makeStore()
+        let dialogs = FakeDialogs()
+        let actions = AppActions(store: store, uiState: UIState(), dialogs: dialogs)
+
+        XCTAssertFalse(actions.perform(.renameSession))
+        XCTAssertTrue(dialogs.promptRenameCalls.isEmpty)
+    }
+
+    func test10b_renameSessionCancelReturnsTrueButNameUnchanged() {
+        let (store, _, _) = TestSupport.makeStore()
+        let dialogs = FakeDialogs()
+        dialogs.nextRenameName = nil
+        let actions = AppActions(store: store, uiState: UIState(), dialogs: dialogs)
+        store.addProject(path: "/tmp/proj-A")
+        let session = store.sessions.first!
+
+        XCTAssertTrue(actions.perform(.renameSession), "cancel still counts as handled")
+
+        XCTAssertEqual(dialogs.promptRenameCalls, [session.name])
+        XCTAssertEqual(store.sessions.first?.name, session.name)
+    }
+
+    func test10c_renameSessionConfirmRenamesSelectedSession() {
+        let (store, _, _) = TestSupport.makeStore()
+        let dialogs = FakeDialogs()
+        dialogs.nextRenameName = "renamed"
+        let actions = AppActions(store: store, uiState: UIState(), dialogs: dialogs)
+        store.addProject(path: "/tmp/proj-A")
+        let sessionID = store.selection!
+
+        XCTAssertTrue(actions.perform(.renameSession))
+
+        XCTAssertEqual(store.sessions.first { $0.id == sessionID }?.name, "renamed")
+    }
 }

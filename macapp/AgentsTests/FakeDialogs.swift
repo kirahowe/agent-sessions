@@ -12,11 +12,13 @@ final class FakeDialogs: DialogPresenting {
     var nextConfirmRemove: Bool = true
     var nextConfirmDeleteWorkspace: Bool = true
     var nextLandMessage: String? = nil
+    var nextRenameName: String? = nil
 
     private(set) var chooseProjectDirectoryCallCount: Int = 0
     private(set) var confirmRemoveCalls: [Project] = []
     private(set) var confirmDeleteWorkspaceCalls: [WorkspaceRow] = []
     private(set) var promptLandMessageCalls: [WorkspaceRow] = []
+    private(set) var promptRenameCalls: [String] = []
 
     func chooseProjectDirectory() -> String? {
         chooseProjectDirectoryCallCount += 1
@@ -36,5 +38,10 @@ final class FakeDialogs: DialogPresenting {
     func promptLandMessage(workspace: WorkspaceRow) -> String? {
         promptLandMessageCalls.append(workspace)
         return nextLandMessage
+    }
+
+    func promptRename(currentName: String) -> String? {
+        promptRenameCalls.append(currentName)
+        return nextRenameName
     }
 }

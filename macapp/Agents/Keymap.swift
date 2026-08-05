@@ -8,6 +8,7 @@ import SwiftUI
 enum AppAction: Hashable {
     case newSession
     case closeSession
+    case renameSession
     case closeWindow
     case addProject
     case removeProject
@@ -27,7 +28,7 @@ extension AppAction: CaseIterable {
     /// simple cases.
     static var allCases: [AppAction] {
         [
-            .newSession, .closeSession, .closeWindow, .addProject, .removeProject,
+            .newSession, .closeSession, .renameSession, .closeWindow, .addProject, .removeProject,
             .previousSession, .nextSession, .newWorkspace, .deleteWorkspace, .keepWorkspaceChanges, .showShortcutHelp,
         ]
             + (0..<9).map { AppAction.selectSession($0) }
@@ -44,6 +45,7 @@ extension AppAction {
         switch self {
         case .newSession: return "New Session"
         case .closeSession: return "Close Session"
+        case .renameSession: return "Rename Session…"
         case .closeWindow: return "Close Window"
         case .addProject: return "Add Project…"
         case .removeProject: return "Remove Project…"
@@ -61,7 +63,7 @@ extension AppAction {
     /// under. Sheet section order is fixed in `ShortcutHelpView`.
     var helpGroup: String {
         switch self {
-        case .newSession, .closeSession, .previousSession, .nextSession, .selectSession:
+        case .newSession, .closeSession, .renameSession, .previousSession, .nextSession, .selectSession:
             return "Sessions"
         case .newWorkspace, .deleteWorkspace, .keepWorkspaceChanges:
             return "Workspaces"
@@ -168,6 +170,10 @@ enum Keymap {
         var map: [AppAction: Shortcut] = [
             .newSession: Shortcut(key: .char("t"), modifiers: [.command]),
             .closeSession: Shortcut(key: .char("w"), modifiers: [.command]),
+            // ⇧⌘R, not plain ⌘R: ShortcutRouter intercepts every ⌘ event
+            // globally before the hosted ghostty terminal sees it, so
+            // binding plain ⌘R would permanently steal it from the terminal.
+            .renameSession: Shortcut(key: .char("r"), modifiers: [.command, .shift]),
             .closeWindow: Shortcut(key: .char("w"), modifiers: [.command, .shift]),
             .addProject: Shortcut(key: .char("n"), modifiers: [.command, .shift]),
             .previousSession: Shortcut(key: .upArrow, modifiers: [.command, .option]),
