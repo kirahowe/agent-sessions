@@ -15,6 +15,39 @@ final class TerminalCenter: SessionTerminating {
 
     private var entries: [String: Entry] = [:]
 
+    /// The terminal configuration applied to every session's controller,
+    /// via `TerminalController`'s `terminalConfiguration:` parameter.
+    ///
+    /// Extracted to a static so it can be asserted on directly in tests —
+    /// see `TerminalCenterTests`. Two things here are load-bearing and will
+    /// silently regress if dropped:
+    ///
+    /// - `term`: the package bundles no terminfo, so losing this breaks
+    ///   ncurses apps (vim, htop, ...) in every spawned shell.
+    /// - the four brand colours: dropping them costs the app its visual
+    ///   identity, with no error to point at why.
+    static let terminalConfiguration = TerminalConfiguration { builder in
+        // The package bundles no terminfo; without this the default
+        // TERM=xterm-ghostty breaks ncurses apps (vim, htop, ...) in the
+        // spawned shell.
+        builder.withCustom("term", "xterm-256color")
+
+        // Terminal-content breathing room. Done via ghostty config
+        // rather than AppKit view nesting/insets around TerminalView,
+        // since ghostty already renders its own content padding.
+        builder.withCustom("window-padding-x", "10")
+        builder.withCustom("window-padding-y", "10")
+
+        // Brand the cursor and selection only. `background`/`foreground`
+        // are deliberately left unset here — those belong to whatever
+        // shell theme the user has configured, and only the cursor and
+        // selection are ours to brand.
+        builder.withCursorColor(Theme.Terminal.cursorColor)
+        builder.withCursorText(Theme.Terminal.cursorText)
+        builder.withSelectionBackground(Theme.Terminal.selectionBackground)
+        builder.withSelectionForeground(Theme.Terminal.selectionForeground)
+    }
+
     /// Invoked with the session id after the underlying shell process exits
     /// and the terminal has already been torn down.
     var onProcessExit: ((String) -> Void)?
@@ -44,18 +77,11 @@ final class TerminalCenter: SessionTerminating {
             backend: .exec,
             workingDirectory: workingDirectory
         )
-        let controller = TerminalController { builder in
-            // The package bundles no terminfo; without this the default
-            // TERM=xterm-ghostty breaks ncurses apps (vim, htop, ...) in the
-            // spawned shell.
-            builder.withCustom("term", "xterm-256color")
-
-            // Terminal-content breathing room. Done via ghostty config
-            // rather than AppKit view nesting/insets around TerminalView,
-            // since ghostty already renders its own content padding.
-            builder.withCustom("window-padding-x", "10")
-            builder.withCustom("window-padding-y", "10")
-        }
+        // configSource/theme are left at their defaults (`.none`/`.default`)
+        // deliberately — see the doc comment on `terminalConfiguration`
+        // above for why that, plus this parameter, exactly reproduces what
+        // the closure-taking convenience initializer used to do.
+        let controller = TerminalController(terminalConfiguration: Self.terminalConfiguration)
         view.controller = controller
 
         entries[sessionID] = Entry(view: view, controller: controller, delegateProxy: proxy)
