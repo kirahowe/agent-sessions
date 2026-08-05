@@ -1129,4 +1129,59 @@ final class AppStoreTests: XCTestCase {
         XCTAssertEqual(store.selection, selectionBefore)
         XCTAssertEqual(store.lastError, "workspace has no changes to land")
     }
+
+    // MARK: - 38
+
+    func test38_newSessionWithCustomNameProducesRowWithThatName() {
+        let (store, _, _) = TestSupport.makeStore()
+        let path = "/tmp/proj-A"
+        store.addProject(path: path)
+        let project = store.projects.first!
+
+        store.newSession(in: project, name: "custom")
+
+        XCTAssertEqual(store.sessions.first { $0.id == store.selection }?.name, "custom")
+    }
+
+    // MARK: - 39
+
+    func test39_newSessionWithBlankNameFallsBackToNumberedDefault() {
+        let (store, _, _) = TestSupport.makeStore()
+        let path = "/tmp/proj-A"
+        store.addProject(path: path)
+        let project = store.projects.first!
+
+        store.newSession(in: project, name: "   ")
+
+        XCTAssertEqual(store.sessions.first { $0.id == store.selection }?.name, "Session 2")
+    }
+
+    // MARK: - 40
+
+    func test40_customNamedSessionDoesNotConsumeCounterNumber() {
+        let (store, _, _) = TestSupport.makeStore()
+        let pathA = "/tmp/proj-A"
+        store.addProject(path: pathA) // root target: "Session 1" — a separate target/counter from the one below
+        // A fresh workspace target with its own, untouched counter.
+        let target = TargetRef.workspace(projectPath: pathA, name: "ws-a")
+
+        store.newSession(in: target, name: "custom")
+        store.newSession(in: target)
+
+        let names = store.sessions.filter { $0.target == target }.map(\.name)
+        XCTAssertEqual(Set(names), Set(["custom", "Session 1"]), "the custom name must not have consumed counter value 1")
+    }
+
+    // MARK: - 41
+
+    func test41_addProjectStillAutoCreatesDefaultNamedFirstSession() {
+        let (store, _, _) = TestSupport.makeStore()
+        let path = "/tmp/proj-A"
+
+        store.addProject(path: path)
+
+        let sessions = store.sessions.filter { $0.projectPath == path }
+        XCTAssertEqual(sessions.count, 1)
+        XCTAssertEqual(sessions.first?.name, "Session 1")
+    }
 }

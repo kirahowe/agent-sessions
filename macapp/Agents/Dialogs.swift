@@ -65,6 +65,30 @@ enum Dialogs {
         return alert.runModal() == .alertFirstButtonReturn
     }
 
+    /// Prompts for a new session's name. Returns nil iff the user
+    /// cancelled — in that case no session should be created at all.
+    /// Otherwise returns the (untrimmed) field value as-is, including when
+    /// it's blank: unlike `promptLandMessage` below, blank input here is
+    /// NOT collapsed to nil, because blank is a meaningful "use the next
+    /// numbered name" answer, distinct from cancelling. It's on the caller
+    /// (`AppStore.newSession`) to trim and decide what blank means.
+    static func promptNewSessionName() -> String? {
+        let alert = NSAlert()
+        alert.messageText = "New Session"
+        alert.informativeText =
+            "Leave blank to use the next numbered name (e.g. \u{201C}Session 1\u{201D})."
+        alert.addButton(withTitle: "Create")
+        alert.addButton(withTitle: "Cancel")
+
+        let textField = NSTextField(frame: NSRect(x: 0, y: 0, width: 240, height: 24))
+        textField.placeholderString = "Session name"
+        alert.accessoryView = textField
+        alert.window.initialFirstResponder = textField
+
+        guard alert.runModal() == .alertFirstButtonReturn else { return nil }
+        return textField.stringValue
+    }
+
     /// Prompts for the landing commit message when keeping (landing) a
     /// workspace's changes. Returns the trimmed message iff the user
     /// confirmed with non-blank input; nil on Cancel OR on blank input (a

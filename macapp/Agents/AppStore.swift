@@ -228,7 +228,10 @@ final class AppStore: ObservableObject {
 
     /// Primary API: create a session on an explicit target, or (nil) resolve
     /// one — selection's target, else the first ordered target, else no-op.
-    func newSession(in target: TargetRef?) {
+    /// `name`, when non-blank after trimming, is used as-is for the new
+    /// row's name. A nil/blank `name` (the default) falls back to today's
+    /// numbered "Session N" naming from `sessionCounters`.
+    func newSession(in target: TargetRef?, name: String? = nil) {
         let resolvedTarget: TargetRef?
         if let target {
             resolvedTarget = target
@@ -241,10 +244,22 @@ final class AppStore: ObservableObject {
         }
         guard let resolvedTarget else { return }
 
-        let number = sessionCounters[resolvedTarget.id, default: 1]
-        sessionCounters[resolvedTarget.id] = number + 1
+        let trimmedName = name?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let rowName: String
+        if let trimmedName, !trimmedName.isEmpty {
+            // A custom name deliberately does NOT consume a counter number:
+            // the counter exists only to keep the *numbered* names
+            // sequential, and seedSessionCounters() below only ever parses
+            // "Session N" names anyway — a custom name was never going to
+            // contribute to it.
+            rowName = trimmedName
+        } else {
+            let number = sessionCounters[resolvedTarget.id, default: 1]
+            sessionCounters[resolvedTarget.id] = number + 1
+            rowName = "Session \(number)"
+        }
 
-        let row = SessionRow(id: UUID().uuidString, target: resolvedTarget, name: "Session \(number)")
+        let row = SessionRow(id: UUID().uuidString, target: resolvedTarget, name: rowName)
         sessions.append(row)
         selection = row.id
         save()
@@ -256,8 +271,8 @@ final class AppStore: ObservableObject {
     /// (not Project?) — an optional-Project overload here would make the
     /// existing bare `store.newSession(in: nil)` call sites in AppActions.swift
     /// ambiguous against the TargetRef? overload above.
-    func newSession(in project: Project) {
-        newSession(in: .root(projectPath: project.path))
+    func newSession(in project: Project, name: String? = nil) {
+        newSession(in: .root(projectPath: project.path), name: name)
     }
 
     /// Used by the sidebar's workspace-row tap: selects that workspace's

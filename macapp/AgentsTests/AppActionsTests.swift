@@ -43,6 +43,43 @@ final class AppActionsTests: XCTestCase {
         XCTAssertEqual(store.sessions.count, countBefore + 1)
     }
 
+    func test01c_newSessionCancelReturnsTrueButCreatesNoSession() {
+        let (store, _, _) = TestSupport.makeStore()
+        let dialogs = FakeDialogs()
+        dialogs.nextNewSessionName = nil
+        let actions = AppActions(store: store, uiState: UIState(), dialogs: dialogs)
+        store.addProject(path: "/tmp/proj-A")
+        let countBefore = store.sessions.count
+
+        XCTAssertTrue(actions.perform(.newSession), "cancel still counts as handled")
+
+        XCTAssertEqual(store.sessions.count, countBefore)
+    }
+
+    func test01d_newSessionConfirmWithCustomNameNamesAndSelectsTheSession() {
+        let (store, _, _) = TestSupport.makeStore()
+        let dialogs = FakeDialogs()
+        dialogs.nextNewSessionName = "custom"
+        let actions = AppActions(store: store, uiState: UIState(), dialogs: dialogs)
+        store.addProject(path: "/tmp/proj-A")
+
+        XCTAssertTrue(actions.perform(.newSession))
+
+        XCTAssertEqual(store.sessions.first { $0.id == store.selection }?.name, "custom")
+    }
+
+    func test01e_newSessionConfirmWithBlankNameUsesNumberedDefault() {
+        let (store, _, _) = TestSupport.makeStore()
+        let dialogs = FakeDialogs()
+        dialogs.nextNewSessionName = ""
+        let actions = AppActions(store: store, uiState: UIState(), dialogs: dialogs)
+        store.addProject(path: "/tmp/proj-A") // "Session 1"
+
+        XCTAssertTrue(actions.perform(.newSession))
+
+        XCTAssertEqual(store.sessions.first { $0.id == store.selection }?.name, "Session 2")
+    }
+
     // MARK: - 2: .closeSession
 
     func test02a_closeSessionFalseWithNoSelection() {

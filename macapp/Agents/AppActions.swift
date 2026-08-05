@@ -21,7 +21,13 @@ final class AppActions {
         switch action {
         case .newSession:
             guard !store.projects.isEmpty else { return false }
-            store.newSession(in: nil)
+            // Cancel still counts as handled, same reasoning as
+            // .renameSession/.addProject above: once the dialog is opened
+            // the shortcut/menu item did its job regardless of the user's
+            // choice.
+            if let name = dialogs.promptNewSessionName() {
+                store.newSession(in: nil, name: name)
+            }
             return true
 
         case .closeSession:

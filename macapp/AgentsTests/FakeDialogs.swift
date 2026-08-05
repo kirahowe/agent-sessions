@@ -13,12 +13,18 @@ final class FakeDialogs: DialogPresenting {
     var nextConfirmDeleteWorkspace: Bool = true
     var nextLandMessage: String? = nil
     var nextRenameName: String? = nil
+    /// Defaults to "" (NOT nil) — meaning "user confirmed without typing a
+    /// custom name" — because that's the outcome existing `.newSession`
+    /// tests already assume when they don't touch this fake. A nil default
+    /// would silently turn every one of those into a cancel and break them.
+    var nextNewSessionName: String? = ""
 
     private(set) var chooseProjectDirectoryCallCount: Int = 0
     private(set) var confirmRemoveCalls: [Project] = []
     private(set) var confirmDeleteWorkspaceCalls: [WorkspaceRow] = []
     private(set) var promptLandMessageCalls: [WorkspaceRow] = []
     private(set) var promptRenameCalls: [String] = []
+    private(set) var promptNewSessionNameCallCount: Int = 0
 
     func chooseProjectDirectory() -> String? {
         chooseProjectDirectoryCallCount += 1
@@ -43,5 +49,10 @@ final class FakeDialogs: DialogPresenting {
     func promptRename(currentName: String) -> String? {
         promptRenameCalls.append(currentName)
         return nextRenameName
+    }
+
+    func promptNewSessionName() -> String? {
+        promptNewSessionNameCallCount += 1
+        return nextNewSessionName
     }
 }

@@ -36,11 +36,13 @@ struct SidebarView: View {
                         .menuIndicator(.hidden)
                         .fixedSize()
                         .accessibilityLabel("More Actions")
-                        // Direct store call, not actions.perform: this targets the
-                        // specific project this header belongs to, not the app's
+                        // Direct store/Dialogs call, not actions.perform: this targets
+                        // the specific project this header belongs to, not the app's
                         // global selection (see comment on the row context menu below).
                         Button {
-                            store.newSession(in: project)
+                            if let name = Dialogs.promptNewSessionName() {
+                                store.newSession(in: project, name: name)
+                            }
                         } label: {
                             Image(systemName: "plus")
                         }
@@ -233,11 +235,13 @@ private struct WorkspaceRowView: View {
                 Task { await store.landWorkspace(workspace.id, message: message) }
             }
         }
-        // Direct store call, not actions.perform: this targets the
+        // Direct store/Dialogs call, not actions.perform: this targets the
         // specific right-clicked workspace, row-targeted the same way
         // the session row's context menu above is.
         Button("New Session") {
-            store.newSession(in: .workspace(projectPath: workspace.projectPath, name: workspace.name))
+            if let name = Dialogs.promptNewSessionName() {
+                store.newSession(in: .workspace(projectPath: workspace.projectPath, name: workspace.name), name: name)
+            }
         }
         Button("Rename…") {
             if let name = Dialogs.promptRename(currentName: workspace.displayName, title: "Rename Workspace") {
