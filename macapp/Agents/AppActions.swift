@@ -21,13 +21,7 @@ final class AppActions {
         switch action {
         case .newSession:
             guard !store.projects.isEmpty else { return false }
-            // Cancel still counts as handled, same reasoning as
-            // .renameSession/.addProject above: once the dialog is opened
-            // the shortcut/menu item did its job regardless of the user's
-            // choice.
-            if let name = dialogs.promptNewSessionName() {
-                store.newSession(in: nil, name: name)
-            }
+            store.newSession(in: nil)
             return true
 
         case .closeSession:
@@ -87,7 +81,7 @@ final class AppActions {
 
         case .newWorkspace:
             guard let project = resolveProject() else { return false }
-            // Cancel still counts as handled, same reasoning as .newSession
+            // Cancel still counts as handled, same reasoning as .addProject
             // above: once the dialog is opened the shortcut/menu item did
             // its job regardless of the user's choice.
             if let label = dialogs.promptNewWorkspaceLabel() {

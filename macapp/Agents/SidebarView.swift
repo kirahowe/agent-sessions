@@ -36,13 +36,11 @@ struct SidebarView: View {
                         .menuIndicator(.hidden)
                         .fixedSize()
                         .accessibilityLabel("More Actions")
-                        // Direct store/Dialogs call, not actions.perform: this targets
+                        // Direct store call, not actions.perform: this targets
                         // the specific project this header belongs to, not the app's
                         // global selection (see comment on the row context menu below).
                         Button {
-                            if let name = Dialogs.promptNewSessionName() {
-                                store.newSession(in: project, name: name)
-                            }
+                            store.newSession(in: project)
                         } label: {
                             Image(systemName: "plus")
                         }
@@ -249,13 +247,11 @@ private struct WorkspaceRowView: View {
                 Task { await store.landWorkspace(workspace.id, message: message) }
             }
         }
-        // Direct store/Dialogs call, not actions.perform: this targets the
+        // Direct store call, not actions.perform: this targets the
         // specific right-clicked workspace, row-targeted the same way
         // the session row's context menu above is.
         Button("New Session") {
-            if let name = Dialogs.promptNewSessionName() {
-                store.newSession(in: .workspace(projectPath: workspace.projectPath, name: workspace.name), name: name)
-            }
+            store.newSession(in: .workspace(projectPath: workspace.projectPath, name: workspace.name))
         }
         // Passes workspace.label (not displayName): an unlabelled workspace
         // should open this dialog with an empty field, not pre-filled with

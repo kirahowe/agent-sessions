@@ -32,52 +32,32 @@ final class AppActionsTests: XCTestCase {
         XCTAssertFalse(actions.perform(.newSession))
     }
 
-    func test01b_newSessionTrueAndCreatesSessionWithOneProject() {
+    func test01b_newSessionTrueAndCreatesAutoNamedSessionAndSelectsIt() {
         let (store, _, _) = TestSupport.makeStore()
         let actions = AppActions(store: store, uiState: UIState(), dialogs: FakeDialogs())
-        store.addProject(path: "/tmp/proj-A")
+        store.addProject(path: "/tmp/proj-A") // "Session 1"
         let countBefore = store.sessions.count
 
         XCTAssertTrue(actions.perform(.newSession))
 
         XCTAssertEqual(store.sessions.count, countBefore + 1)
+        XCTAssertEqual(store.sessions.first { $0.id == store.selection }?.name, "Session 2")
     }
 
-    func test01c_newSessionCancelReturnsTrueButCreatesNoSession() {
+    // No dialog involved any more — .newSession always calls
+    // store.newSession(in: nil) directly, so repeated performs should
+    // exercise AppStore's own numbering exactly like repeated direct calls
+    // would, with nothing in AppActions' routing able to disturb it.
+    func test01c_newSessionTwiceAutoNumbersSequentially() {
         let (store, _, _) = TestSupport.makeStore()
-        let dialogs = FakeDialogs()
-        dialogs.nextNewSessionName = nil
-        let actions = AppActions(store: store, uiState: UIState(), dialogs: dialogs)
-        store.addProject(path: "/tmp/proj-A")
-        let countBefore = store.sessions.count
-
-        XCTAssertTrue(actions.perform(.newSession), "cancel still counts as handled")
-
-        XCTAssertEqual(store.sessions.count, countBefore)
-    }
-
-    func test01d_newSessionConfirmWithCustomNameNamesAndSelectsTheSession() {
-        let (store, _, _) = TestSupport.makeStore()
-        let dialogs = FakeDialogs()
-        dialogs.nextNewSessionName = "custom"
-        let actions = AppActions(store: store, uiState: UIState(), dialogs: dialogs)
-        store.addProject(path: "/tmp/proj-A")
-
-        XCTAssertTrue(actions.perform(.newSession))
-
-        XCTAssertEqual(store.sessions.first { $0.id == store.selection }?.name, "custom")
-    }
-
-    func test01e_newSessionConfirmWithBlankNameUsesNumberedDefault() {
-        let (store, _, _) = TestSupport.makeStore()
-        let dialogs = FakeDialogs()
-        dialogs.nextNewSessionName = ""
-        let actions = AppActions(store: store, uiState: UIState(), dialogs: dialogs)
+        let actions = AppActions(store: store, uiState: UIState(), dialogs: FakeDialogs())
         store.addProject(path: "/tmp/proj-A") // "Session 1"
 
         XCTAssertTrue(actions.perform(.newSession))
-
         XCTAssertEqual(store.sessions.first { $0.id == store.selection }?.name, "Session 2")
+
+        XCTAssertTrue(actions.perform(.newSession))
+        XCTAssertEqual(store.sessions.first { $0.id == store.selection }?.name, "Session 3")
     }
 
     // MARK: - 2: .closeSession
