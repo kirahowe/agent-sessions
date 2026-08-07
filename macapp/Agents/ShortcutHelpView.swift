@@ -98,7 +98,7 @@ struct ShortcutHelpView: View {
                 }
                 .keyboardShortcut(.cancelAction)
             }
-            .padding([.horizontal, .bottom], 16)
+            .padding(16)
         }
         .frame(minWidth: 440, minHeight: 380)
     }
