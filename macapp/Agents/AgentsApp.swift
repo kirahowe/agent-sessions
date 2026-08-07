@@ -30,6 +30,7 @@ struct AgentsApp: App {
     let updaterEnabled: Bool
     let updaterController: SPUStandardUpdaterController
     @StateObject private var store: AppStore
+    @AppStorage(AppearanceMode.defaultsKey) private var appearanceMode: AppearanceMode = .system
 
     init() {
         let center = TerminalCenter()
@@ -187,6 +188,27 @@ struct AgentsApp: App {
                 }
                 .keymapShortcut(.showShortcutHelp)
             }
+        }
+        // The single place the appearance preference is actually applied.
+        // `initial: true` covers launch; the same observer fires again when
+        // the Settings window's picker rewrites the shared @AppStorage key,
+        // since both read/write the same UserDefaults entry — so there's no
+        // second application site for the two to drift apart from each
+        // other. (Scene.onChange(of:initial:) exists on macOS 14+; this
+        // app's deployment target is 15.)
+        .onChange(of: appearanceMode, initial: true) { _, mode in
+            mode.apply()
+        }
+
+        // A `Settings` scene is what makes macOS add "Settings…" (⌘,) to the
+        // app menu automatically — no CommandGroup wiring needed, unlike
+        // every menu item above.
+        Settings {
+            SettingsView()
+                // Reapplied here because the `.tint` on the main Window's
+                // content (above) doesn't reach a separate scene — the same
+                // system-accent-override reasoning applies as there.
+                .tint(Theme.accent)
         }
     }
 }
