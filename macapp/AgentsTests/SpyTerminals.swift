@@ -11,6 +11,10 @@ final class SpyTerminals: SessionTerminating {
     /// simulate a terminal reporting a status change, the same way
     /// `onProcessExit` simulates process exit.
     var onSessionActivity: ((String, SessionActivity?) -> Void)?
+    /// Tests fire this directly (`spy.onTitleChange?(id, "building...")`) to
+    /// simulate a terminal reporting an OSC title change, the same way
+    /// `onSessionActivity` simulates a status change.
+    var onTitleChange: ((String, String) -> Void)?
     private(set) var closedIDs: [String] = []
 
     func closeSession(_ id: String) {

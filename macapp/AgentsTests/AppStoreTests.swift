@@ -1331,4 +1331,89 @@ final class AppStoreTests: XCTestCase {
 
         XCTAssertEqual(store.sessionActivity[session.id], .blocked)
     }
+
+    // MARK: - 52
+
+    func test52_onTitleChangeCallbackWiredInInitReachesStore() {
+        let (store, spy, _) = TestSupport.makeStore()
+        store.addProject(path: "/tmp/proj-A")
+        let session = store.sessions.first!
+
+        spy.onTitleChange?(session.id, "building the widget")
+
+        XCTAssertEqual(store.sessionTitles[session.id], "building the widget")
+    }
+
+    // MARK: - 53
+
+    func test53_setSessionTitleUnknownIDIsIgnored() {
+        let (store, _, _) = TestSupport.makeStore()
+        store.addProject(path: "/tmp/proj-A")
+
+        store.setSessionTitle("building the widget", for: "not-a-real-id")
+
+        XCTAssertTrue(store.sessionTitles.isEmpty)
+    }
+
+    // MARK: - 54
+
+    func test54_setSessionTitleWhitespaceOnlyClearsEntryAndTitlesAreStoredTrimmed() {
+        let (store, _, _) = TestSupport.makeStore()
+        store.addProject(path: "/tmp/proj-A")
+        let session = store.sessions.first!
+        store.setSessionTitle("  building the widget  \n", for: session.id)
+        XCTAssertEqual(store.sessionTitles[session.id], "building the widget")
+
+        store.setSessionTitle("   \n", for: session.id)
+
+        XCTAssertNil(store.sessionTitles[session.id])
+    }
+
+    // MARK: - 55
+
+    func test55_closingSessionDropsItsTitleEntry() {
+        let (store, _, _) = TestSupport.makeStore()
+        store.addProject(path: "/tmp/proj-A")
+        let session = store.sessions.first!
+        store.setSessionTitle("building the widget", for: session.id)
+
+        store.closeSession(session.id)
+
+        XCTAssertNil(store.sessionTitles[session.id])
+    }
+
+    // MARK: - 56
+
+    func test56_removeProjectDropsTitlesForAllItsSessions() {
+        let (store, _, _) = TestSupport.makeStore()
+        let path = "/tmp/proj-A"
+        store.addProject(path: path)
+        store.newSession(in: store.projects.first!)
+        let sessions = store.sessions.filter { $0.projectPath == path }
+        for session in sessions {
+            store.setSessionTitle("working", for: session.id)
+        }
+        XCTAssertEqual(store.sessionTitles.count, sessions.count)
+
+        store.removeProject(store.projects.first!)
+
+        XCTAssertTrue(store.sessionTitles.isEmpty)
+    }
+
+    // MARK: - 57
+
+    func test57_titleDoesNotSurviveSaveReloadRoundTrip() {
+        let url = TestSupport.freshStateURL()
+        let spy1 = SpyTerminals()
+        let store1 = AppStore(terminals: spy1, stateURL: url)
+        store1.addProject(path: "/tmp/proj-A")
+        let session = store1.sessions.first!
+        store1.setSessionTitle("building the widget", for: session.id)
+        XCTAssertFalse(store1.sessionTitles.isEmpty)
+
+        let spy2 = SpyTerminals()
+        let store2 = AppStore(terminals: spy2, stateURL: url)
+
+        XCTAssertTrue(store2.sessionTitles.isEmpty, "title must never be persisted")
+    }
 }

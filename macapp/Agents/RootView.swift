@@ -15,6 +15,15 @@ struct RootView: View {
         return "Agents"
     }
 
+    /// The selected session's latest OSC window title, or "" when there is
+    /// no selection or that session hasn't reported one yet — an empty
+    /// string renders no subtitle at all, rather than a stale/placeholder
+    /// one.
+    private var windowSubtitle: String {
+        guard let selectedID = store.selection else { return "" }
+        return store.sessionTitles[selectedID] ?? ""
+    }
+
     var body: some View {
         NavigationSplitView {
             SidebarView(store: store)
@@ -43,6 +52,7 @@ struct RootView: View {
             }
         }
         .navigationTitle(windowTitle)
+        .navigationSubtitle(windowSubtitle)
         .task {
             // Runs once at launch: a non-blocking, informational check for
             // bb/jj. Terminals work fine without either — only workspace

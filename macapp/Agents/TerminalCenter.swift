@@ -58,6 +58,11 @@ final class TerminalCenter: SessionTerminating {
     /// activity means "clear."
     var onSessionActivity: ((String, SessionActivity?) -> Void)?
 
+    /// Invoked with the session id and new title whenever a session's
+    /// terminal reports an OSC window-title change via
+    /// `SessionDelegateProxy.terminalDidChangeTitle`.
+    var onTitleChange: ((String, String) -> Void)?
+
     /// Lazily creates (on first call) or returns the cached `TerminalView`
     /// for a session, spawning the user's login shell rooted at
     /// `workingDirectory`.
@@ -111,6 +116,12 @@ final class TerminalCenter: SessionTerminating {
     func handleSessionActivity(sessionID: String, activity: SessionActivity?) {
         onSessionActivity?(sessionID, activity)
     }
+
+    /// Called by a session's delegate proxy when the shell reports a new OSC
+    /// window title. Just forwards — same reasoning as `handleSessionActivity`.
+    func handleTitleChange(sessionID: String, title: String) {
+        onTitleChange?(sessionID, title)
+    }
 }
 
 /// Small per-session delegate that closes over a session id and forwards to
@@ -129,8 +140,10 @@ final class SessionDelegateProxy: TerminalSurfaceTitleDelegate, TerminalSurfaceC
     }
 
     func terminalDidChangeTitle(_ title: String) {
-        // No-op for day 0 — window title is driven by session/project name,
-        // not the shell's OSC title.
+        // The window TITLE is still driven by session/project name, not the
+        // shell's OSC title — see RootView's windowTitle. The OSC title
+        // instead drives the window SUBTITLE, via AppStore.sessionTitles.
+        center?.handleTitleChange(sessionID: sessionID, title: title)
     }
 
     func terminalDidClose(processAlive: Bool) {

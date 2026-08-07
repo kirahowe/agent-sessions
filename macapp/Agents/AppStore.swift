@@ -21,6 +21,13 @@ final class AppStore: ObservableObject {
     /// which has no meaningful value to restore after a relaunch — see
     /// `SessionActivity`'s doc comment.
     @Published private(set) var sessionActivity: [String: SessionActivity] = [:]
+    /// Each live session's latest OSC window-title string, as reported by
+    /// the shell (or an agent running in it, e.g. Claude Code) via the
+    /// terminal's title-change delegate. Deliberately NOT part of
+    /// `PersistedState`/`save()`/`load()`: a live shell re-reports its title
+    /// on its own, and a title carried over from a previous run would just
+    /// be stale/wrong after relaunch.
+    @Published private(set) var sessionTitles: [String: String] = [:]
 
     let terminals: any SessionTerminating
     private let engine: any WorkspaceEngineProviding
@@ -86,6 +93,9 @@ final class AppStore: ObservableObject {
         terminals.onSessionActivity = { [weak self] id, activity in
             self?.setSessionActivity(activity, for: id)
         }
+        terminals.onTitleChange = { [weak self] id, title in
+            self?.setSessionTitle(title, for: id)
+        }
         load()
         seedSessionCounters()
     }
@@ -111,7 +121,7 @@ final class AppStore: ObservableObject {
             terminals.closeSession(id)
         }
         sessions.removeAll { $0.projectPath == project.path }
-        pruneSessionActivity()
+        pruneLiveSessionState()
         projects.removeAll { $0.path == project.path }
         // Local bookkeeping only: removing a project from the app must never
         // destroy the user's on-disk jj workspaces, so we drop our local
@@ -155,7 +165,7 @@ final class AppStore: ObservableObject {
             terminals.closeSession(sessionID)
         }
         sessions.removeAll { $0.target == target }
-        pruneSessionActivity()
+        pruneLiveSessionState()
         if let selection, removedIDs.contains(selection) {
             self.selection = nil
         }
@@ -217,7 +227,7 @@ final class AppStore: ObservableObject {
             terminals.closeSession(sessionID)
         }
         sessions.removeAll { $0.target == target }
-        pruneSessionActivity()
+        pruneLiveSessionState()
         workspaces.removeAll { $0.id == id }
         if let selection, removedIDs.contains(selection) {
             self.selection = nil
@@ -314,7 +324,7 @@ final class AppStore: ObservableObject {
 
         terminals.closeSession(id)
         sessions.remove(at: index)
-        pruneSessionActivity()
+        pruneLiveSessionState()
 
         if wasSelected {
             let siblings = sessions.enumerated().filter { $0.element.target == row.target }
@@ -343,15 +353,32 @@ final class AppStore: ObservableObject {
         }
     }
 
-    /// Drops any `sessionActivity` entry whose session no longer exists.
-    /// Called from every site that removes rows from `sessions`
-    /// (`closeSession`, `removeProject`, `deleteWorkspace`,
-    /// `landWorkspace`) so an indicator can never outlive the session it
-    /// describes. One shared helper instead of duplicating this removal
-    /// logic at each call site.
-    private func pruneSessionActivity() {
+    /// Sets (or, when `title` trims to empty, clears) a session's
+    /// window-title string. Ignores ids with no matching row in `sessions` —
+    /// a title update racing that session's own teardown is a normal,
+    /// harmless race, not an error to surface. Deliberately never calls
+    /// `save()`: this state is not persisted (see `sessionTitles`'s doc
+    /// comment).
+    func setSessionTitle(_ title: String, for sessionID: String) {
+        guard sessions.contains(where: { $0.id == sessionID }) else { return }
+        let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty {
+            sessionTitles.removeValue(forKey: sessionID)
+        } else {
+            sessionTitles[sessionID] = trimmed
+        }
+    }
+
+    /// Drops any per-live-session state (`sessionActivity`, `sessionTitles`)
+    /// whose session no longer exists. Called from every site that removes
+    /// rows from `sessions` (`closeSession`, `removeProject`,
+    /// `deleteWorkspace`, `landWorkspace`) so neither can ever outlive the
+    /// session it describes. One shared helper instead of duplicating this
+    /// removal logic at each call site.
+    private func pruneLiveSessionState() {
         let liveIDs = Set(sessions.map(\.id))
         sessionActivity = sessionActivity.filter { liveIDs.contains($0.key) }
+        sessionTitles = sessionTitles.filter { liveIDs.contains($0.key) }
     }
 
     func renameSession(_ id: String, to name: String) {
