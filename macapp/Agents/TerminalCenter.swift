@@ -72,7 +72,10 @@ final class TerminalCenter: SessionTerminating {
         }
 
         let proxy = SessionDelegateProxy(sessionID: sessionID, center: self)
-        let view = TerminalView(frame: .zero)
+        // DropTerminalView adds Finder drag-and-drop (the package itself has
+        // none) — see its doc comment for why. The stored type stays
+        // `TerminalView`; every caller only needs the base API.
+        let view = DropTerminalView(frame: .zero)
 
         // Setup order mirrors the package's own AppKit example: delegate,
         // then configuration, then controller, before the caller adds the
