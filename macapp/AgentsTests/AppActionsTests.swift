@@ -1,3 +1,4 @@
+import AppKit
 import XCTest
 @testable import Agents
 
@@ -14,6 +15,49 @@ private func waitUntil(_ condition: () -> Bool, iterations: Int = 50) async {
     }
 }
 
+/// Builds AppActions with a synchronous `present` so tests can assert
+/// dialog interactions immediately after `perform` returns. The production
+/// default defers presentation by a runloop turn (see AppActions.present);
+/// test coverage for that deferral is test11 below.
+///
+/// Deviation from spec: `UIState()`/`FakeDialogs()` can't sit directly in
+/// default-parameter position here — a default-value expression is
+/// evaluated in a nonisolated context even when the function itself is
+/// `@MainActor`, and both inits are main-actor-isolated. Defaulting to
+/// `nil` and constructing inside the isolated body sidesteps that while
+/// keeping every call site identical (`makeActions(store:)`,
+/// `makeActions(store:dialogs:)`, `makeActions(store:uiState:)`).
+///
+/// `currentEvent` defaults to `{ nil }` — no originating event — so every
+/// existing test dispatches on every `perform`, unaffected by the keystroke
+/// dedup that section 12 exercises.
+@MainActor
+private func makeActions(
+    store: AppStore,
+    uiState: UIState? = nil,
+    dialogs: FakeDialogs? = nil,
+    currentEvent: @escaping () -> NSEvent? = { nil }
+) -> AppActions {
+    AppActions(
+        store: store,
+        uiState: uiState ?? UIState(),
+        dialogs: dialogs ?? FakeDialogs(),
+        present: { $0() },
+        currentEvent: currentEvent
+    )
+}
+
+/// A ⇧⌘R keydown with a caller-chosen timestamp. `AppActions` keys its
+/// dedup on `(action, event.timestamp)`, so the timestamp is the only field
+/// these tests actually vary; the rest just make a well-formed event.
+private func keyDownEvent(timestamp: TimeInterval) -> NSEvent {
+    NSEvent.keyEvent(
+        with: .keyDown, location: .zero, modifierFlags: [.command, .shift],
+        timestamp: timestamp, windowNumber: 0, context: nil,
+        characters: "r", charactersIgnoringModifiers: "r", isARepeat: false, keyCode: 15
+    )!
+}
+
 /// Each numbered section exercises one `AppAction` case of
 /// `AppActions.perform(_:)`. All store state is built through `AppStore`'s
 /// real public API (never by poking `store.projects`/`store.sessions`
@@ -27,14 +71,14 @@ final class AppActionsTests: XCTestCase {
 
     func test01a_newSessionFalseWithZeroProjects() {
         let (store, _, _) = TestSupport.makeStore()
-        let actions = AppActions(store: store, uiState: UIState(), dialogs: FakeDialogs())
+        let actions = makeActions(store: store)
 
         XCTAssertFalse(actions.perform(.newSession))
     }
 
     func test01b_newSessionTrueAndCreatesAutoNamedSessionAndSelectsIt() {
         let (store, _, _) = TestSupport.makeStore()
-        let actions = AppActions(store: store, uiState: UIState(), dialogs: FakeDialogs())
+        let actions = makeActions(store: store)
         store.addProject(path: "/tmp/proj-A") // "Session 1"
         let countBefore = store.sessions.count
 
@@ -50,7 +94,7 @@ final class AppActionsTests: XCTestCase {
     // would, with nothing in AppActions' routing able to disturb it.
     func test01c_newSessionTwiceAutoNumbersSequentially() {
         let (store, _, _) = TestSupport.makeStore()
-        let actions = AppActions(store: store, uiState: UIState(), dialogs: FakeDialogs())
+        let actions = makeActions(store: store)
         store.addProject(path: "/tmp/proj-A") // "Session 1"
 
         XCTAssertTrue(actions.perform(.newSession))
@@ -64,7 +108,7 @@ final class AppActionsTests: XCTestCase {
 
     func test02a_closeSessionFalseWithNoSelection() {
         let (store, _, _) = TestSupport.makeStore()
-        let actions = AppActions(store: store, uiState: UIState(), dialogs: FakeDialogs())
+        let actions = makeActions(store: store)
         store.selection = nil
 
         XCTAssertFalse(actions.perform(.closeSession))
@@ -72,7 +116,7 @@ final class AppActionsTests: XCTestCase {
 
     func test02b_closeSessionTrueAndClosesSelectedSession() {
         let (store, spy, _) = TestSupport.makeStore()
-        let actions = AppActions(store: store, uiState: UIState(), dialogs: FakeDialogs())
+        let actions = makeActions(store: store)
         store.addProject(path: "/tmp/proj-A")
         let sessionID = store.selection!
 
@@ -88,7 +132,7 @@ final class AppActionsTests: XCTestCase {
         let (store, _, _) = TestSupport.makeStore()
         let dialogs = FakeDialogs()
         dialogs.nextProjectDirectory = nil
-        let actions = AppActions(store: store, uiState: UIState(), dialogs: dialogs)
+        let actions = makeActions(store: store, dialogs: dialogs)
 
         XCTAssertTrue(actions.perform(.addProject), "cancel still counts as handled")
         XCTAssertTrue(store.projects.isEmpty)
@@ -99,7 +143,7 @@ final class AppActionsTests: XCTestCase {
         let (store, _, _) = TestSupport.makeStore()
         let dialogs = FakeDialogs()
         dialogs.nextProjectDirectory = "/tmp/proj-A"
-        let actions = AppActions(store: store, uiState: UIState(), dialogs: dialogs)
+        let actions = makeActions(store: store, dialogs: dialogs)
 
         XCTAssertTrue(actions.perform(.addProject))
 
@@ -113,7 +157,7 @@ final class AppActionsTests: XCTestCase {
     func test04a_removeProjectFalseWhenAmbiguous() {
         let (store, _, _) = TestSupport.makeStore()
         let dialogs = FakeDialogs()
-        let actions = AppActions(store: store, uiState: UIState(), dialogs: dialogs)
+        let actions = makeActions(store: store, dialogs: dialogs)
         store.addProject(path: "/tmp/proj-A")
         store.addProject(path: "/tmp/proj-B")
         // addProject auto-selects the newest project's session; explicitly
@@ -128,7 +172,7 @@ final class AppActionsTests: XCTestCase {
         let (store, _, _) = TestSupport.makeStore()
         let dialogs = FakeDialogs()
         dialogs.nextConfirmRemove = false
-        let actions = AppActions(store: store, uiState: UIState(), dialogs: dialogs)
+        let actions = makeActions(store: store, dialogs: dialogs)
         store.addProject(path: "/tmp/proj-A") // single project -> resolveProject's fallback branch
         let project = store.projects.first!
 
@@ -142,7 +186,7 @@ final class AppActionsTests: XCTestCase {
         let (store, _, _) = TestSupport.makeStore()
         let dialogs = FakeDialogs()
         dialogs.nextConfirmRemove = true
-        let actions = AppActions(store: store, uiState: UIState(), dialogs: dialogs)
+        let actions = makeActions(store: store, dialogs: dialogs)
         store.addProject(path: "/tmp/proj-A")
         let project = store.projects.first!
 
@@ -157,7 +201,7 @@ final class AppActionsTests: XCTestCase {
     func test05a_newWorkspaceUsesSelectedSessionsProject() async {
         let fake = FakeWorkspaceEngine()
         let (store, _, _) = TestSupport.makeStore(engine: fake)
-        let actions = AppActions(store: store, uiState: UIState(), dialogs: FakeDialogs())
+        let actions = makeActions(store: store)
         store.addProject(path: "/tmp/proj-A")
         store.addProject(path: "/tmp/proj-B") // selection now in B's session
 
@@ -170,7 +214,7 @@ final class AppActionsTests: XCTestCase {
     func test05b_newWorkspaceFallsBackToSingleProjectWithNoSelection() async {
         let fake = FakeWorkspaceEngine()
         let (store, _, _) = TestSupport.makeStore(engine: fake)
-        let actions = AppActions(store: store, uiState: UIState(), dialogs: FakeDialogs())
+        let actions = makeActions(store: store)
         store.addProject(path: "/tmp/proj-A")
         store.selection = nil
 
@@ -183,7 +227,7 @@ final class AppActionsTests: XCTestCase {
     func test05c_newWorkspaceFalseWhenAmbiguous() {
         let fake = FakeWorkspaceEngine()
         let (store, _, _) = TestSupport.makeStore(engine: fake)
-        let actions = AppActions(store: store, uiState: UIState(), dialogs: FakeDialogs())
+        let actions = makeActions(store: store)
         store.addProject(path: "/tmp/proj-A")
         store.addProject(path: "/tmp/proj-B")
         store.selection = nil
@@ -197,7 +241,7 @@ final class AppActionsTests: XCTestCase {
         let (store, _, _) = TestSupport.makeStore(engine: fake)
         let dialogs = FakeDialogs()
         dialogs.nextNewWorkspaceLabel = nil
-        let actions = AppActions(store: store, uiState: UIState(), dialogs: dialogs)
+        let actions = makeActions(store: store, dialogs: dialogs)
         store.addProject(path: "/tmp/proj-A")
 
         XCTAssertTrue(actions.perform(.newWorkspace), "cancel still counts as handled")
@@ -212,7 +256,7 @@ final class AppActionsTests: XCTestCase {
         let (store, _, _) = TestSupport.makeStore(engine: fake)
         let dialogs = FakeDialogs()
         dialogs.nextNewWorkspaceLabel = "my label"
-        let actions = AppActions(store: store, uiState: UIState(), dialogs: dialogs)
+        let actions = makeActions(store: store, dialogs: dialogs)
         store.addProject(path: "/tmp/proj-A")
         let wsRow = WorkspaceRow(projectPath: "/tmp/proj-A", name: "calm-river", path: "/tmp/workspaces/calm-river", label: nil)
         fake.nextCreateResult = .success(wsRow)
@@ -231,7 +275,7 @@ final class AppActionsTests: XCTestCase {
 
     func test06a_deleteWorkspaceFalseWhenSelectionIsNotAWorkspaceSession() {
         let (store, _, _) = TestSupport.makeStore()
-        let actions = AppActions(store: store, uiState: UIState(), dialogs: FakeDialogs())
+        let actions = makeActions(store: store)
 
         store.selection = nil
         XCTAssertFalse(actions.perform(.deleteWorkspace))
@@ -245,7 +289,7 @@ final class AppActionsTests: XCTestCase {
         let (store, _, _) = TestSupport.makeStore(engine: fake)
         let dialogs = FakeDialogs()
         dialogs.nextConfirmDeleteWorkspace = false
-        let actions = AppActions(store: store, uiState: UIState(), dialogs: dialogs)
+        let actions = makeActions(store: store, dialogs: dialogs)
         store.addProject(path: "/tmp/proj-A")
         let wsRow = WorkspaceRow(projectPath: "/tmp/proj-A", name: "ws-a", path: "/tmp/workspaces/ws-a", label: nil)
         fake.nextCreateResult = .success(wsRow)
@@ -264,7 +308,7 @@ final class AppActionsTests: XCTestCase {
         let (store, _, _) = TestSupport.makeStore(engine: fake)
         let dialogs = FakeDialogs()
         dialogs.nextConfirmDeleteWorkspace = true
-        let actions = AppActions(store: store, uiState: UIState(), dialogs: dialogs)
+        let actions = makeActions(store: store, dialogs: dialogs)
         store.addProject(path: "/tmp/proj-A")
         let wsRow = WorkspaceRow(projectPath: "/tmp/proj-A", name: "ws-a", path: "/tmp/workspaces/ws-a", label: nil)
         fake.nextCreateResult = .success(wsRow)
@@ -280,7 +324,7 @@ final class AppActionsTests: XCTestCase {
 
     func test07a_keepWorkspaceChangesFalseWhenSelectionIsNotAWorkspaceSession() {
         let (store, _, _) = TestSupport.makeStore()
-        let actions = AppActions(store: store, uiState: UIState(), dialogs: FakeDialogs())
+        let actions = makeActions(store: store)
 
         store.selection = nil
         XCTAssertFalse(actions.perform(.keepWorkspaceChanges))
@@ -294,7 +338,7 @@ final class AppActionsTests: XCTestCase {
         let (store, _, _) = TestSupport.makeStore(engine: fake)
         let dialogs = FakeDialogs()
         dialogs.nextLandMessage = nil
-        let actions = AppActions(store: store, uiState: UIState(), dialogs: dialogs)
+        let actions = makeActions(store: store, dialogs: dialogs)
         store.addProject(path: "/tmp/proj-A")
         let wsRow = WorkspaceRow(projectPath: "/tmp/proj-A", name: "ws-a", path: "/tmp/workspaces/ws-a", label: nil)
         fake.nextCreateResult = .success(wsRow)
@@ -311,7 +355,7 @@ final class AppActionsTests: XCTestCase {
         let (store, _, _) = TestSupport.makeStore(engine: fake)
         let dialogs = FakeDialogs()
         dialogs.nextLandMessage = "Ship it"
-        let actions = AppActions(store: store, uiState: UIState(), dialogs: dialogs)
+        let actions = makeActions(store: store, dialogs: dialogs)
         store.addProject(path: "/tmp/proj-A")
         let wsRow = WorkspaceRow(projectPath: "/tmp/proj-A", name: "ws-a", path: "/tmp/workspaces/ws-a", label: nil)
         fake.nextCreateResult = .success(wsRow)
@@ -329,7 +373,7 @@ final class AppActionsTests: XCTestCase {
 
     func test08a_selectSessionValidIndexSelectsAndReturnsTrue() {
         let (store, _, _) = TestSupport.makeStore()
-        let actions = AppActions(store: store, uiState: UIState(), dialogs: FakeDialogs())
+        let actions = makeActions(store: store)
         store.addProject(path: "/tmp/proj-A")
         store.addProject(path: "/tmp/proj-B")
         let ordered = store.orderedSessions
@@ -340,7 +384,7 @@ final class AppActionsTests: XCTestCase {
 
     func test08b_selectSessionOutOfRangeReturnsFalse() {
         let (store, _, _) = TestSupport.makeStore()
-        let actions = AppActions(store: store, uiState: UIState(), dialogs: FakeDialogs())
+        let actions = makeActions(store: store)
         store.addProject(path: "/tmp/proj-A")
 
         XCTAssertFalse(actions.perform(.selectSession(5)))
@@ -351,7 +395,7 @@ final class AppActionsTests: XCTestCase {
     func test09_showShortcutHelpTogglesBothDirections() {
         let (store, _, _) = TestSupport.makeStore()
         let uiState = UIState()
-        let actions = AppActions(store: store, uiState: uiState, dialogs: FakeDialogs())
+        let actions = makeActions(store: store, uiState: uiState)
         XCTAssertFalse(uiState.showShortcutHelp)
 
         XCTAssertTrue(actions.perform(.showShortcutHelp))
@@ -366,7 +410,7 @@ final class AppActionsTests: XCTestCase {
     func test10a_renameSessionFalseWithNoSelection() {
         let (store, _, _) = TestSupport.makeStore()
         let dialogs = FakeDialogs()
-        let actions = AppActions(store: store, uiState: UIState(), dialogs: dialogs)
+        let actions = makeActions(store: store, dialogs: dialogs)
 
         XCTAssertFalse(actions.perform(.renameSession))
         XCTAssertTrue(dialogs.promptRenameCalls.isEmpty)
@@ -376,7 +420,7 @@ final class AppActionsTests: XCTestCase {
         let (store, _, _) = TestSupport.makeStore()
         let dialogs = FakeDialogs()
         dialogs.nextRenameName = nil
-        let actions = AppActions(store: store, uiState: UIState(), dialogs: dialogs)
+        let actions = makeActions(store: store, dialogs: dialogs)
         store.addProject(path: "/tmp/proj-A")
         let session = store.sessions.first!
 
@@ -390,12 +434,128 @@ final class AppActionsTests: XCTestCase {
         let (store, _, _) = TestSupport.makeStore()
         let dialogs = FakeDialogs()
         dialogs.nextRenameName = "renamed"
-        let actions = AppActions(store: store, uiState: UIState(), dialogs: dialogs)
+        let actions = makeActions(store: store, dialogs: dialogs)
         store.addProject(path: "/tmp/proj-A")
         let sessionID = store.selection!
 
         XCTAssertTrue(actions.perform(.renameSession))
 
         XCTAssertEqual(store.sessions.first { $0.id == sessionID }?.name, "renamed")
+    }
+
+    // MARK: - 11: dialog presentation is deferred (the double-Escape bug)
+
+    // Pins down the fix itself, using AppActions' real default `present`
+    // (DispatchQueue.main.async) instead of the synchronous one makeActions
+    // injects everywhere else. If perform ever went back to presenting the
+    // dialog inline — the bug that made Escape reopen the rename alert,
+    // because the modal loop ran while the triggering keydown's dispatch was
+    // still suspended in the ShortcutRouter monitor callback — the first
+    // assertion here would fail the moment promptRename was called too
+    // early.
+    func test11_renameSessionDefersDialogPresentationByOneRunloopTurn() async {
+        let (store, _, _) = TestSupport.makeStore()
+        let dialogs = FakeDialogs()
+        dialogs.nextRenameName = nil
+        let actions = AppActions(store: store, uiState: UIState(), dialogs: dialogs)
+        store.addProject(path: "/tmp/proj-A")
+        let session = store.sessions.first!
+
+        XCTAssertTrue(actions.perform(.renameSession))
+        XCTAssertTrue(dialogs.promptRenameCalls.isEmpty, "dialog must not be presented synchronously inside perform")
+
+        // Drains the main queue: FIFO ordering guarantees the deferred
+        // dialog block, enqueued during perform above, runs before this
+        // continuation's block does.
+        await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
+            DispatchQueue.main.async { c.resume() }
+        }
+
+        XCTAssertEqual(dialogs.promptRenameCalls, [session.name])
+    }
+
+    // MARK: - 12: one keystroke performs an action once (the double-dialog bug)
+
+    // The regression test for the reported bug. One ⇧⌘R press reaches
+    // AppActions twice — once from ShortcutRouter's local NSEvent monitor,
+    // once from the menu item's own key equivalent, which .keymapShortcut
+    // attaches and which the monitor's nil return does not actually
+    // suppress. Both calls arrive inside the same sendEvent:, so both see
+    // the same NSApp.currentEvent, modelled here by a fixed keydown. Before
+    // the fix that queued two rename alerts, and dismissing the dialog
+    // appeared to need two Escapes.
+    func test12a_sameKeystrokeDispatchedTwicePerformsOnce() {
+        let (store, _, _) = TestSupport.makeStore()
+        let dialogs = FakeDialogs()
+        dialogs.nextRenameName = nil
+        let event = keyDownEvent(timestamp: 1000)
+        let actions = makeActions(store: store, dialogs: dialogs, currentEvent: { event })
+        store.addProject(path: "/tmp/proj-A")
+
+        XCTAssertTrue(actions.perform(.renameSession))
+        XCTAssertTrue(actions.perform(.renameSession), "the duplicate still reports handled — it must not fall through to a beep")
+
+        XCTAssertEqual(dialogs.promptRenameCalls.count, 1)
+    }
+
+    // The guard keys on the individual keystroke, not on the action, so it
+    // can't wedge an action permanently after its first use — and holding
+    // ⇧⌘R to auto-repeat still opens a dialog per repeat.
+    func test12b_distinctKeystrokesEachPerform() {
+        let (store, _, _) = TestSupport.makeStore()
+        let dialogs = FakeDialogs()
+        dialogs.nextRenameName = nil
+        var event = keyDownEvent(timestamp: 1000)
+        let actions = makeActions(store: store, dialogs: dialogs, currentEvent: { event })
+        store.addProject(path: "/tmp/proj-A")
+
+        XCTAssertTrue(actions.perform(.renameSession))
+        event = keyDownEvent(timestamp: 2000)
+        XCTAssertTrue(actions.perform(.renameSession))
+
+        XCTAssertEqual(dialogs.promptRenameCalls.count, 2)
+    }
+
+    // Only a dispatch that actually handled the action is recorded. A first
+    // attempt that returned false (⇧⌘R with nothing selected) must not
+    // consume the keystroke and block a second attempt on the same event —
+    // which is exactly the ordering when the router's dispatch declines and
+    // the menu's key equivalent then finds valid state.
+    func test12c_unhandledDispatchIsNotRecorded() {
+        let (store, _, _) = TestSupport.makeStore()
+        let dialogs = FakeDialogs()
+        dialogs.nextRenameName = nil
+        let event = keyDownEvent(timestamp: 1000)
+        let actions = makeActions(store: store, dialogs: dialogs, currentEvent: { event })
+
+        XCTAssertFalse(actions.perform(.renameSession), "no selection — nothing to rename")
+        XCTAssertTrue(dialogs.promptRenameCalls.isEmpty)
+
+        store.addProject(path: "/tmp/proj-A") // now there is a selection
+        let session = store.sessions.first!
+
+        XCTAssertTrue(actions.perform(.renameSession))
+        XCTAssertEqual(dialogs.promptRenameCalls, [session.name])
+    }
+
+    // Menu items chosen with the mouse carry a non-keyDown current event,
+    // so nothing is deduplicated: picking Rename Session… from the menu
+    // twice must present the dialog twice.
+    func test12d_nonKeyDownCurrentEventNeverDedups() {
+        let (store, _, _) = TestSupport.makeStore()
+        let dialogs = FakeDialogs()
+        dialogs.nextRenameName = nil
+        let click = NSEvent.mouseEvent(
+            with: .leftMouseUp, location: .zero, modifierFlags: [],
+            timestamp: 1000, windowNumber: 0, context: nil,
+            eventNumber: 0, clickCount: 1, pressure: 1
+        )!
+        let actions = makeActions(store: store, dialogs: dialogs, currentEvent: { click })
+        store.addProject(path: "/tmp/proj-A")
+
+        XCTAssertTrue(actions.perform(.renameSession))
+        XCTAssertTrue(actions.perform(.renameSession))
+
+        XCTAssertEqual(dialogs.promptRenameCalls.count, 2)
     }
 }

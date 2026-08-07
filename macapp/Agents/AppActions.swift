@@ -10,14 +10,90 @@ final class AppActions {
     let uiState: UIState
     private let dialogs: any DialogPresenting
 
-    init(store: AppStore, uiState: UIState, dialogs: any DialogPresenting = LiveDialogPresenter()) {
+    /// Schedules dialog presentation one runloop turn after `perform`
+    /// returns, instead of presenting inline. `ShortcutRouter` calls
+    /// `perform` from inside an `NSEvent` local-monitor callback, and
+    /// `NSAlert.runModal`/`NSOpenPanel.runModal` nested there would run a
+    /// modal event loop while AppKit is still dispatching the triggering
+    /// keydown — which was observed leaking that keystroke into the hosted
+    /// terminal once the dialog closed.
+    ///
+    /// Deferring is NOT what fixes the duplicate dialog (the "press Escape
+    /// twice" bug); `perform`'s per-keystroke dedup is. But the two are
+    /// linked: because presentation is deferred, both dispatches of a
+    /// keystroke finish before any modal loop starts, so the second one
+    /// still sees the same `NSApp.currentEvent` the dedup keys on. Moving
+    /// presentation back inline would silently break that guarantee.
+    ///
+    /// Tests inject a synchronous `present` so assertions can still run
+    /// immediately after `perform` returns.
+    private let present: (@escaping () -> Void) -> Void
+
+    /// The keydown AppKit was dispatching when this action was last
+    /// *handled*. Injected as a closure (rather than read from `NSApp`
+    /// directly) so tests can drive the dedup in `perform` without a real
+    /// event stream.
+    private let currentEvent: () -> NSEvent?
+    private var lastKeyDispatch: (action: AppAction, timestamp: TimeInterval)?
+
+    init(
+        store: AppStore,
+        uiState: UIState,
+        dialogs: any DialogPresenting = LiveDialogPresenter(),
+        present: @escaping (@escaping () -> Void) -> Void = { work in DispatchQueue.main.async(execute: work) },
+        currentEvent: @escaping () -> NSEvent? = { NSApp.currentEvent }
+    ) {
         self.store = store
         self.uiState = uiState
         self.dialogs = dialogs
+        self.present = present
+        self.currentEvent = currentEvent
     }
 
+    /// Runs `action` at most once per originating keystroke.
+    ///
+    /// A ⌘-shortcut in this app is dispatched by two entirely independent
+    /// mechanisms: `ShortcutRouter`'s local `NSEvent` monitor, and the menu
+    /// item's own key equivalent, which `.keymapShortcut(_:)` attaches in
+    /// AgentsApp.swift. The router returning nil for a handled event was
+    /// assumed to consume the keydown and stop the menu from also firing.
+    /// Measured against the running app — breakpoints on both paths — it
+    /// does not: one ⇧⌘R produces a call from the monitor *and* a call from
+    /// `-[NSMenu _performKeyEquivalentForItemAtIndex:]`. For most actions the
+    /// second dispatch is invisible or self-cancelling (a second toggle, a
+    /// re-select of the row already selected), but the six dialog-presenting
+    /// actions each queued a second dialog behind the first — which is why
+    /// dismissing the rename alert appeared to need two Escapes.
+    ///
+    /// Both dispatches happen synchronously inside the same
+    /// `-[NSApplication sendEvent:]`, so they share one `NSApp.currentEvent`.
+    /// That makes the identity of the keydown a sound dedup key — and it
+    /// holds only because dialog presentation is deferred a runloop turn
+    /// (see `present`): no modal loop runs between the two dispatches to
+    /// swap `NSApp.currentEvent` out from under the second one.
+    ///
+    /// Two deliberate exclusions. A menu item chosen with the mouse carries
+    /// a non-keyDown current event, so it is never deduplicated — picking
+    /// Rename Session… from the menu twice in a row must work. And only a
+    /// dispatch that actually handled the action is recorded, so a `false`
+    /// return (⌘W with nothing selected, say) never suppresses a later
+    /// legitimate attempt riding the same event.
     @discardableResult
     func perform(_ action: AppAction) -> Bool {
+        guard let event = currentEvent(), event.type == .keyDown else {
+            return dispatch(action)
+        }
+        if let last = lastKeyDispatch, last.action == action, last.timestamp == event.timestamp {
+            return true
+        }
+        let handled = dispatch(action)
+        if handled {
+            lastKeyDispatch = (action, event.timestamp)
+        }
+        return handled
+    }
+
+    private func dispatch(_ action: AppAction) -> Bool {
         switch action {
         case .newSession:
             guard !store.projects.isEmpty else { return false }
@@ -35,10 +111,12 @@ final class AppActions {
             else { return false }
             // Cancel still counts as handled, same reasoning as
             // .deleteWorkspace/.keepWorkspaceChanges above: once the row is
-            // resolved we opened the prompt, so the shortcut/menu item did
-            // its job regardless of the user's choice.
-            if let name = dialogs.promptRename(currentName: row.name) {
-                store.renameSession(selection, to: name)
+            // resolved we scheduled the prompt, so the shortcut/menu item
+            // did its job regardless of the user's choice.
+            present {
+                if let name = self.dialogs.promptRename(currentName: row.name) {
+                    self.store.renameSession(selection, to: name)
+                }
             }
             return true
 
@@ -49,20 +127,24 @@ final class AppActions {
 
         case .addProject:
             // Cancel still counts as handled — the shortcut did its job by
-            // opening the panel.
-            if let path = dialogs.chooseProjectDirectory() {
-                store.addProject(path: path)
+            // scheduling the panel.
+            present {
+                if let path = self.dialogs.chooseProjectDirectory() {
+                    self.store.addProject(path: path)
+                }
             }
             return true
 
         case .removeProject:
             let project = resolveProject()
             guard let project else { return false }
-            // Once a project is resolved we opened the confirm dialog, so
+            // Once a project is resolved we scheduled the confirm dialog, so
             // the shortcut/menu-item did its job regardless of the user's
             // choice (same "cancel still counts as handled" reasoning as addProject).
-            if dialogs.confirmRemove(project) {
-                store.removeProject(project)
+            present {
+                if self.dialogs.confirmRemove(project) {
+                    self.store.removeProject(project)
+                }
             }
             return true
 
@@ -82,10 +164,12 @@ final class AppActions {
         case .newWorkspace:
             guard let project = resolveProject() else { return false }
             // Cancel still counts as handled, same reasoning as .addProject
-            // above: once the dialog is opened the shortcut/menu item did
+            // above: once the dialog is scheduled the shortcut/menu item did
             // its job regardless of the user's choice.
-            if let label = dialogs.promptNewWorkspaceLabel() {
-                Task { await store.createWorkspace(in: project.path, label: label) }
+            present {
+                if let label = self.dialogs.promptNewWorkspaceLabel() {
+                    Task { await self.store.createWorkspace(in: project.path, label: label) }
+                }
             }
             return true
 
@@ -95,11 +179,13 @@ final class AppActions {
                   case .workspace(let projectPath, let name) = row.target,
                   let workspace = store.workspaces.first(where: { $0.projectPath == projectPath && $0.name == name })
             else { return false }
-            // Once a workspace is resolved we opened the confirm dialog, so
-            // the shortcut/menu-item did its job regardless of the user's
+            // Once a workspace is resolved we scheduled the confirm dialog,
+            // so the shortcut/menu-item did its job regardless of the user's
             // choice (same "cancel still counts as handled" reasoning as addProject/removeProject).
-            if dialogs.confirmDeleteWorkspace(workspace) {
-                Task { await store.deleteWorkspace(workspace.id) }
+            present {
+                if self.dialogs.confirmDeleteWorkspace(workspace) {
+                    Task { await self.store.deleteWorkspace(workspace.id) }
+                }
             }
             return true
 
@@ -110,10 +196,13 @@ final class AppActions {
                   let workspace = store.workspaces.first(where: { $0.projectPath == projectPath && $0.name == name })
             else { return false }
             // Cancel still counts as handled, same reasoning as
-            // .deleteWorkspace above: once a workspace is resolved we opened
-            // the prompt, so the menu item did its job regardless of choice.
-            if let message = dialogs.promptLandMessage(workspace: workspace) {
-                Task { await store.landWorkspace(workspace.id, message: message) }
+            // .deleteWorkspace above: once a workspace is resolved we
+            // scheduled the prompt, so the menu item did its job regardless
+            // of choice.
+            present {
+                if let message = self.dialogs.promptLandMessage(workspace: workspace) {
+                    Task { await self.store.landWorkspace(workspace.id, message: message) }
+                }
             }
             return true
 

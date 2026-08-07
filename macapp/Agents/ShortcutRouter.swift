@@ -1,13 +1,23 @@
 import AppKit
 
-/// The single point through which every keyboard shortcut in the app
+/// The first point through which every keyboard shortcut in the app
 /// flows: one local `NSEvent` monitor. Menus render their shortcuts from
-/// the same `Keymap.standard` table (via `Shortcut.swiftUIShortcut`), but
-/// this monitor is what actually consumes a matched keydown — by
-/// returning nil once `perform` reports the action as handled, the system
-/// never also dispatches the menu item's own key equivalent, so a binding
-/// can never fire twice. Adding a shortcut = adding a Keymap entry; the
-/// uniqueness test in KeymapTests guards against accidental conflicts.
+/// the same `Keymap.standard` table (via `Shortcut.swiftUIShortcut`), and
+/// this monitor returns nil for a matched, handled keydown — but that does
+/// *not* stop the system from also dispatching the menu item's own key
+/// equivalent. Measured against the running app, both fire, so a single
+/// keystroke reaches `AppActions.perform` twice; `AppActions` is what
+/// makes the second call a no-op, deduplicating by the originating
+/// keydown. Adding a shortcut = adding a Keymap entry; the uniqueness test
+/// in KeymapTests guards against accidental conflicts.
+/// Actions that present modal dialogs defer that presentation via
+/// `AppActions.present` rather than presenting inline: a modal event loop
+/// must never run inside this monitor callback, because the triggering
+/// keydown is still suspended in AppKit's dispatch, and that dispatch
+/// resumes corrupted once the callback finally returns (shortcut keys
+/// leaking into the terminal after the dialog closes). Deferral is also
+/// what keeps `AppActions`' dedup sound — with no modal loop running
+/// between the two dispatches, both see the same `NSApp.currentEvent`.
 @MainActor
 final class ShortcutRouter {
     private var monitor: Any?
@@ -49,7 +59,7 @@ final class ShortcutRouter {
             return event
         }
         if perform(action) {
-            return nil // consumed: handled, so the system's own menu key-equivalent never also fires
+            return nil // handled — swallow it here (the menu key-equivalent still fires; AppActions dedups that)
         }
         return event // action not currently valid (e.g. ⌘W with nothing selected) — let the system handle/beep normally
     }
