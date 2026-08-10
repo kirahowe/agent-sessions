@@ -10,18 +10,21 @@ struct RootView: View {
            let session = store.sessions.first(where: { $0.id == selectedID }),
            let project = store.projects.first(where: { $0.path == session.projectPath })
         {
-            return "\(session.name) — \(project.name)"
+            return "\(session.displayName) — \(project.name)"
         }
         return "Agents"
     }
 
-    /// The selected session's latest OSC window title, or "" when there is
-    /// no selection or that session hasn't reported one yet — an empty
-    /// string renders no subtitle at all, rather than a stale/placeholder
-    /// one.
+    /// The agent-set terminal title of the selected session — but only when
+    /// it isn't already what the window title shows (see `SessionRow.subtitle`),
+    /// so the title never repeats verbatim on the line beneath itself. "" when
+    /// there's no selection, no agent title yet, or it would duplicate the
+    /// name; an empty string renders no subtitle at all.
     private var windowSubtitle: String {
-        guard let selectedID = store.selection else { return "" }
-        return store.sessionTitles[selectedID] ?? ""
+        guard let selectedID = store.selection,
+              let session = store.sessions.first(where: { $0.id == selectedID })
+        else { return "" }
+        return session.subtitle ?? ""
     }
 
     var body: some View {

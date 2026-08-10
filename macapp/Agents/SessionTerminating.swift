@@ -16,8 +16,9 @@ protocol SessionTerminating: AnyObject {
     /// Fired when a session's terminal reports a new OSC window-title string
     /// (sessionID, title). Mirrors `onSessionActivity`'s per-session,
     /// callback-based seam so `AppStore` can be tested against a spy without
-    /// any real terminal machinery. A blank/whitespace-only title means "no
-    /// meaningful title" — the shell cleared it or never set one.
+    /// any real terminal machinery. A blank/whitespace-only title is IGNORED
+    /// downstream (see AppStore.setSessionTitle): "remember the last title"
+    /// means a shell clearing its title keeps the last real one.
     var onTitleChange: ((String, String) -> Void)? { get set }
     func closeSession(_ id: String)
 }

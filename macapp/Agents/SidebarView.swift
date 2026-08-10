@@ -118,7 +118,14 @@ private struct SessionRowView: View {
         HStack(spacing: 8) {
             Image(systemName: "terminal")
                 .foregroundStyle(.secondary)
-            Text(session.name)
+            // Pinned to one line: displayName is now often the agent-set
+            // terminal title, which can be a full sentence — without this a
+            // long title would wrap and grow the row's height out of step
+            // with its siblings. The tooltip surfaces the full text when the
+            // tail is truncated.
+            Text(session.displayName)
+                .lineLimit(1)
+                .help(session.displayName)
             if let activity {
                 // Placed before the trailing Spacer()/ellipsis-menu area
                 // (not after) so this dot never collides with the
@@ -162,7 +169,9 @@ private struct SessionRowView: View {
         // global selection, so it isn't the same operation as
         // AppActions' selection-based cases.
         Button("Rename…") {
-            if let name = Dialogs.promptRename(currentName: session.name) {
+            // Prefill with what the user currently sees (agent title or an
+            // existing custom name) — the natural starting point to edit.
+            if let name = Dialogs.promptRename(currentName: session.displayName) {
                 store.renameSession(session.id, to: name)
             }
         }

@@ -21,13 +21,6 @@ final class AppStore: ObservableObject {
     /// which has no meaningful value to restore after a relaunch — see
     /// `SessionActivity`'s doc comment.
     @Published private(set) var sessionActivity: [String: SessionActivity] = [:]
-    /// Each live session's latest OSC window-title string, as reported by
-    /// the shell (or an agent running in it, e.g. Claude Code) via the
-    /// terminal's title-change delegate. Deliberately NOT part of
-    /// `PersistedState`/`save()`/`load()`: a live shell re-reports its title
-    /// on its own, and a title carried over from a previous run would just
-    /// be stale/wrong after relaunch.
-    @Published private(set) var sessionTitles: [String: String] = [:]
 
     let terminals: any SessionTerminating
     private let engine: any WorkspaceEngineProviding
@@ -353,40 +346,51 @@ final class AppStore: ObservableObject {
         }
     }
 
-    /// Sets (or, when `title` trims to empty, clears) a session's
-    /// window-title string. Ignores ids with no matching row in `sessions` —
-    /// a title update racing that session's own teardown is a normal,
-    /// harmless race, not an error to surface. Deliberately never calls
-    /// `save()`: this state is not persisted (see `sessionTitles`'s doc
-    /// comment).
+    /// Records a session's latest agent-set OSC terminal title onto its row
+    /// as `agentTitle` — the sidebar/window name for any session the user
+    /// hasn't manually renamed. Persisted (via `save()`), so the name stays
+    /// stable across relaunches rather than flashing back to "Session N"
+    /// until the agent re-announces.
+    ///
+    /// A blank/whitespace-only title is IGNORED, not treated as a clear:
+    /// "remember the last title" means a shell that quietly resets its title
+    /// (e.g. the agent exits and the bare prompt takes over) must not wipe
+    /// the name. A title identical to the one already stored is a no-op too,
+    /// so agents that re-emit the same title on every turn don't churn a
+    /// state.json write each time. Ids with no matching row (a title racing
+    /// that session's teardown) are a harmless no-op.
     func setSessionTitle(_ title: String, for sessionID: String) {
-        guard sessions.contains(where: { $0.id == sessionID }) else { return }
+        guard let index = sessions.firstIndex(where: { $0.id == sessionID }) else { return }
         let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
-        if trimmed.isEmpty {
-            sessionTitles.removeValue(forKey: sessionID)
-        } else {
-            sessionTitles[sessionID] = trimmed
-        }
+        guard !trimmed.isEmpty, sessions[index].agentTitle != trimmed else { return }
+        sessions[index].agentTitle = trimmed
+        save()
     }
 
-    /// Drops any per-live-session state (`sessionActivity`, `sessionTitles`)
-    /// whose session no longer exists. Called from every site that removes
-    /// rows from `sessions` (`closeSession`, `removeProject`,
-    /// `deleteWorkspace`, `landWorkspace`) so neither can ever outlive the
-    /// session it describes. One shared helper instead of duplicating this
-    /// removal logic at each call site.
+    /// Drops any per-live-session state (`sessionActivity`) whose session no
+    /// longer exists. Called from every site that removes rows from
+    /// `sessions` (`closeSession`, `removeProject`, `deleteWorkspace`,
+    /// `landWorkspace`) so it can never outlive the session it describes. One
+    /// shared helper instead of duplicating this removal logic at each call
+    /// site. (The agent title needs no pruning here — it lives on the
+    /// `SessionRow` itself, so removing the row removes it.)
     private func pruneLiveSessionState() {
         let liveIDs = Set(sessions.map(\.id))
         sessionActivity = sessionActivity.filter { liveIDs.contains($0.key) }
-        sessionTitles = sessionTitles.filter { liveIDs.contains($0.key) }
     }
 
+    /// A manual rename writes `customName`, not `name`: it must win over —
+    /// and survive — any agent-set `agentTitle`, and it deliberately leaves
+    /// the auto "Session N" (`name`) intact as the counter seed and fallback.
+    /// A blank name is a no-op (it does NOT clear an existing custom name):
+    /// clearing would need its own affordance, and silently reverting to the
+    /// agent title on an accidental empty submit would be surprising.
     func renameSession(_ id: String, to name: String) {
         guard let index = sessions.firstIndex(where: { $0.id == id }) else { return }
 
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
-        sessions[index].name = trimmed
+        sessions[index].customName = trimmed
         save()
     }
 

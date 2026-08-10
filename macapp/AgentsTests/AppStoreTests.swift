@@ -238,16 +238,21 @@ final class AppStoreTests: XCTestCase {
 
     // MARK: - 10
 
-    func test10_renameSessionTrimsWhitespaceAndNoOpsOnBlank() {
+    func test10_renameSessionSetsAStickyCustomNameAndNoOpsOnBlank() {
         let (store, _, _) = TestSupport.makeStore()
         store.addProject(path: "/tmp/proj-A")
         let session = store.sessions.first!
 
         store.renameSession(session.id, to: "  build server  ")
-        XCTAssertEqual(store.sessions.first { $0.id == session.id }?.name, "build server")
+        let renamed = store.sessions.first { $0.id == session.id }!
+        XCTAssertEqual(renamed.customName, "build server")
+        XCTAssertEqual(renamed.displayName, "build server")
+        // The auto label stays intact underneath as the counter seed/fallback.
+        XCTAssertEqual(renamed.name, "Session 1")
 
         store.renameSession(session.id, to: "   \n\t")
-        XCTAssertEqual(store.sessions.first { $0.id == session.id }?.name, "build server")
+        XCTAssertEqual(store.sessions.first { $0.id == session.id }?.customName, "build server",
+                       "a blank rename is a no-op and must not clear the custom name")
     }
 
     // MARK: - 11
@@ -555,6 +560,33 @@ final class AppStoreTests: XCTestCase {
         let raw = try String(contentsOf: url, encoding: .utf8)
         XCTAssertTrue(raw.contains("\"version\":2"), "expected migrated save to be version 2: \(raw)")
         XCTAssertTrue(raw.contains("\"workspaces\""), "expected migrated save to include a workspaces key: \(raw)")
+    }
+
+    // MARK: - 21b
+
+    // The upgrade path for existing users: a v2 state.json written before
+    // `customName`/`agentTitle` existed omits those keys entirely. Decoding
+    // must treat them as nil rather than throwing — a throw would move the
+    // file aside as "corrupt" and silently wipe the user's projects/sessions
+    // on the very first launch after the update.
+    func test21b_v2JSONWithoutCustomNameOrAgentTitleDecodesThoseAsNil() throws {
+        let url = TestSupport.freshStateURL()
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+
+        let preFieldsJSON = """
+        {"version":2,"projects":["/tmp/proj-A"],"sessions":[{"id":"s-1","target":{"root":{"projectPath":"/tmp/proj-A"}},"name":"Session 1"}],"workspaces":[],"selection":"s-1"}
+        """
+        try Data(preFieldsJSON.utf8).write(to: url)
+
+        let spy = SpyTerminals()
+        let store = AppStore(terminals: spy, stateURL: url)
+
+        let session = store.sessions.first { $0.id == "s-1" }!
+        XCTAssertNil(session.customName)
+        XCTAssertNil(session.agentTitle)
+        // With neither present the display name falls back to the auto label.
+        XCTAssertEqual(session.displayName, "Session 1")
+        XCTAssertNil(session.subtitle)
     }
 
     // MARK: - 22
@@ -1334,14 +1366,17 @@ final class AppStoreTests: XCTestCase {
 
     // MARK: - 52
 
-    func test52_onTitleChangeCallbackWiredInInitReachesStore() {
+    func test52_onTitleChangeBecomesTheDisplayName() {
         let (store, spy, _) = TestSupport.makeStore()
         store.addProject(path: "/tmp/proj-A")
         let session = store.sessions.first!
 
         spy.onTitleChange?(session.id, "building the widget")
 
-        XCTAssertEqual(store.sessionTitles[session.id], "building the widget")
+        let row = store.sessions.first { $0.id == session.id }!
+        XCTAssertEqual(row.agentTitle, "building the widget")
+        // With no manual rename, the agent title becomes the display name.
+        XCTAssertEqual(row.displayName, "building the widget")
     }
 
     // MARK: - 53
@@ -1352,68 +1387,80 @@ final class AppStoreTests: XCTestCase {
 
         store.setSessionTitle("building the widget", for: "not-a-real-id")
 
-        XCTAssertTrue(store.sessionTitles.isEmpty)
+        XCTAssertTrue(store.sessions.allSatisfy { $0.agentTitle == nil })
     }
 
     // MARK: - 54
 
-    func test54_setSessionTitleWhitespaceOnlyClearsEntryAndTitlesAreStoredTrimmed() {
+    func test54_setSessionTitleTrimsAndABlankTitleKeepsTheLastRemembered() {
         let (store, _, _) = TestSupport.makeStore()
         store.addProject(path: "/tmp/proj-A")
         let session = store.sessions.first!
+
         store.setSessionTitle("  building the widget  \n", for: session.id)
-        XCTAssertEqual(store.sessionTitles[session.id], "building the widget")
+        XCTAssertEqual(store.sessions.first { $0.id == session.id }?.agentTitle, "building the widget")
 
+        // A blank title must NOT clear the remembered one — "remember the last
+        // title" means a shell quietly resetting its title keeps the name.
         store.setSessionTitle("   \n", for: session.id)
-
-        XCTAssertNil(store.sessionTitles[session.id])
+        XCTAssertEqual(store.sessions.first { $0.id == session.id }?.agentTitle, "building the widget")
     }
 
     // MARK: - 55
 
-    func test55_closingSessionDropsItsTitleEntry() {
+    func test55_manualRenameWinsOverALaterAgentTitle() {
         let (store, _, _) = TestSupport.makeStore()
         store.addProject(path: "/tmp/proj-A")
         let session = store.sessions.first!
+
+        store.renameSession(session.id, to: "my work")
         store.setSessionTitle("building the widget", for: session.id)
 
-        store.closeSession(session.id)
-
-        XCTAssertNil(store.sessionTitles[session.id])
+        let row = store.sessions.first { $0.id == session.id }!
+        // The agent title is still recorded (it drives the subtitle)…
+        XCTAssertEqual(row.agentTitle, "building the widget")
+        // …but the sticky manual name still wins the display name.
+        XCTAssertEqual(row.displayName, "my work")
+        // …and the differing agent title shows through as the subtitle.
+        XCTAssertEqual(row.subtitle, "building the widget")
     }
 
     // MARK: - 56
 
-    func test56_removeProjectDropsTitlesForAllItsSessions() {
+    func test56_displayNameFallsBackToLabelAndSubtitleHidesWhenItEqualsName() {
         let (store, _, _) = TestSupport.makeStore()
-        let path = "/tmp/proj-A"
-        store.addProject(path: path)
-        store.newSession(in: store.projects.first!)
-        let sessions = store.sessions.filter { $0.projectPath == path }
-        for session in sessions {
-            store.setSessionTitle("working", for: session.id)
-        }
-        XCTAssertEqual(store.sessionTitles.count, sessions.count)
+        store.addProject(path: "/tmp/proj-A")
+        let session = store.sessions.first!
 
-        store.removeProject(store.projects.first!)
+        // No agent title, no rename: falls back to the auto label, no subtitle.
+        var row = store.sessions.first { $0.id == session.id }!
+        XCTAssertEqual(row.displayName, "Session 1")
+        XCTAssertNil(row.subtitle)
 
-        XCTAssertTrue(store.sessionTitles.isEmpty)
+        // Agent title present, no rename: it IS the name, so the subtitle would
+        // just repeat it and is therefore suppressed.
+        store.setSessionTitle("building the widget", for: session.id)
+        row = store.sessions.first { $0.id == session.id }!
+        XCTAssertEqual(row.displayName, "building the widget")
+        XCTAssertNil(row.subtitle)
     }
 
     // MARK: - 57
 
-    func test57_titleDoesNotSurviveSaveReloadRoundTrip() {
+    func test57_agentTitleSurvivesSaveReloadRoundTrip() {
         let url = TestSupport.freshStateURL()
         let spy1 = SpyTerminals()
         let store1 = AppStore(terminals: spy1, stateURL: url)
         store1.addProject(path: "/tmp/proj-A")
         let session = store1.sessions.first!
         store1.setSessionTitle("building the widget", for: session.id)
-        XCTAssertFalse(store1.sessionTitles.isEmpty)
 
         let spy2 = SpyTerminals()
         let store2 = AppStore(terminals: spy2, stateURL: url)
 
-        XCTAssertTrue(store2.sessionTitles.isEmpty, "title must never be persisted")
+        let reloaded = store2.sessions.first { $0.id == session.id }!
+        XCTAssertEqual(reloaded.agentTitle, "building the widget",
+                       "the agent title must persist so the name is stable across relaunches")
+        XCTAssertEqual(reloaded.displayName, "building the widget")
     }
 }

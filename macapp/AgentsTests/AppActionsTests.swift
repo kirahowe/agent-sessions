@@ -440,7 +440,9 @@ final class AppActionsTests: XCTestCase {
 
         XCTAssertTrue(actions.perform(.renameSession))
 
-        XCTAssertEqual(store.sessions.first { $0.id == sessionID }?.name, "renamed")
+        // A rename writes `customName`, so the observable result is the
+        // display name — `name` stays the "Session N" counter seed.
+        XCTAssertEqual(store.sessions.first { $0.id == sessionID }?.displayName, "renamed")
     }
 
     // MARK: - 11: dialog presentation is deferred (the double-Escape bug)

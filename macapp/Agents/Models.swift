@@ -48,9 +48,38 @@ struct WorkspaceRow: Identifiable, Codable, Hashable {
 struct SessionRow: Identifiable, Codable, Hashable {
     let id: String        // UUID string
     var target: TargetRef
-    var name: String      // "Session 1", "Session 2", ... renameable
+    // The auto-assigned "Session 1", "Session 2", … label. Kept purely as
+    // the counter seed (seedSessionCounters parses it) and the last-resort
+    // fallback name; it is NOT what the sidebar shows once an agent title or
+    // a manual rename exists — see `displayName`.
+    var name: String
+    // A name the user typed via Rename…. Highest-priority display name: once
+    // set it is sticky and is never overwritten by an incoming agent title —
+    // an explicit rename is a firm decision the agent must not stomp.
+    var customName: String? = nil
+    // The most recent non-empty OSC terminal title the agent (e.g. Claude
+    // Code) set for this session. Persisted so the name stays stable across
+    // relaunches instead of flashing back to "Session N" until the agent
+    // re-announces. Updated only on a non-empty title (see
+    // AppStore.setSessionTitle): a shell quietly clearing its title must not
+    // wipe the remembered one.
+    var agentTitle: String? = nil
 
     var projectPath: String { target.projectPath }
+
+    /// What the sidebar row and window title show. A manual rename wins;
+    /// otherwise the agent-set terminal title; otherwise the auto "Session N".
+    var displayName: String { customName ?? agentTitle ?? name }
+
+    /// The window subtitle: the agent-set terminal title, but only when it
+    /// isn't already exactly what `displayName` shows — there's no point
+    /// repeating the name verbatim on the line directly beneath it. So the
+    /// agent title surfaces here only once a manual rename has taken over the
+    /// name; with no manual name the title IS the name and this is nil.
+    var subtitle: String? {
+        guard let agentTitle, agentTitle != displayName else { return nil }
+        return agentTitle
+    }
 }
 
 struct PersistedState: Codable {

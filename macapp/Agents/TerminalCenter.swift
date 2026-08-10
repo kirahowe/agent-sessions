@@ -143,9 +143,10 @@ final class SessionDelegateProxy: TerminalSurfaceTitleDelegate, TerminalSurfaceC
     }
 
     func terminalDidChangeTitle(_ title: String) {
-        // The window TITLE is still driven by session/project name, not the
-        // shell's OSC title — see RootView's windowTitle. The OSC title
-        // instead drives the window SUBTITLE, via AppStore.sessionTitles.
+        // The agent's OSC title becomes the session's display name (sidebar
+        // + window title) unless the user has manually renamed it, and also
+        // the window subtitle — see SessionRow.displayName/subtitle and
+        // AppStore.setSessionTitle, which persists it onto the row.
         center?.handleTitleChange(sessionID: sessionID, title: title)
     }
 

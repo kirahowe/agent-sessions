@@ -114,7 +114,7 @@ final class AppActions {
             // resolved we scheduled the prompt, so the shortcut/menu item
             // did its job regardless of the user's choice.
             present {
-                if let name = self.dialogs.promptRename(currentName: row.name) {
+                if let name = self.dialogs.promptRename(currentName: row.displayName) {
                     self.store.renameSession(selection, to: name)
                 }
             }
