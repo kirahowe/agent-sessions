@@ -394,6 +394,30 @@ final class AppStore: ObservableObject {
         save()
     }
 
+    /// Reorders sessions within one sidebar bucket (project root or one
+    /// workspace). Cross-target moves are intentionally unsupported: the
+    /// sidebar only ever drags within the target-specific `ForEach`, and a
+    /// session's terminal working directory/identity is defined by its
+    /// existing `TargetRef`, not by drag destination.
+    func moveSessions(in target: TargetRef, fromOffsets: IndexSet, toOffset: Int) {
+        let targetIndices = sessions.indices.filter { sessions[$0].target == target }
+        guard !targetIndices.isEmpty else { return }
+
+        let targetSessions = targetIndices.map { sessions[$0] }
+        guard let reordered = reorderedTargetSessions(
+            targetSessions,
+            fromOffsets: fromOffsets,
+            toOffset: toOffset
+        ), reordered != targetSessions else {
+            return
+        }
+
+        for (globalIndex, session) in zip(targetIndices, reordered) {
+            sessions[globalIndex] = session
+        }
+        save()
+    }
+
     // MARK: - Navigation
 
     /// For each project in `projects` order: its root target, then its
@@ -570,5 +594,33 @@ final class AppStore: ObservableObject {
                 .max() ?? 0
             sessionCounters[target.id] = maxNumber + 1
         }
+    }
+
+    private func reorderedTargetSessions(
+        _ targetSessions: [SessionRow],
+        fromOffsets: IndexSet,
+        toOffset: Int
+    ) -> [SessionRow]? {
+        guard !fromOffsets.isEmpty else { return nil }
+        guard fromOffsets.allSatisfy(targetSessions.indices.contains),
+              (0...targetSessions.count).contains(toOffset)
+        else {
+            return nil
+        }
+
+        let movingSessions = fromOffsets.map { targetSessions[$0] }
+        var remainingSessions: [SessionRow] = []
+        remainingSessions.reserveCapacity(targetSessions.count - movingSessions.count)
+        for (index, session) in targetSessions.enumerated() where !fromOffsets.contains(index) {
+            remainingSessions.append(session)
+        }
+
+        let removedBeforeDestination = fromOffsets.count(in: 0..<toOffset)
+        let insertionIndex = min(
+            max(toOffset - removedBeforeDestination, 0),
+            remainingSessions.count
+        )
+        remainingSessions.insert(contentsOf: movingSessions, at: insertionIndex)
+        return remainingSessions
     }
 }

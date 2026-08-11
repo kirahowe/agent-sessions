@@ -11,12 +11,26 @@ struct SidebarView: View {
                     ForEach(store.sessions.filter { $0.target == .root(projectPath: project.path) }) { session in
                         SessionRowView(store: store, session: session, activity: store.sessionActivity[session.id])
                     }
+                    .onMove { offsets, destination in
+                        store.moveSessions(
+                            in: .root(projectPath: project.path),
+                            fromOffsets: offsets,
+                            toOffset: destination
+                        )
+                    }
 
                     ForEach(store.workspaces.filter { $0.projectPath == project.path }) { workspace in
                         WorkspaceRowView(store: store, workspace: workspace)
 
                         ForEach(sessions(in: workspace)) { session in
                             SessionRowView(store: store, session: session, activity: store.sessionActivity[session.id], indent: 16)
+                        }
+                        .onMove { offsets, destination in
+                            store.moveSessions(
+                                in: .workspace(projectPath: workspace.projectPath, name: workspace.name),
+                                fromOffsets: offsets,
+                                toOffset: destination
+                            )
                         }
                     }
                 } header: {

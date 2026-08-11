@@ -1463,4 +1463,91 @@ final class AppStoreTests: XCTestCase {
                        "the agent title must persist so the name is stable across relaunches")
         XCTAssertEqual(reloaded.displayName, "building the widget")
     }
+
+    // MARK: - 58
+
+    func test58_moveSessionsReordersOneProjectBucketWithoutDisturbingInterleavedTargets() {
+        let (store, _, _) = TestSupport.makeStore()
+        let pathA = "/tmp/proj-A"
+        let pathB = "/tmp/proj-B"
+        store.addProject(path: pathA) // A1
+        store.addProject(path: pathB) // B1
+        let projectA = store.projects.first { $0.path == pathA }!
+        store.newSession(in: projectA) // A2, globally after B1
+
+        store.moveSessions(
+            in: .root(projectPath: pathA),
+            fromOffsets: IndexSet(integer: 1),
+            toOffset: 0
+        )
+
+        let sessionsA = store.sessions
+            .filter { $0.target == .root(projectPath: pathA) }
+            .map(\.name)
+        XCTAssertEqual(sessionsA, ["Session 2", "Session 1"])
+        XCTAssertEqual(
+            store.sessions.map(\.projectPath),
+            [pathA, pathB, pathA],
+            "reordering a target should rewrite only that target's slots inside the persisted array"
+        )
+        XCTAssertEqual(
+            store.orderedSessions.map(\.name),
+            ["Session 2", "Session 1", "Session 1"],
+            "sidebar navigation order should follow the reordered bucket"
+        )
+    }
+
+    // MARK: - 59
+
+    func test59_moveSessionsPersistsWorkspaceOrderAcrossReload() async {
+        let fake = FakeWorkspaceEngine()
+        let (store1, _, url) = TestSupport.makeStore(engine: fake)
+        let path = "/tmp/proj-A"
+        store1.addProject(path: path)
+
+        fake.nextCreateResult = .success(
+            WorkspaceRow(projectPath: path, name: "ws-a", path: "/tmp/workspaces/ws-a", label: nil)
+        )
+        await store1.createWorkspace(in: path)
+        let target = TargetRef.workspace(projectPath: path, name: "ws-a")
+        store1.newSession(in: target) // Session 2
+        store1.newSession(in: target) // Session 3
+
+        store1.moveSessions(in: target, fromOffsets: IndexSet(integer: 2), toOffset: 0)
+
+        let store2 = AppStore(terminals: SpyTerminals(), stateURL: url, engine: fake)
+        let reloaded = store2.sessions
+            .filter { $0.target == target }
+            .map(\.name)
+        XCTAssertEqual(reloaded, ["Session 3", "Session 1", "Session 2"])
+    }
+
+    // MARK: - 60
+
+    func test60_moveSessionsRejectsUnknownTargetsInvalidOffsetsAndNoOpMoves() {
+        let (store, _, _) = TestSupport.makeStore()
+        let path = "/tmp/proj-A"
+        store.addProject(path: path)
+        let project = store.projects.first!
+        store.newSession(in: project)
+        store.newSession(in: project)
+        let target = TargetRef.root(projectPath: path)
+        let before = store.sessions
+
+        store.moveSessions(
+            in: .workspace(projectPath: path, name: "missing"),
+            fromOffsets: IndexSet(integer: 0),
+            toOffset: 0
+        )
+        XCTAssertEqual(store.sessions, before)
+
+        store.moveSessions(in: target, fromOffsets: IndexSet(integer: 9), toOffset: 0)
+        XCTAssertEqual(store.sessions, before)
+
+        store.moveSessions(in: target, fromOffsets: IndexSet(integer: 0), toOffset: 9)
+        XCTAssertEqual(store.sessions, before)
+
+        store.moveSessions(in: target, fromOffsets: IndexSet(integer: 1), toOffset: 2)
+        XCTAssertEqual(store.sessions, before, "moving an item to its current trailing slot should be a no-op")
+    }
 }
