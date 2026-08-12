@@ -30,7 +30,7 @@ struct RootView: View {
     var body: some View {
         NavigationSplitView {
             SidebarView(store: store)
-                .navigationSplitViewColumnWidth(min: 240, ideal: 280, max: 320)
+                .navigationSplitViewColumnWidth(min: 240, ideal: 280, max: .infinity)
         } detail: {
             // The terminal host must always be present in the tree — even
             // with no session selected — because reparenting or recreating
