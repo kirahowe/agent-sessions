@@ -9,6 +9,31 @@ configs:
   Debug: debug
   Release: release
 
+# The app's user-visible name, and the single source of truth for everything
+# that has to differ between a dev build and a release build. Defined at
+# project scope rather than on the Agents target because AgentsTests needs it
+# too, for TEST_HOST: the test host IS the app bundle, so the moment the
+# bundle's on-disk name became config-dependent, the test target had to be
+# able to spell that name as well.
+#
+# Consumed three ways, which must all agree — if they diverge, macOS shows a
+# name in one place that contradicts another:
+#   - CFBundleName / CFBundleDisplayName, via the Agents target's
+#     `info: properties:` below
+#   - WRAPPER_NAME, i.e. the .app directory name on disk
+#   - AgentsTests' TEST_HOST path
+#
+# Deliberately NOT plumbed through INFOPLIST_KEY_CFBundleDisplayName /
+# INFOPLIST_KEY_CFBundleName, which cannot override the CFBundleName key
+# xcodegen's `info:` block already bakes in — see the GENERATE_INFOPLIST_FILE
+# comment on the Agents target for the full story.
+settings:
+  configs:
+    Debug:
+      AGENTS_APP_DISPLAY_NAME: "Agents Dev"
+    Release:
+      AGENTS_APP_DISPLAY_NAME: "Agents"
+
 packages:
   libghostty-spm:
     url: https://github.com/Lakr233/libghostty-spm
@@ -33,7 +58,24 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.kirahowe.agents
+        # PRODUCT_NAME stays "Agents" in BOTH configs so the executable
+        # inside the bundle is always Contents/MacOS/Agents. Only the
+        # wrapper — the .app directory name, which is what macOS actually
+        # shows the user — varies by config, via WRAPPER_NAME below.
+        # Renaming the executable too would buy nothing visible while
+        # forcing every consumer of the binary path (CFBundleExecutable,
+        # AgentsTests' TEST_HOST) to become config-dependent as well.
         PRODUCT_NAME: Agents
+        # WRAPPER_NAME is what makes a dev build distinguishable from a
+        # release build in macOS's own UI. CFBundleName and
+        # CFBundleDisplayName alone are NOT enough: TCC permission prompts —
+        # and anything else that falls back to a bundle's filename rather
+        # than its Info.plist — showed both builds identically as
+        # "Agents.app", so a Documents/Desktop access prompt gave no clue
+        # which build had triggered it. Overriding the wrapper name (rather
+        # than PRODUCT_NAME) renames only the .app directory, leaving the
+        # executable and every path derived from it untouched.
+        WRAPPER_NAME: "$(AGENTS_APP_DISPLAY_NAME).app"
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
         MARKETING_VERSION: "0.1.0"
@@ -48,7 +90,7 @@ targets:
         # obvious — CFBundleName (from PRODUCT_NAME). That last one silently
         # clobbers this target's per-config CFBundleName override (Debug
         # needs "Agents Dev", but PRODUCT_NAME must stay "Agents" in both
-        # configs — see its own comment below). With NO, none of those three
+        # configs — see its own comment above). With NO, none of those three
         # get auto-populated, so all three are instead explicit
         # $(VAR)-substituted entries in `info: properties:` below — plain
         # Xcode variable substitution, which is unconditional in both
@@ -77,17 +119,13 @@ targets:
         CODE_SIGNING_REQUIRED: NO
         DEAD_CODE_STRIPPING: YES
       configs:
+        # AGENTS_APP_DISPLAY_NAME, which drives both the CFBundle*Name keys
+        # and WRAPPER_NAME above, is set per-config at PROJECT scope (top of
+        # this file) so AgentsTests can read it too.
         Debug:
           PRODUCT_BUNDLE_IDENTIFIER: com.kirahowe.agents.dev
-          # Consumed via $(AGENTS_APP_DISPLAY_NAME) in `info: properties:`
-          # below — NOT via INFOPLIST_KEY_CFBundleDisplayName/CFBundleName,
-          # which can't override the CFBundleName key xcodegen's `info:`
-          # block already bakes in (see the GENERATE_INFOPLIST_FILE comment
-          # above).
-          AGENTS_APP_DISPLAY_NAME: "Agents Dev"
         Release:
           PRODUCT_BUNDLE_IDENTIFIER: com.kirahowe.agents
-          AGENTS_APP_DISPLAY_NAME: "Agents"
     info:
       path: Info-Agents.plist
       properties:
@@ -122,7 +160,12 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.kirahowe.agents.tests
         SWIFT_VERSION: "5.0"
         GENERATE_INFOPLIST_FILE: YES
-        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/Agents.app/Contents/MacOS/Agents"
+        # The app bundle's directory name is config-dependent (see
+        # WRAPPER_NAME on the Agents target), so this can't hardcode
+        # "Agents.app" — the test scheme builds Debug, where the bundle is
+        # "Agents Dev.app". The executable inside it is named "Agents" in
+        # both configs, hence the plain trailing MacOS/Agents.
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/$(AGENTS_APP_DISPLAY_NAME).app/Contents/MacOS/Agents"
         BUNDLE_LOADER: "$(TEST_HOST)"
         CODE_SIGN_STYLE: Manual
         CODE_SIGN_IDENTITY: "-"

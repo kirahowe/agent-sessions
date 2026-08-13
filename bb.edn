@@ -8,9 +8,12 @@
                        "-scheme" "Agents" "-configuration" "Debug"
                        "-derivedDataPath" "macapp/.build" "build")}
 
+  ;; The Debug bundle is "Agents Dev.app", not "Agents.app" — the wrapper
+  ;; name is config-dependent so macOS can tell a dev build from a release
+  ;; one (see WRAPPER_NAME in macapp/project.yml).
   run {:doc "Build, then launch the built app"
        :depends [build]
-       :task (shell "open" "macapp/.build/Build/Products/Debug/Agents.app")}
+       :task (shell "open" "macapp/.build/Build/Products/Debug/Agents Dev.app")}
 
   test {:doc "Generate the project, then run the AgentsTests unit test suite"
         :depends [gen]
