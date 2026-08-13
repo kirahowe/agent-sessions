@@ -22,6 +22,30 @@ final class AppStore: ObservableObject {
     /// `SessionActivity`'s doc comment.
     @Published private(set) var sessionActivity: [String: SessionActivity] = [:]
 
+    /// Count of sessions currently `.blocked` — agents actively burning the
+    /// user's time waiting on a permission prompt, as opposed to `.yourTurn`
+    /// sessions, which can sit idle indefinitely with no cost to anyone.
+    /// Drives the Dock tile badge (see `dockBadgeLabel(blockedCount:)` below
+    /// and its application in RootView.swift) — `.yourTurn` is deliberately
+    /// excluded from the count for that same reason, so the badge only ever
+    /// screams about the state that's actually costing the user something by
+    /// going unnoticed.
+    var blockedSessionCount: Int {
+        sessionActivity.values.filter { $0 == .blocked }.count
+    }
+
+    /// Pure formatting for the Dock tile's badge label, pulled out as a
+    /// static so it's directly unit-testable without a running
+    /// `NSApplication` — see the call site in RootView.swift for why the
+    /// actual `NSApp.dockTile.badgeLabel` assignment has to happen in the
+    /// view layer instead of here. `nil` (not `"0"`) is the signal
+    /// `NSDockTile.badgeLabel` uses to mean "no badge at all"; returning the
+    /// string `"0"` for a zero count would instead show a badge that reads
+    /// "0", which is a worse resting state than no badge.
+    static func dockBadgeLabel(blockedCount: Int) -> String? {
+        blockedCount == 0 ? nil : "\(blockedCount)"
+    }
+
     let terminals: any SessionTerminating
     private let engine: any WorkspaceEngineProviding
 

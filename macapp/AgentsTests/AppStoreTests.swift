@@ -1550,4 +1550,108 @@ final class AppStoreTests: XCTestCase {
         store.moveSessions(in: target, fromOffsets: IndexSet(integer: 1), toOffset: 2)
         XCTAssertEqual(store.sessions, before, "moving an item to its current trailing slot should be a no-op")
     }
+
+    // MARK: - 61
+
+    func test61_blockedSessionCountIsZeroWithNoActivitySet() {
+        let (store, _, _) = TestSupport.makeStore()
+        store.addProject(path: "/tmp/proj-A")
+
+        XCTAssertEqual(
+            store.blockedSessionCount, 0,
+            "a freshly created session has no activity at all yet, so blockedSessionCount must read 0 — a nonzero count here would put a phantom badge on the Dock before any agent has ever reported being blocked"
+        )
+    }
+
+    // MARK: - 62
+
+    func test62_blockedSessionCountIgnoresYourTurnSessions() {
+        let (store, _, _) = TestSupport.makeStore()
+        store.addProject(path: "/tmp/proj-A")
+        let project = store.projects.first!
+        store.newSession(in: project)
+        store.newSession(in: project)
+        for session in store.sessions {
+            store.setSessionActivity(.yourTurn, for: session.id)
+        }
+
+        XCTAssertEqual(
+            store.blockedSessionCount, 0,
+            "sessions merely waiting for the user's next prompt (.yourTurn) can sit idle indefinitely at no cost, so they must never inflate blockedSessionCount — counting them would put an alarming Dock badge on the app for a state that isn't actually burning anyone's time"
+        )
+    }
+
+    // MARK: - 63
+
+    func test63_blockedSessionCountCountsOnlyBlockedAmongMixedActivity() {
+        let (store, _, _) = TestSupport.makeStore()
+        store.addProject(path: "/tmp/proj-A")
+        let project = store.projects.first!
+        store.newSession(in: project)
+        store.newSession(in: project)
+        let sessions = store.sessions
+        store.setSessionActivity(.blocked, for: sessions[0].id)
+        store.setSessionActivity(.yourTurn, for: sessions[1].id)
+        store.setSessionActivity(.blocked, for: sessions[2].id)
+
+        XCTAssertEqual(
+            store.blockedSessionCount, 2,
+            "blockedSessionCount must count only the .blocked entries among a mix of activity states — miscounting here means the Dock badge either undercounts real blockages the user hasn't noticed yet, or overcounts and cries wolf on sessions that are merely waiting on the user's own schedule"
+        )
+    }
+
+    // MARK: - 64
+
+    func test64_blockedSessionCountReflectsSeveralBlockedSessions() {
+        let (store, _, _) = TestSupport.makeStore()
+        store.addProject(path: "/tmp/proj-A")
+        let project = store.projects.first!
+        store.newSession(in: project)
+        store.newSession(in: project)
+        for session in store.sessions {
+            store.setSessionActivity(.blocked, for: session.id)
+        }
+
+        XCTAssertEqual(
+            store.blockedSessionCount, 3,
+            "every one of three sessions is .blocked, so blockedSessionCount must read 3 — the Dock badge exists precisely to surface how many agents are stuck waiting, and an undercount here would leave the user unaware some of them need attention"
+        )
+    }
+
+    // MARK: - 65
+
+    func test65_closingABlockedSessionDropsBlockedSessionCount() {
+        let (store, _, _) = TestSupport.makeStore()
+        store.addProject(path: "/tmp/proj-A")
+        let project = store.projects.first!
+        store.newSession(in: project)
+        let sessions = store.sessions
+        store.setSessionActivity(.blocked, for: sessions[0].id)
+        store.setSessionActivity(.blocked, for: sessions[1].id)
+        XCTAssertEqual(store.blockedSessionCount, 2)
+
+        store.closeSession(sessions[0].id)
+
+        XCTAssertEqual(
+            store.blockedSessionCount, 1,
+            "closing a blocked session must drop it out of blockedSessionCount immediately (pruneLiveSessionState already removes its sessionActivity entry) — otherwise the Dock badge would keep counting a session that no longer exists, permanently overstating how many agents actually need the user's attention"
+        )
+    }
+
+    // MARK: - 66
+
+    func test66_dockBadgeLabelIsNilForZeroAndTheCountOtherwise() {
+        XCTAssertNil(
+            AppStore.dockBadgeLabel(blockedCount: 0),
+            "a zero blocked count must produce nil, not the string \"0\" — nil is the value NSDockTile.badgeLabel treats as \"clear the badge\", so returning \"0\" here would leave a permanent, meaningless badge on the Dock icon at rest"
+        )
+        XCTAssertEqual(
+            AppStore.dockBadgeLabel(blockedCount: 1), "1",
+            "a single blocked session must render as the literal string \"1\" on the Dock badge"
+        )
+        XCTAssertEqual(
+            AppStore.dockBadgeLabel(blockedCount: 7), "7",
+            "dockBadgeLabel must pass an arbitrary blocked count straight through as its decimal string, so the Dock badge always shows the user exactly how many sessions are blocked rather than some capped or rounded approximation"
+        )
+    }
 }

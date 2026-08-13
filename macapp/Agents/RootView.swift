@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 struct RootView: View {
@@ -68,6 +69,24 @@ struct RootView: View {
         }
         .sheet(isPresented: $uiState.showShortcutHelp) {
             ShortcutHelpView()
+        }
+        // A blocked session is exactly the case where the user has stepped
+        // away from the app entirely (why else would an agent still be
+        // stuck on a permission prompt?), so the signal that matters most
+        // has to reach them somewhere they'll see it even unfocused — the
+        // Dock. This is applied here in the view layer, not from inside
+        // AppStore itself, specifically so AppStore can stay AppKit-free and
+        // unit-testable without a running NSApplication: `blockedSessionCount`
+        // and `dockBadgeLabel(blockedCount:)` are both plain, testable
+        // AppStore API, and this modifier is the one place their result
+        // actually touches `NSApp`. `initial: true` mirrors the same
+        // "covers launch" reasoning as AgentsApp's appearanceMode
+        // `.onChange` — without it the badge would only ever update starting
+        // from the first change to `blockedSessionCount` *after* this
+        // modifier attaches, rather than reflecting whatever count already
+        // holds at that moment.
+        .onChange(of: store.blockedSessionCount, initial: true) { _, count in
+            NSApp.dockTile.badgeLabel = AppStore.dockBadgeLabel(blockedCount: count)
         }
         .alert(
             "Workspace Error",

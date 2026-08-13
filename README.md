@@ -25,21 +25,39 @@ whenever you need it.
 
 ## Waiting indicators
 
-Sessions running Claude Code can show a coloured dot in the sidebar when they
+Sessions running Claude Code can show an indicator in the sidebar when they
 need you:
 
-- **Gold** — the agent finished its turn. Your move, but nothing is stuck.
-- **Red** — the agent is blocked on a permission prompt and is doing nothing
-  until you answer.
+- **Gold dot** — the agent finished its turn. Your move, but nothing is stuck.
+- **Red pulsing exclamation mark** — the agent is blocked on a permission
+  prompt and is doing nothing until you answer. Blocked sessions are also
+  counted on the Dock tile's badge, so they stay visible when the app isn't
+  focused.
 
-No dot means the agent is working (or the session isn't running an agent).
+No indicator means the agent is working (or the session isn't running an
+agent).
 
-The app can't detect this on its own, so `hooks/agents-status.sh` reports it
-from Claude Code's hooks. It writes an OSC 777 escape to the session's pty,
-which the app reads. Requires `jq`.
+The two states differ by shape and motion, not only by colour: a session that
+can wait indefinitely and one that is burning time deserve different urgency,
+and a hue-only difference is no difference at all to anyone with colour-vision
+deficiency. The pulse honours the system Reduce Motion setting — with it on,
+the blocked glyph renders statically.
+
+The app can't detect any of this on its own, so `hooks/agents-status.sh`
+reports it from Claude Code's hooks. It writes an OSC 777 escape to the
+session's pty, which the app reads. Requires `jq`.
+
+The script only emits when `AGENTS_APP` is set in its environment, which this
+app stamps into every terminal it spawns. That makes it safe to register
+globally, as below: in iTerm2, Terminal.app, or any other host, the hook sees
+no `AGENTS_APP` and exits without writing anything — which matters, because a
+terminal that renders OSC 777 as a real desktop notification would otherwise
+pop one on every single tool call.
 
 Wire it up in `~/.claude/settings.json`, using the **absolute** path to your
-clone — Claude Code does not expand `~` here:
+clone — Claude Code does not expand `~` here. If you already run another
+status script (an iTerm2 tab-colour hook, say), add this one alongside it as a
+second entry in the same `hooks` array rather than replacing it:
 
 ```json
 {
