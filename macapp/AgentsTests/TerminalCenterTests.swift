@@ -64,4 +64,27 @@ final class TerminalCenterTests: XCTestCase {
             "selection-foreground no longer matches Theme.Terminal.selectionForeground — the app has quietly lost its brand selection colour"
         )
     }
+
+    /// `TerminalCenter.sessionEnvVars` is the app's half of its contract with
+    /// `hooks/agents-status.sh`: that hook is registered globally in the
+    /// user's Claude Code settings (so it also runs for sessions hosted in
+    /// iTerm2 and every other terminal), and it refuses to emit its OSC 777
+    /// status escape unless it sees a non-empty `AGENTS_APP` in its
+    /// environment. If this static ever loses that key — or stops being
+    /// passed through to `TerminalSurfaceOptions.envVars` — the hook keeps
+    /// running exactly as before but silently exits before writing anything,
+    /// which means every session's sidebar status indicator (the gold/red
+    /// dot) simply stops updating, with nothing in this app's own logs to
+    /// explain why.
+    func testSessionEnvVarsStampsAGENTS_APP() {
+        let value = TerminalCenter.sessionEnvVars["AGENTS_APP"]
+        XCTAssertNotNil(
+            value,
+            "TerminalCenter.sessionEnvVars is missing AGENTS_APP — hooks/agents-status.sh gates its entire OSC 777 status escape on that variable, so every session's sidebar status indicator would silently stop updating with no error to point at why"
+        )
+        XCTAssertFalse(
+            value?.isEmpty ?? true,
+            "TerminalCenter.sessionEnvVars sets AGENTS_APP to an empty string — the hook's guard treats an unset-or-empty value identically, so this would disable every session's sidebar status indicator just as completely as dropping the key entirely"
+        )
+    }
 }

@@ -48,6 +48,25 @@ final class TerminalCenter: SessionTerminating {
         builder.withSelectionForeground(Theme.Terminal.selectionForeground)
     }
 
+    /// Extra environment variables stamped into every spawned session's
+    /// shell, via `TerminalSurfaceOptions.envVars`.
+    ///
+    /// Extracted to a static for the same reason as `terminalConfiguration`
+    /// above — so it can be asserted on directly in tests, see
+    /// `TerminalCenterTests`. This is the app's half of the contract with
+    /// `hooks/agents-status.sh`: that hook is registered globally in the
+    /// user's Claude Code settings, so it also runs for sessions hosted in
+    /// iTerm2 and every other terminal, and it refuses to emit its OSC 777
+    /// status escape unless `AGENTS_APP` is present in its environment —
+    /// that's the only signal it has for "I'm actually running inside the
+    /// Agents app." Dropping this static, or losing it from the options
+    /// passed to `TerminalSurfaceOptions` below, silently disables every
+    /// session's status indicator in the sidebar with no error to point at:
+    /// the hook just sees an unset variable and exits 0 before ever writing
+    /// its escape, so nothing in this app's logs would even hint at why the
+    /// dots stopped appearing.
+    static let sessionEnvVars: [String: String] = ["AGENTS_APP": "1"]
+
     /// Invoked with the session id after the underlying shell process exits
     /// and the terminal has already been torn down.
     var onProcessExit: ((String) -> Void)?
@@ -83,7 +102,8 @@ final class TerminalCenter: SessionTerminating {
         view.delegate = proxy
         view.configuration = TerminalSurfaceOptions(
             backend: .exec,
-            workingDirectory: workingDirectory
+            workingDirectory: workingDirectory,
+            envVars: Self.sessionEnvVars
         )
         // configSource/theme are left at their defaults (`.none`/`.default`)
         // deliberately — see the doc comment on `terminalConfiguration`
