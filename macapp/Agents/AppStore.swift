@@ -6,7 +6,9 @@ final class AppStore: ObservableObject {
     @Published var projects: [Project] = []
     @Published var sessions: [SessionRow] = []
     @Published var workspaces: [WorkspaceRow] = []
-    @Published var selection: String?
+    @Published var selection: String? {
+        didSet { updateAttention() }
+    }
     @Published var lastError: String?
     /// Set (instead of `lastError`) when `landWorkspace` fails with
     /// `.noTrunk` — that error is recoverable by creating the trunk bookmark
@@ -451,6 +453,78 @@ final class AppStore: ObservableObject {
     func apply(_ signal: AttentionSignal, to sessionID: String) {
         guard sessions.contains(where: { $0.id == sessionID }) else { return }
         attention[sessionID] = SessionAttention.reduce(attention[sessionID] ?? .init(), signal)
+    }
+
+    /// Whether the app itself is frontmost. AppStore stays AppKit-free (only
+    /// `Combine` and `Foundation` are imported at the top of this file, on
+    /// purpose — see the same reasoning applied to `blockedSessionCount` in
+    /// RootView.swift's Dock-badge comment), so it has no way to observe
+    /// NSApplication activation itself. The view layer feeds this in via
+    /// `setAppActive(_:)` from real `NSApplication.didBecomeActive`/
+    /// `didResignActive` notifications, plus one seed call at launch (see
+    /// RootView.swift's `.task`).
+    ///
+    /// Deliberately NOT `@Published`: nothing renders from this value
+    /// directly — it exists purely to feed `updateAttention()` below.
+    private(set) var isAppActive = false
+
+    /// Called by the view layer on NSApplication activate/resign, and once
+    /// at launch to seed the state neither notification fires for (see
+    /// RootView.swift). Guards on the actual change for the same reason
+    /// `updateAttention()` itself guards on the transition rather than the
+    /// input — see that method's doc comment.
+    func setAppActive(_ isActive: Bool) {
+        guard isAppActive != isActive else { return }
+        isAppActive = isActive
+        updateAttention()
+    }
+
+    /// The session currently attended, i.e. the one `.attentionChanged(true)`
+    /// was last sent for. Tracked separately from `selection` because
+    /// `updateAttention()` needs the PREVIOUS attended session, not just the
+    /// current one — `selection` alone can't answer "what was attended a
+    /// moment ago," and that's exactly what has to be un-attended below.
+    private var attendedSessionID: String?
+
+    /// The one place `.attentionChanged` is ever emitted — reached from two
+    /// independent inputs: `selection`'s `didSet` and `setAppActive(_:)`.
+    ///
+    /// The un-attend leg (the `if let previous` branch) is NOT optional. A
+    /// session that was attended when the user switched away must have
+    /// `isAttended` cleared, or every later notification for it would be
+    /// silently dropped forever as "they're already looking at it" (see
+    /// `SessionAttention.reduce`'s `.notification`/`.bell` cases) — that
+    /// row could never light up again for the rest of its life. This is the
+    /// single most consequential line in this stage.
+    ///
+    /// This keys on the session id and nothing coarser — never the project
+    /// or workspace it belongs to. cmux (#5095) auto-withdrew attention at a
+    /// level coarser than the unit of attention and silently ate
+    /// notifications for a second, unattended agent sharing the same
+    /// container; the unit of attention here is one session, full stop (see
+    /// design/session-attention.md section D).
+    ///
+    /// The guard is on the TRANSITION (`next != attendedSessionID`), not on
+    /// each input, because `didSet` fires on same-value writes too (SwiftUI's
+    /// sidebar rewrites `selection` through the `List` binding even when the
+    /// value doesn't change) and this function is reached from two
+    /// independent call sites — without the guard, a same-value selection
+    /// write or a redundant `setAppActive` call would re-run the un-attend/
+    /// attend pair on a session nothing actually changed for.
+    ///
+    /// The stale-id case needs no special handling here: `apply(_:to:)`
+    /// above already ignores ids with no live session, so an un-attend aimed
+    /// at a session that was just closed is a harmless no-op.
+    private func updateAttention() {
+        let next = isAppActive ? selection : nil
+        guard next != attendedSessionID else { return }
+        if let previous = attendedSessionID {
+            apply(.attentionChanged(isAttended: false), to: previous)
+        }
+        attendedSessionID = next
+        if let next {
+            apply(.attentionChanged(isAttended: true), to: next)
+        }
     }
 
     /// Records a session's latest agent-set OSC terminal title onto its row

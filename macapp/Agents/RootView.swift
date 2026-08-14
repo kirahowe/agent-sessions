@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import SwiftUI
 
 struct RootView: View {
@@ -58,6 +59,15 @@ struct RootView: View {
         .navigationTitle(windowTitle)
         .navigationSubtitle(windowSubtitle)
         .task {
+            // Seeds the app-active flag with whatever state already holds at
+            // launch: NSApplication.didBecomeActive/didResignActive (below)
+            // only fire on a SUBSEQUENT transition, so without this, a
+            // session that's already selected when the app launches active
+            // would sit un-attended until the user clicked away and back.
+            // Same "covers launch" reasoning as the Dock badge's
+            // `initial: true` and AgentsApp's appearanceMode `.onChange`.
+            store.setAppActive(NSApp.isActive)
+
             // Runs once at launch: a non-blocking, informational check for
             // bb/jj. Terminals work fine without either — only workspace
             // operations need them — so a miss here only queues an alert,
@@ -66,6 +76,22 @@ struct RootView: View {
             if !missing.isEmpty {
                 uiState.missingToolsNotice = ToolPreflight.guidance(for: missing)
             }
+        }
+        // Feeds NSApplication's real active state into the store, in the
+        // view layer for exactly the reason the Dock-badge `.onChange`
+        // below already documents: AppStore stays AppKit-free and
+        // unit-testable without a running NSApplication, so it can't
+        // observe these notifications itself — it just owns the plain
+        // `isAppActive` Bool and `setAppActive(_:)` setter, and this is the
+        // one place that setter actually gets called from real activation
+        // events. The `.task` above seeds the state these notifications
+        // don't cover: neither fires for whatever the app's active state
+        // already is at the moment this view attaches.
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            store.setAppActive(true)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didResignActiveNotification)) { _ in
+            store.setAppActive(false)
         }
         .sheet(isPresented: $uiState.showShortcutHelp) {
             ShortcutHelpView()

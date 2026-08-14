@@ -1974,4 +1974,177 @@ final class AppStoreTests: XCTestCase {
             "the Dock badge must count a session blocked by classification exactly the same as one blocked by the hook — a badge that only reacts to the hook path would undercount for every agent that doesn't have it installed"
         )
     }
+
+    // MARK: - 79
+
+    func test79_selectingASessionWhoseIndicatorWasRaisedByClassificationClearsIt() {
+        let (store, spy, _) = TestSupport.makeStore()
+        store.addProject(path: "/tmp/proj-A")
+        let target = store.sessions.first!
+        store.newSession(in: store.projects.first!)
+        let other = store.sessions.first { $0.id != target.id }!
+        XCTAssertEqual(store.selection, other.id)
+        store.setAppActive(true)
+
+        spy.onSessionSignal?(target.id, .notification(title: "Claude Code", body: "Claude is waiting for your input"))
+        XCTAssertEqual(store.attention[target.id]?.activity, .yourTurn, "the setup must actually raise the indicator before this test can prove selecting it clears one")
+
+        store.selection = target.id
+
+        XCTAssertNil(
+            store.attention[target.id]?.activity,
+            "selecting a session whose gold dot came from classifying a free-text notification must clear it — the hook isn't installed here, so 'looked at it' is the only honest signal available that the user has seen it"
+        )
+    }
+
+    // MARK: - 80
+
+    func test80_selectingASessionWhoseBlockedCameFromTheHookDoesNotClearIt() {
+        let (store, _, _) = TestSupport.makeStore()
+        store.addProject(path: "/tmp/proj-A")
+        let target = store.sessions.first!
+        store.newSession(in: store.projects.first!)
+        let other = store.sessions.first { $0.id != target.id }!
+        XCTAssertEqual(store.selection, other.id)
+        store.setAppActive(true)
+
+        store.apply(.structured(.set(.blocked)), to: target.id)
+
+        store.selection = target.id
+
+        XCTAssertEqual(
+            store.attention[target.id]?.activity, .blocked,
+            "selecting a session the hook has reported as genuinely still blocked must not clear the red pulse — going dark while a permission prompt is actually still open would be a lie the user could act on by walking away"
+        )
+    }
+
+    // MARK: - 81
+
+    func test81_notificationForTheCurrentlyAttendedSessionIsDropped() {
+        let (store, spy, _) = TestSupport.makeStore()
+        store.addProject(path: "/tmp/proj-A")
+        let session = store.sessions.first!
+        store.setAppActive(true)
+        XCTAssertEqual(store.attention[session.id]?.isAttended, true)
+
+        spy.onSessionSignal?(session.id, .notification(title: "Claude Code", body: "Claude needs your permission to use Bash"))
+
+        XCTAssertNil(
+            store.attention[session.id]?.activity,
+            "a notification for the session already on screen must not raise an indicator — there's no later selection change to ever clear it, so a raise here would light the row forever"
+        )
+    }
+
+    // MARK: - 82
+
+    func test82_notificationForASelectedSessionWithAppNotFrontmostRaises() {
+        let (store, spy, _) = TestSupport.makeStore()
+        store.addProject(path: "/tmp/proj-A")
+        let session = store.sessions.first!
+        // Deliberately never calling setAppActive(true): the session is
+        // selected but the user has switched to another app entirely, which
+        // is exactly the case they need the indicator for.
+
+        spy.onSessionSignal?(session.id, .notification(title: "Claude Code", body: "Claude is waiting for your input"))
+
+        XCTAssertEqual(
+            store.attention[session.id]?.activity, .yourTurn,
+            "a notification for a selected session must still raise when the app itself isn't frontmost — this is the case the user actually needs the indicator for, since they're away from the app and can't see the row is selected"
+        )
+    }
+
+    // MARK: - 83
+
+    /// The regression that matters most in this stage: if the un-attend leg
+    /// of `AppStore.updateAttention()` were ever dropped, `isAttended` would
+    /// stay true forever after this resign, and `SessionAttention.reduce`
+    /// would keep silently swallowing every future notification for this
+    /// session as "they're already looking at it" — the row could never
+    /// light up again.
+    func test83_resigningAppActiveAfterAttendingLetsANotificationRaiseAgain() {
+        let (store, spy, _) = TestSupport.makeStore()
+        store.addProject(path: "/tmp/proj-A")
+        let session = store.sessions.first!
+        store.setAppActive(true)
+        XCTAssertEqual(store.attention[session.id]?.isAttended, true)
+
+        store.setAppActive(false)
+
+        spy.onSessionSignal?(session.id, .notification(title: "Claude Code", body: "Claude is waiting for your input"))
+
+        XCTAssertEqual(
+            store.attention[session.id]?.activity, .yourTurn,
+            "a notification arriving after the app resigns active must raise, even though this exact session was attended a moment ago — a missing un-attend here would leave isAttended stuck true and silently drop every notification for this session for the rest of its life"
+        )
+    }
+
+    // MARK: - 84
+
+    func test84_switchingSelectionUnattendsTheOldSessionAndAttendsTheNew() {
+        let (store, spy, _) = TestSupport.makeStore()
+        store.addProject(path: "/tmp/proj-A")
+        let sessionA = store.sessions.first!
+        store.setAppActive(true)
+        XCTAssertEqual(store.attention[sessionA.id]?.isAttended, true)
+
+        // newSession both creates B and selects it, which is the selection
+        // change under test — A is no longer `store.selection` afterward.
+        store.newSession(in: store.projects.first!)
+        XCTAssertNotEqual(store.selection, sessionA.id)
+
+        spy.onSessionSignal?(sessionA.id, .notification(title: "Claude Code", body: "Claude is waiting for your input"))
+
+        XCTAssertEqual(
+            store.attention[sessionA.id]?.activity, .yourTurn,
+            "moving selection away from A must un-attend it — if A were still marked attended after the switch, this notification would be silently dropped instead of raising"
+        )
+    }
+
+    // MARK: - 85
+
+    /// cmux (#5095) auto-withdrew attention at a level coarser than the unit
+    /// of attention (a whole container, not the one session inside it the
+    /// user was actually looking at) and silently ate notifications for a
+    /// second, unattended agent sharing that container. This is the same
+    /// shape here: two sessions share a project, only one is selected, and
+    /// the other must still be able to raise.
+    func test85_attendingOneSessionDoesNotSuppressAnUnselectedSiblingInTheSameProject() {
+        let (store, spy, _) = TestSupport.makeStore()
+        store.addProject(path: "/tmp/proj-A")
+        let sessionA = store.sessions.first!
+        store.newSession(in: store.projects.first!)
+        let sessionB = store.sessions.first { $0.id != sessionA.id }!
+        XCTAssertEqual(sessionB.projectPath, sessionA.projectPath, "both sessions must share a project for this to test granularity at all")
+
+        store.selection = sessionA.id
+        store.setAppActive(true)
+        XCTAssertEqual(store.attention[sessionA.id]?.isAttended, true)
+
+        spy.onSessionSignal?(sessionB.id, .notification(title: "Claude Code", body: "Claude needs your permission to use Bash"))
+
+        XCTAssertEqual(
+            store.attention[sessionB.id]?.activity, .blocked,
+            "attention must never be withdrawn at a level coarser than one session — B sharing a project with the attended A must not suppress B's own notification"
+        )
+    }
+
+    // MARK: - 86
+
+    func test86_withAppActiveNeverSeededSelectionChangesAttendNothing() {
+        let (store, spy, _) = TestSupport.makeStore()
+        store.addProject(path: "/tmp/proj-A")
+        let sessionA = store.sessions.first!
+        store.newSession(in: store.projects.first!)
+        // Selection churns twice, but setAppActive(_:) is never called at
+        // all — simulating what would happen if RootView's launch seed
+        // (`store.setAppActive(NSApp.isActive)`) never ran.
+        store.selection = sessionA.id
+
+        spy.onSessionSignal?(sessionA.id, .notification(title: "Claude Code", body: "Claude is waiting for your input"))
+
+        XCTAssertEqual(
+            store.attention[sessionA.id]?.activity, .yourTurn,
+            "selection changes alone must never attend a session — without the app-active flag ever being set true, a notification for the selected session must still raise, or a store that never received the seed call would silently swallow every notification for whatever happens to be selected"
+        )
+    }
 }
