@@ -1270,98 +1270,108 @@ final class AppStoreTests: XCTestCase {
 
     // MARK: - 45
 
-    func test45_setSessionActivityOnRealSessionIsReadableViaStore() {
+    func test45_applyStructuredSetOnRealSessionIsReadableViaStore() {
         let (store, _, _) = TestSupport.makeStore()
         store.addProject(path: "/tmp/proj-A")
         let session = store.sessions.first!
 
-        store.setSessionActivity(.blocked, for: session.id)
+        store.apply(.structured(.set(.blocked)), to: session.id)
 
-        XCTAssertEqual(store.sessionActivity[session.id], .blocked)
+        XCTAssertEqual(store.attention[session.id]?.activity, .blocked)
     }
 
     // MARK: - 46
 
-    func test46_setSessionActivityNilClearsEntry() {
+    func test46_applyStructuredClearClearsActivityButLeavesTheLatchedEntry() {
         let (store, _, _) = TestSupport.makeStore()
         store.addProject(path: "/tmp/proj-A")
         let session = store.sessions.first!
-        store.setSessionActivity(.yourTurn, for: session.id)
+        store.apply(.structured(.set(.yourTurn)), to: session.id)
 
-        store.setSessionActivity(nil, for: session.id)
+        store.apply(.structured(.clear), to: session.id)
 
-        XCTAssertNil(store.sessionActivity[session.id])
+        XCTAssertNil(store.attention[session.id]?.activity)
+        // Unlike the old setSessionActivity(nil:) API, a structured clear
+        // does NOT remove the dictionary entry — it leaves an AttentionState
+        // with a nil activity and isStructured still true. That latch is the
+        // whole point: it's what keeps a later unstructured notification
+        // (e.g. a stray bell) from reclassifying a session the hook has
+        // already proven it's authoritative for.
+        XCTAssertEqual(
+            store.attention[session.id]?.isStructured, true,
+            "a structured clear must latch isStructured just like a structured set — losing that would let an unstructured signal reclassify a session the hook already speaks for"
+        )
     }
 
     // MARK: - 47
 
-    func test47_setSessionActivityUnknownIDIsIgnored() {
+    func test47_applyStructuredUnknownIDIsIgnored() {
         let (store, _, _) = TestSupport.makeStore()
         store.addProject(path: "/tmp/proj-A")
 
-        store.setSessionActivity(.blocked, for: "not-a-real-id")
+        store.apply(.structured(.set(.blocked)), to: "not-a-real-id")
 
-        XCTAssertTrue(store.sessionActivity.isEmpty)
+        XCTAssertTrue(store.attention.isEmpty)
     }
 
     // MARK: - 48
 
-    func test48_closingSessionDropsItsActivityEntry() {
+    func test48_closingSessionDropsItsAttentionEntry() {
         let (store, _, _) = TestSupport.makeStore()
         store.addProject(path: "/tmp/proj-A")
         let session = store.sessions.first!
-        store.setSessionActivity(.blocked, for: session.id)
+        store.apply(.structured(.set(.blocked)), to: session.id)
 
         store.closeSession(session.id)
 
-        XCTAssertNil(store.sessionActivity[session.id])
+        XCTAssertNil(store.attention[session.id])
     }
 
     // MARK: - 49
 
-    func test49_removeProjectDropsActivityForAllItsSessions() {
+    func test49_removeProjectDropsAttentionForAllItsSessions() {
         let (store, _, _) = TestSupport.makeStore()
         let path = "/tmp/proj-A"
         store.addProject(path: path)
         store.newSession(in: store.projects.first!)
         let sessions = store.sessions.filter { $0.projectPath == path }
         for session in sessions {
-            store.setSessionActivity(.yourTurn, for: session.id)
+            store.apply(.structured(.set(.yourTurn)), to: session.id)
         }
-        XCTAssertEqual(store.sessionActivity.count, sessions.count)
+        XCTAssertEqual(store.attention.count, sessions.count)
 
         store.removeProject(store.projects.first!)
 
-        XCTAssertTrue(store.sessionActivity.isEmpty)
+        XCTAssertTrue(store.attention.isEmpty)
     }
 
     // MARK: - 50
 
-    func test50_activityDoesNotSurviveSaveReloadRoundTrip() {
+    func test50_attentionDoesNotSurviveSaveReloadRoundTrip() {
         let url = TestSupport.freshStateURL()
         let spy1 = SpyTerminals()
         let store1 = AppStore(terminals: spy1, stateURL: url)
         store1.addProject(path: "/tmp/proj-A")
         let session = store1.sessions.first!
-        store1.setSessionActivity(.blocked, for: session.id)
-        XCTAssertFalse(store1.sessionActivity.isEmpty)
+        store1.apply(.structured(.set(.blocked)), to: session.id)
+        XCTAssertFalse(store1.attention.isEmpty)
 
         let spy2 = SpyTerminals()
         let store2 = AppStore(terminals: spy2, stateURL: url)
 
-        XCTAssertTrue(store2.sessionActivity.isEmpty, "activity must never be persisted")
+        XCTAssertTrue(store2.attention.isEmpty, "attention must never be persisted")
     }
 
     // MARK: - 51
 
-    func test51_onSessionActivityCallbackWiredInInitReachesStore() {
+    func test51_onSessionSignalCallbackWiredInInitReachesStore() {
         let (store, spy, _) = TestSupport.makeStore()
         store.addProject(path: "/tmp/proj-A")
         let session = store.sessions.first!
 
-        spy.onSessionActivity?(session.id, .blocked)
+        spy.onSessionSignal?(session.id, .structured(.set(.blocked)))
 
-        XCTAssertEqual(store.sessionActivity[session.id], .blocked)
+        XCTAssertEqual(store.attention[session.id]?.activity, .blocked)
     }
 
     // MARK: - 52
@@ -1572,7 +1582,7 @@ final class AppStoreTests: XCTestCase {
         store.newSession(in: project)
         store.newSession(in: project)
         for session in store.sessions {
-            store.setSessionActivity(.yourTurn, for: session.id)
+            store.apply(.structured(.set(.yourTurn)), to: session.id)
         }
 
         XCTAssertEqual(
@@ -1590,9 +1600,9 @@ final class AppStoreTests: XCTestCase {
         store.newSession(in: project)
         store.newSession(in: project)
         let sessions = store.sessions
-        store.setSessionActivity(.blocked, for: sessions[0].id)
-        store.setSessionActivity(.yourTurn, for: sessions[1].id)
-        store.setSessionActivity(.blocked, for: sessions[2].id)
+        store.apply(.structured(.set(.blocked)), to: sessions[0].id)
+        store.apply(.structured(.set(.yourTurn)), to: sessions[1].id)
+        store.apply(.structured(.set(.blocked)), to: sessions[2].id)
 
         XCTAssertEqual(
             store.blockedSessionCount, 2,
@@ -1609,7 +1619,7 @@ final class AppStoreTests: XCTestCase {
         store.newSession(in: project)
         store.newSession(in: project)
         for session in store.sessions {
-            store.setSessionActivity(.blocked, for: session.id)
+            store.apply(.structured(.set(.blocked)), to: session.id)
         }
 
         XCTAssertEqual(
@@ -1626,15 +1636,15 @@ final class AppStoreTests: XCTestCase {
         let project = store.projects.first!
         store.newSession(in: project)
         let sessions = store.sessions
-        store.setSessionActivity(.blocked, for: sessions[0].id)
-        store.setSessionActivity(.blocked, for: sessions[1].id)
+        store.apply(.structured(.set(.blocked)), to: sessions[0].id)
+        store.apply(.structured(.set(.blocked)), to: sessions[1].id)
         XCTAssertEqual(store.blockedSessionCount, 2)
 
         store.closeSession(sessions[0].id)
 
         XCTAssertEqual(
             store.blockedSessionCount, 1,
-            "closing a blocked session must drop it out of blockedSessionCount immediately (pruneLiveSessionState already removes its sessionActivity entry) — otherwise the Dock badge would keep counting a session that no longer exists, permanently overstating how many agents actually need the user's attention"
+            "closing a blocked session must drop it out of blockedSessionCount immediately (pruneLiveSessionState already removes its attention entry) — otherwise the Dock badge would keep counting a session that no longer exists, permanently overstating how many agents actually need the user's attention"
         )
     }
 
@@ -1915,5 +1925,53 @@ final class AppStoreTests: XCTestCase {
         XCTAssertTrue(spy.closedIDs.contains(wsSessionID), "the land's own teardown must still have happened")
         XCTAssertFalse(store.sessions.contains { $0.id == wsSessionID })
         XCTAssertFalse(store.workspaces.contains { $0.id == wsRow.id }, "the land itself must still read as successful")
+    }
+
+    // MARK: - 76
+
+    /// This is the headline win of the whole design: an agent that never
+    /// installed `hooks/agents-status.sh` — the common case for anyone who
+    /// isn't a clone of this repo — still lights up the sidebar, purely off
+    /// a free-text OSC notification classified by `AttentionClassifier`.
+    func test76_freeTextNotificationViaOnSessionSignalRaisesAnIndicatorWithNoHookInvolved() {
+        let (store, spy, _) = TestSupport.makeStore()
+        store.addProject(path: "/tmp/proj-A")
+        let session = store.sessions.first!
+
+        spy.onSessionSignal?(session.id, .notification(title: "Claude Code", body: "Claude needs your permission to use Bash"))
+
+        XCTAssertEqual(
+            store.attention[session.id]?.activity, .blocked,
+            "a permission-prompt notification from an agent with no hook installed must still raise the red indicator — otherwise the entire point of this stage (lighting up agents that never ran the hook) silently doesn't work"
+        )
+    }
+
+    // MARK: - 77
+
+    func test77_freeTextNotificationForUnknownSessionIsIgnored() {
+        let (store, spy, _) = TestSupport.makeStore()
+        store.addProject(path: "/tmp/proj-A")
+
+        spy.onSessionSignal?("not-a-real-id", .notification(title: "Claude Code", body: "Claude is waiting for your input"))
+
+        XCTAssertTrue(
+            store.attention.isEmpty,
+            "a notification racing a session's own teardown must be a harmless no-op, not a phantom entry keyed on an id nothing in the sidebar can ever look up again"
+        )
+    }
+
+    // MARK: - 78
+
+    func test78_blockedSessionCountCountsAClassifiedBlockJustLikeAHookBlock() {
+        let (store, spy, _) = TestSupport.makeStore()
+        store.addProject(path: "/tmp/proj-A")
+        let session = store.sessions.first!
+
+        spy.onSessionSignal?(session.id, .notification(title: "Claude Code", body: "Claude needs your permission to use Bash"))
+
+        XCTAssertEqual(
+            store.blockedSessionCount, 1,
+            "the Dock badge must count a session blocked by classification exactly the same as one blocked by the hook — a badge that only reacts to the hook path would undercount for every agent that doesn't have it installed"
+        )
     }
 }

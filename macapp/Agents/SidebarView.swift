@@ -9,7 +9,7 @@ struct SidebarView: View {
             ForEach(store.projects) { project in
                 Section {
                     ForEach(store.sessions.filter { $0.target == .root(projectPath: project.path) }) { session in
-                        SessionRowView(store: store, session: session, activity: store.sessionActivity[session.id])
+                        SessionRowView(store: store, session: session, activity: store.attention[session.id]?.activity)
                     }
                     .onMove { offsets, destination in
                         store.moveSessions(
@@ -23,7 +23,7 @@ struct SidebarView: View {
                         WorkspaceRowView(store: store, workspace: workspace)
 
                         ForEach(sessions(in: workspace)) { session in
-                            SessionRowView(store: store, session: session, activity: store.sessionActivity[session.id], indent: 16)
+                            SessionRowView(store: store, session: session, activity: store.attention[session.id]?.activity, indent: 16)
                         }
                         .onMove { offsets, destination in
                             store.moveSessions(

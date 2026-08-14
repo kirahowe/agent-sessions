@@ -6,15 +6,19 @@ import Foundation
 @MainActor
 protocol SessionTerminating: AnyObject {
     var onProcessExit: ((String) -> Void)? { get set }
-    /// Fired when a session's terminal reports an activity-status change
-    /// (parsed from a Claude Code hook's OSC notification — see
-    /// `SessionActivity.parseStatusMessage`). A nil activity means "clear
-    /// this session's indicator." Mirrors `onProcessExit`'s per-session,
-    /// callback-based seam so `AppStore` can be tested against a spy without
-    /// any real terminal machinery.
-    var onSessionActivity: ((String, SessionActivity?) -> Void)? { get set }
+    /// Fired whenever a session's terminal reports anything that could bear
+    /// on attention state — a structured `agents:status` payload, a
+    /// free-text desktop notification, a bell, and so on (see
+    /// `AttentionSignal`). The proxy no longer parses or decides anything
+    /// itself: it only translates a delegate callback into a signal and
+    /// forwards it. All interpretation — classification, the structured
+    /// latch, attended-suppression — lives in `SessionAttention.reduce`.
+    /// Mirrors `onProcessExit`'s per-session, callback-based seam so
+    /// `AppStore` can be tested against a spy without any real terminal
+    /// machinery.
+    var onSessionSignal: ((String, AttentionSignal) -> Void)? { get set }
     /// Fired when a session's terminal reports a new OSC window-title string
-    /// (sessionID, title). Mirrors `onSessionActivity`'s per-session,
+    /// (sessionID, title). Mirrors `onSessionSignal`'s per-session,
     /// callback-based seam so `AppStore` can be tested against a spy without
     /// any real terminal machinery. A blank/whitespace-only title is IGNORED
     /// downstream (see AppStore.setSessionTitle): "remember the last title"

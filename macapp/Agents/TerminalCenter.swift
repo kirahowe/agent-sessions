@@ -71,11 +71,10 @@ final class TerminalCenter: SessionTerminating {
     /// and the terminal has already been torn down.
     var onProcessExit: ((String) -> Void)?
 
-    /// Invoked with the session id and parsed activity whenever a session's
-    /// terminal reports (or clears) a status via
-    /// `SessionDelegateProxy.terminalDidRequestDesktopNotification`. A nil
-    /// activity means "clear."
-    var onSessionActivity: ((String, SessionActivity?) -> Void)?
+    /// Invoked with the session id and an `AttentionSignal` whenever a
+    /// session's terminal reports something that could bear on attention
+    /// state, via `SessionDelegateProxy`. See `SessionTerminating.onSessionSignal`.
+    var onSessionSignal: ((String, AttentionSignal) -> Void)?
 
     /// Invoked with the session id and new title whenever a session's
     /// terminal reports an OSC window-title change via
@@ -133,15 +132,15 @@ final class TerminalCenter: SessionTerminating {
         onProcessExit?(sessionID)
     }
 
-    /// Called by a session's delegate proxy when it parses a recognised
-    /// `agents:status` notification off the tty. Just forwards — no
-    /// terminal-lifecycle teardown needed here, unlike `handleProcessExit`.
-    func handleSessionActivity(sessionID: String, activity: SessionActivity?) {
-        onSessionActivity?(sessionID, activity)
+    /// Called by a session's delegate proxy with any signal that could bear
+    /// on attention state. Just forwards — no terminal-lifecycle teardown
+    /// needed here, unlike `handleProcessExit`.
+    func handleSessionSignal(sessionID: String, signal: AttentionSignal) {
+        onSessionSignal?(sessionID, signal)
     }
 
     /// Called by a session's delegate proxy when the shell reports a new OSC
-    /// window title. Just forwards — same reasoning as `handleSessionActivity`.
+    /// window title. Just forwards — same reasoning as `handleSessionSignal`.
     func handleTitleChange(sessionID: String, title: String) {
         onTitleChange?(sessionID, title)
     }
@@ -180,20 +179,17 @@ final class SessionDelegateProxy: TerminalSurfaceTitleDelegate, TerminalSurfaceC
     /// all the registration this proxy needs — nothing else has to opt it
     /// in.
     ///
-    /// A nil parse result means a genuine desktop notification from some
-    /// other program running in the shell (e.g. an npm build finishing) —
-    /// the app doesn't surface those at all today, so ignoring it here is
-    /// correct for now, not a silent drop of something we should have
-    /// handled.
+    /// A nil parse result means this notification isn't the structured
+    /// `agents:status` protocol — either a genuine desktop notification from
+    /// some other program in the shell (e.g. an npm build finishing), or an
+    /// agent's own free-text turn/permission notification. This stage keeps
+    /// behaviour identical to today and drops that case unhandled; routing
+    /// it as `AttentionSignal.notification` for `AttentionClassifier` to
+    /// score is the next stage, not this one.
     func terminalDidRequestDesktopNotification(title: String, body: String) {
         guard let message = SessionActivity.parseStatusMessage(title: title, body: body) else {
             return
         }
-        switch message {
-        case .set(let activity):
-            center?.handleSessionActivity(sessionID: sessionID, activity: activity)
-        case .clear:
-            center?.handleSessionActivity(sessionID: sessionID, activity: nil)
-        }
+        center?.handleSessionSignal(sessionID: sessionID, signal: .structured(message))
     }
 }

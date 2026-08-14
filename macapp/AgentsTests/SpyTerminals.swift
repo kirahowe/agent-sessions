@@ -7,13 +7,13 @@ import Foundation
 @MainActor
 final class SpyTerminals: SessionTerminating {
     var onProcessExit: ((String) -> Void)?
-    /// Tests fire this directly (`spy.onSessionActivity?(id, .blocked)`) to
-    /// simulate a terminal reporting a status change, the same way
+    /// Tests fire this directly (`spy.onSessionSignal?(id, .structured(.set(.blocked)))`)
+    /// to simulate a terminal reporting an attention signal, the same way
     /// `onProcessExit` simulates process exit.
-    var onSessionActivity: ((String, SessionActivity?) -> Void)?
+    var onSessionSignal: ((String, AttentionSignal) -> Void)?
     /// Tests fire this directly (`spy.onTitleChange?(id, "building...")`) to
     /// simulate a terminal reporting an OSC title change, the same way
-    /// `onSessionActivity` simulates a status change.
+    /// `onSessionSignal` simulates an attention signal.
     var onTitleChange: ((String, String) -> Void)?
     private(set) var closedIDs: [String] = []
 

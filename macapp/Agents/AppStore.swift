@@ -14,13 +14,15 @@ final class AppStore: ObservableObject {
     /// dead-end error message. Carries the original workspace id + message
     /// so the retry doesn't require the user to retype anything.
     @Published var pendingTrunkBootstrap: (workspaceID: String, message: String?)?
-    /// What each live session's agent is currently doing, as reported by
-    /// Claude Code hooks via desktop-notification OSC sequences (see
-    /// `SessionActivity`). Deliberately NOT part of `PersistedState`/
-    /// `save()`/`load()`: this describes a live process's current state,
-    /// which has no meaningful value to restore after a relaunch — see
+    /// What each live session's agent is currently doing, resolved from
+    /// every signal source (structured hook payloads, classified free-text
+    /// notifications, bells, and the user's own focus) by
+    /// `SessionAttention.reduce` — see `apply(_:to:)`, the only place this
+    /// is written. Deliberately NOT part of `PersistedState`/`save()`/
+    /// `load()`: this describes a live process's current state, which has
+    /// no meaningful value to restore after a relaunch — see
     /// `SessionActivity`'s doc comment.
-    @Published private(set) var sessionActivity: [String: SessionActivity] = [:]
+    @Published private(set) var attention: [String: AttentionState] = [:]
 
     /// Count of sessions currently `.blocked` — agents actively burning the
     /// user's time waiting on a permission prompt, as opposed to `.yourTurn`
@@ -31,7 +33,7 @@ final class AppStore: ObservableObject {
     /// screams about the state that's actually costing the user something by
     /// going unnoticed.
     var blockedSessionCount: Int {
-        sessionActivity.values.filter { $0 == .blocked }.count
+        attention.values.filter { $0.activity == .blocked }.count
     }
 
     /// Pure formatting for the Dock tile's badge label, pulled out as a
@@ -107,8 +109,8 @@ final class AppStore: ObservableObject {
         terminals.onProcessExit = { [weak self] id in
             self?.closeSession(id)
         }
-        terminals.onSessionActivity = { [weak self] id, activity in
-            self?.setSessionActivity(activity, for: id)
+        terminals.onSessionSignal = { [weak self] id, signal in
+            self?.apply(signal, to: id)
         }
         terminals.onTitleChange = { [weak self] id, title in
             self?.setSessionTitle(title, for: id)
@@ -440,18 +442,15 @@ final class AppStore: ObservableObject {
         save()
     }
 
-    /// Sets (or, when `activity` is nil, clears) a session's activity
-    /// indicator. Ignores ids with no matching row in `sessions` — a status
-    /// update racing that session's own teardown is a normal, harmless
-    /// race, not an error to surface. Deliberately never calls `save()`:
-    /// this state is not persisted (see `sessionActivity`'s doc comment).
-    func setSessionActivity(_ activity: SessionActivity?, for sessionID: String) {
+    /// The single funnel for every attention signal, from every source —
+    /// nothing else in the app may write `attention`. Ignores ids with no
+    /// matching row in `sessions` — a signal racing that session's own
+    /// teardown is a normal, harmless race, not an error to surface.
+    /// Deliberately never calls `save()`: this state is not persisted (see
+    /// `attention`'s doc comment).
+    func apply(_ signal: AttentionSignal, to sessionID: String) {
         guard sessions.contains(where: { $0.id == sessionID }) else { return }
-        if let activity {
-            sessionActivity[sessionID] = activity
-        } else {
-            sessionActivity.removeValue(forKey: sessionID)
-        }
+        attention[sessionID] = SessionAttention.reduce(attention[sessionID] ?? .init(), signal)
     }
 
     /// Records a session's latest agent-set OSC terminal title onto its row
@@ -475,7 +474,7 @@ final class AppStore: ObservableObject {
         save()
     }
 
-    /// Drops any per-live-session state (`sessionActivity`) whose session no
+    /// Drops any per-live-session state (`attention`) whose session no
     /// longer exists. Called from every site that removes rows from
     /// `sessions` (`closeSession`, `removeProject`, `deleteWorkspace`,
     /// `landWorkspace`) so it can never outlive the session it describes. One
@@ -484,7 +483,7 @@ final class AppStore: ObservableObject {
     /// `SessionRow` itself, so removing the row removes it.)
     private func pruneLiveSessionState() {
         let liveIDs = Set(sessions.map(\.id))
-        sessionActivity = sessionActivity.filter { liveIDs.contains($0.key) }
+        attention = attention.filter { liveIDs.contains($0.key) }
     }
 
     /// A manual rename writes `customName`, not `name`: it must win over —
