@@ -25,8 +25,7 @@ whenever you need it.
 
 ## Waiting indicators
 
-Sessions running Claude Code can show an indicator in the sidebar when they
-need you:
+Sessions show an indicator in the sidebar when their agent needs you:
 
 - **Gold dot** — the agent finished its turn. Your move, but nothing is stuck.
 - **Red pulsing exclamation mark** — the agent is blocked on a permission
@@ -34,8 +33,7 @@ need you:
   counted on the Dock tile's badge, so they stay visible when the app isn't
   focused.
 
-No indicator means the agent is working (or the session isn't running an
-agent).
+No indicator means the agent is working, or has nothing to say.
 
 The two states differ by shape and motion, not only by colour: a session that
 can wait indefinitely and one that is burning time deserve different urgency,
@@ -43,25 +41,66 @@ and a hue-only difference is no difference at all to anyone with colour-vision
 deficiency. The pulse honours the system Reduce Motion setting — with it on,
 the blocked glyph renders statically.
 
-The app can't detect any of this on its own, so `hooks/agents-status.sh`
-reports it from Claude Code's hooks. It writes an OSC 777 escape to the
-session's pty, which the app reads. Requires `jq`.
+### With no setup at all
+
+Any agent that emits an ordinary terminal desktop notification lights up a
+session. Gemini CLI does this natively, and Claude Code can be asked to
+(`preferredNotifChannel`). The app also listens for the terminal bell and for
+OSC 9;4 progress reports.
+
+Notification text is classified by keyword — wording about permission or
+approval raises the red pulse, everything else raises the gold dot. That is
+fuzzy by nature: the terminal protocol flattens the notification down to a
+title and body, so the text is the only signal there is. It errs toward gold,
+so unfamiliar wording costs you a less urgent indicator rather than a missed
+permission prompt.
+
+Selecting a session clears an indicator raised this way. Without a hook,
+"you looked at it" is the only honest evidence that you've seen it.
+
+### With the hook, for real agent state
+
+`hooks/agents-status.sh` reports the agent's actual state instead of guessing
+at it, by writing an OSC 777 escape to the session's pty. It's optional, and
+it needs `jq`.
+
+What it buys is trust. A session that speaks this protocol is believed over
+keyword classification for the rest of its life, so its red pulse **survives
+you selecting the session** and clears only when the agent says it's
+unblocked — rather than going dark the moment you glance at a session that is
+still, in fact, stuck.
 
 The script only emits when `AGENTS_APP` is set in its environment, which this
 app stamps into every terminal it spawns. That makes it safe to register
 globally, as below: in iTerm2, Terminal.app, or any other host, the hook sees
 no `AGENTS_APP` and exits without writing anything — which matters, because a
 terminal that renders OSC 777 as a real desktop notification would otherwise
-pop one on every single tool call.
+pop one for real.
 
-Wire it up in `~/.claude/settings.json`, using the **absolute** path to your
-clone — Claude Code does not expand `~` here. If you already run another
-status script (an iTerm2 tab-colour hook, say), add this one alongside it as a
-second entry in the same `hooks` array rather than replacing it:
+It also emits only when the state actually changes, so a long agent turn
+writes nothing down the pty after the first escape.
+
+#### Claude Code
+
+Wire it up in `settings.json` under Claude Code's config directory. That is
+**`$CLAUDE_CONFIG_DIR`** if you have it set, and `~/.claude` only as the
+default — if you've relocated your config, `~/.claude` may not exist at all:
+
+```sh
+"${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json"
+```
+
+Use the **absolute** path to your clone; Claude Code does not expand `~`
+here. If you already run another status script (an iTerm2 tab-colour hook,
+say), add this one alongside it as a second entry in the same `hooks` array
+rather than replacing it:
 
 ```json
 {
   "hooks": {
+    "SessionStart": [
+      { "hooks": [{ "type": "command", "command": "/path/to/agents/hooks/agents-status.sh" }] }
+    ],
     "Stop": [
       { "hooks": [{ "type": "command", "command": "/path/to/agents/hooks/agents-status.sh" }] }
     ],
@@ -81,10 +120,49 @@ second entry in the same `hooks` array rather than replacing it:
 }
 ```
 
-All five events matter: `Stop` and `Notification` raise the indicator,
-and the other three clear it. `PreToolUse`/`PostToolUse` are what clear the
-red after you approve a permission prompt — approving isn't a
-`UserPromptSubmit`, so nothing else would.
+`Stop` and `Notification` raise the indicator; the rest clear it.
+`PreToolUse`/`PostToolUse` are what clear the red after you approve a
+permission prompt — approving isn't a `UserPromptSubmit`, so nothing else
+would. `SessionStart` is not strictly required; it just resyncs a fresh
+session so the first real event is guaranteed to be sent.
+
+#### Codex
+
+Codex CLI's lifecycle hooks share the event vocabulary and the JSON-on-stdin
+payload, so the same script serves both. Its config lives at
+`$CODEX_HOME/hooks.json` — again an env var first, with `~/.codex` as the
+default — and takes the same shape:
+
+```json
+{
+  "hooks": {
+    "SessionStart": [
+      { "hooks": [{ "type": "command", "command": "/path/to/agents/hooks/agents-status.sh" }] }
+    ],
+    "Stop": [
+      { "hooks": [{ "type": "command", "command": "/path/to/agents/hooks/agents-status.sh" }] }
+    ],
+    "PermissionRequest": [
+      { "hooks": [{ "type": "command", "command": "/path/to/agents/hooks/agents-status.sh" }] }
+    ],
+    "UserPromptSubmit": [
+      { "hooks": [{ "type": "command", "command": "/path/to/agents/hooks/agents-status.sh" }] }
+    ],
+    "PreToolUse": [
+      { "matcher": "*", "hooks": [{ "type": "command", "command": "/path/to/agents/hooks/agents-status.sh" }] }
+    ],
+    "PostToolUse": [
+      { "matcher": "*", "hooks": [{ "type": "command", "command": "/path/to/agents/hooks/agents-status.sh" }] }
+    ]
+  }
+}
+```
+
+Two differences from Claude Code. Codex has no `Notification` event —
+`PermissionRequest` is a first-class event and is what raises the red pulse.
+And Codex requires you to explicitly trust a hook before it will run one; run
+`/hooks` inside Codex to review and approve it.
 
 The script exits 0 and stays silent on anything it doesn't recognise, so it
-is harmless in terminals other than this app.
+is harmless in terminals other than this app, and under agents that send it
+events it has no opinion about.
