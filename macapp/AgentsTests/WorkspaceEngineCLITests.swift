@@ -186,7 +186,14 @@ final class WorkspaceEngineCLITests: XCTestCase {
         let namePredicate = NSPredicate(format: "SELF MATCHES %@", "^[a-z]+-[a-z]+$")
         XCTAssertTrue(namePredicate.evaluate(with: row.name), "expected a two-word adjective-noun name, got \(row.name)")
 
-        let expectedPath = (projectDir as NSString).deletingLastPathComponent + "/workspaces/" + row.name
+        // Workspaces nest INSIDE the project (<project>/workspaces/<name>),
+        // not alongside it in a directory shared by every project under the
+        // same parent — see agents-cli's workspaces-root doc comment for why
+        // (jj's per-workspace working-copy tracking makes the nested
+        // directory invisible to the outer workspace; the repo-root
+        // .gitignore's /workspaces/ entry is what keeps plain git happy
+        // about it).
+        let expectedPath = projectDir + "/workspaces/" + row.name
         XCTAssertEqual(row.path, expectedPath)
 
         // The CLI absolutizes the project path server-side, and on macOS
@@ -261,5 +268,153 @@ final class WorkspaceEngineCLITests: XCTestCase {
 
         XCTAssertEqual(result.stdout.count, 204800, "200KB of output is comfortably past the ~64KB pipe buffer that deadlocked the old drain-after-exit implementation")
         XCTAssertEqual(result.exitCode, 0)
+    }
+
+    // MARK: - Envelope decoding for workspace-land-preview / rebase-onto-trunk
+
+    /// Every test above this point drives the REAL agents-cli against a
+    /// REAL jj repo, because their whole point is proving the Swift<->CLI
+    /// process seam works end to end. These tests want something narrower:
+    /// does `WorkspaceEngineCLI` decode a given JSON envelope correctly?
+    /// That question doesn't need a real jj repo, or even the real
+    /// workspace-land-preview/rebase-onto-trunk subcommands to exist yet —
+    /// it needs a `bb` that prints a chosen envelope and exits.
+    ///
+    /// `AGENTS_BB` is `resolveBBPath`'s dev-override env var, checked
+    /// BEFORE any Homebrew candidate (see WorkspaceEngine.swift) — pointing
+    /// it at a throwaway shell script that ignores its arguments and just
+    /// cats a canned envelope makes `WorkspaceEngineCLI` run its real
+    /// decode/error-mapping logic against exactly the bytes each test
+    /// wants, with no dependency on jj/bb being installed or on the CLI
+    /// side of this feature having landed. `resolveScriptURL` still needs
+    /// SOME agents-cli to exist, but the test host already bundles the
+    /// real one as a resource (see this file's own header comment) — our
+    /// stub `bb` never actually interprets it, so which one that is
+    /// doesn't matter.
+    private func withStubBB(json: String, _ body: () async throws -> Void) async throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("WorkspaceEngineCLITests-stub-bb-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let scriptURL = dir.appendingPathComponent("bb")
+        // Ignores $1 (the real agents-cli script path) and $2... (the
+        // subcommand + its own flags) entirely — this stub answers every
+        // invocation the same way, because each test only ever makes one
+        // call through it.
+        let script = "#!/bin/sh\ncat <<'STUB_BB_EOF'\n\(json)\nSTUB_BB_EOF\n"
+        try script.write(to: scriptURL, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: scriptURL.path)
+
+        let previous = ProcessInfo.processInfo.environment["AGENTS_BB"]
+        setenv("AGENTS_BB", scriptURL.path, 1)
+        defer {
+            if let previous {
+                setenv("AGENTS_BB", previous, 1)
+            } else {
+                unsetenv("AGENTS_BB")
+            }
+        }
+
+        try await body()
+    }
+
+    private func makeWorkspace() -> WorkspaceRow {
+        WorkspaceRow(projectPath: "/tmp/proj-stub", name: "ws-stub", path: "/tmp/workspaces/ws-stub", label: nil)
+    }
+
+    func test_previewLand_decodesFullPreviewPayload() async throws {
+        let json = """
+        {"ok":true,"preview":{"bookmark":"main","bookmark_commit":"efdd547b","commits":[{"id":"5178cc25","subject":"Name the dev bundle Agents Dev.app on disk"}],"conflicts":[],"needs_message":false,"diverging":[{"id":"0071bbf4","subject":"Badge the Dock with blocked session count"}]}}
+        """
+        try await withStubBB(json: json) {
+            let preview = try await WorkspaceEngineCLI().previewLand(self.makeWorkspace())
+
+            XCTAssertEqual(preview.bookmark, "main")
+            XCTAssertEqual(preview.bookmarkCommit, "efdd547b")
+            XCTAssertEqual(preview.commits, [LandCommit(id: "5178cc25", subject: "Name the dev bundle Agents Dev.app on disk")])
+            XCTAssertEqual(preview.conflicts, [])
+            XCTAssertFalse(preview.needsMessage)
+            XCTAssertEqual(preview.diverging, [LandCommit(id: "0071bbf4", subject: "Badge the Dock with blocked session count")])
+        }
+    }
+
+    func test_previewLand_missingPreviewPayloadOnOkTrueThrowsContractViolation() async throws {
+        try await withStubBB(json: #"{"ok":true}"#) {
+            do {
+                _ = try await WorkspaceEngineCLI().previewLand(self.makeWorkspace())
+                XCTFail("expected a thrown EngineError.failed for a missing preview payload")
+            } catch EngineError.failed(let message) {
+                XCTAssertTrue(message.contains("preview payload"), "expected the contract-violation message to mention the missing preview payload, got: \(message)")
+            } catch {
+                XCTFail("expected EngineError.failed, got \(error)")
+            }
+        }
+    }
+
+    /// `workspace-land-preview` throws the SAME error codes as
+    /// `workspace-land` in the same situations (per the CLI contract) — one
+    /// representative each, pinning that `engineError(for:)`'s mapping
+    /// applies uniformly regardless of which subcommand's envelope it's
+    /// decoding.
+    func test_previewLand_errorEnvelopeCodesMapToTheirEngineErrors() async throws {
+        let cases: [(code: String, expect: (EngineError) -> Bool)] = [
+            ("not-a-jj-repo", { if case .notAJJRepo = $0 { return true }; return false }),
+            ("no-trunk", { if case .noTrunk = $0 { return true }; return false }),
+            ("nothing-to-land", { if case .nothingToLand = $0 { return true }; return false }),
+            ("shared-history", { if case .sharedHistory = $0 { return true }; return false }),
+        ]
+        for testCase in cases {
+            let json = #"{"ok":false,"error":{"code":"\#(testCase.code)","message":"stub message for \#(testCase.code)"}}"#
+            try await withStubBB(json: json) {
+                do {
+                    _ = try await WorkspaceEngineCLI().previewLand(self.makeWorkspace())
+                    XCTFail("expected a thrown EngineError for code \(testCase.code)")
+                } catch let error as EngineError {
+                    XCTAssertTrue(testCase.expect(error), "code \(testCase.code) mapped to the wrong EngineError case: \(error)")
+                    XCTAssertEqual(error.message, "stub message for \(testCase.code)")
+                } catch {
+                    XCTFail("expected EngineError, got \(error)")
+                }
+            }
+        }
+    }
+
+    func test_rebaseOntoTrunk_decodesRebasedPayload() async throws {
+        try await withStubBB(json: #"{"ok":true,"rebased":{"count":3,"bookmark":"main"}}"#) {
+            let count = try await WorkspaceEngineCLI().rebaseOntoTrunk(projectPath: "/tmp/proj-stub")
+            XCTAssertEqual(count, 3)
+        }
+    }
+
+    func test_rebaseOntoTrunk_missingRebasedPayloadOnOkTrueThrowsContractViolation() async throws {
+        try await withStubBB(json: #"{"ok":true}"#) {
+            do {
+                _ = try await WorkspaceEngineCLI().rebaseOntoTrunk(projectPath: "/tmp/proj-stub")
+                XCTFail("expected a thrown EngineError.failed for a missing rebased payload")
+            } catch EngineError.failed(let message) {
+                XCTAssertTrue(message.contains("rebased payload"), "expected the contract-violation message to mention the missing rebased payload, got: \(message)")
+            } catch {
+                XCTFail("expected EngineError.failed, got \(error)")
+            }
+        }
+    }
+
+    /// The one error code new to this pair of subcommands: a rebase that
+    /// hits a conflict maps to `EngineError.rebaseConflict`, distinct from
+    /// `workspace-land`'s own `land-conflict` (see `EngineError.rebaseConflict`'s
+    /// doc comment in WorkspaceEngine.swift for why they're kept separate).
+    func test_rebaseOntoTrunk_rebaseConflictErrorMapsToEngineErrorRebaseConflict() async throws {
+        let json = #"{"ok":false,"error":{"code":"rebase-conflict","message":"rebase hit a conflict"}}"#
+        try await withStubBB(json: json) {
+            do {
+                _ = try await WorkspaceEngineCLI().rebaseOntoTrunk(projectPath: "/tmp/proj-stub")
+                XCTFail("expected a thrown EngineError.rebaseConflict")
+            } catch EngineError.rebaseConflict(let message) {
+                XCTAssertEqual(message, "rebase hit a conflict")
+            } catch {
+                XCTFail("expected EngineError.rebaseConflict, got \(error)")
+            }
+        }
     }
 }

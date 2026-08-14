@@ -9,11 +9,19 @@ enum EngineError: Error, Equatable {
     case landConflict(String)
     case nothingToLand(String)
     case sharedHistory(String)
+    // Thrown by rebase-onto-trunk when rebasing the default workspace's
+    // diverging commits onto the (just-moved) trunk bookmark hits a
+    // conflict. Distinct from .landConflict: that one is reported by (and
+    // guards) workspace-land itself, before trunk ever moves; this one can
+    // only happen AFTER a successful land, as a side effect of the optional
+    // rebase-offer the user opted into — see AppStore.reviewAndLandWorkspace.
+    case rebaseConflict(String)
 
     var message: String {
         switch self {
         case .notAJJRepo(let m), .nameConflict(let m), .destExists(let m), .failed(let m),
-             .noTrunk(let m), .landConflict(let m), .nothingToLand(let m), .sharedHistory(let m):
+             .noTrunk(let m), .landConflict(let m), .nothingToLand(let m), .sharedHistory(let m),
+             .rebaseConflict(let m):
             return m
         }
     }
@@ -34,11 +42,67 @@ struct LandResult: Equatable {
     var cleanupWarning: String? = nil
 }
 
+/// One commit as shown in the land-review confirmation — just enough to
+/// render a human-readable line (`LandPreview.commits`/`.conflicts`/
+/// `.diverging` are all this shape). `id` is a short commit id, already
+/// truncated by the CLI; it's carried through for potential future use
+/// (e.g. a "show diff" affordance) but today only `subject` is rendered.
+struct LandCommit: Equatable {
+    let id: String
+    let subject: String
+}
+
+/// A dry-run report of exactly what `landWorkspace` would do, fetched by
+/// `previewLand` and shown to the user before they commit to landing. This
+/// is what replaces the old free-text `promptLandMessage` prompt: that
+/// prompt asked the user to type a description on every land, but the CLI
+/// only ever reads it back (via `--message`) when `needsMessage` here is
+/// true — a rare case — so the prompt was almost always silently discarded
+/// work. Showing the user what will ACTUALLY happen is strictly more
+/// useful than asking them to (usually pointlessly) describe it themselves.
+struct LandPreview: Equatable {
+    /// The trunk bookmark's name (e.g. "main").
+    let bookmark: String
+    /// Trunk's current short commit id, BEFORE landing — lets the
+    /// confirmation dialog show exactly what's about to move, not just its
+    /// name.
+    let bookmarkCommit: String
+    /// What will land on `bookmark`, oldest first.
+    let commits: [LandCommit]
+    /// Non-empty means landing would conflict. Still delivered inside an
+    /// otherwise-successful (`ok:true`) preview envelope, because a
+    /// preview's whole job is to REPORT, not to enforce — `workspace-land`
+    /// itself independently refuses a conflicting land with its own
+    /// `land-conflict` error. This field exists so the confirmation dialog
+    /// can warn the user before they even try, not to replace that
+    /// enforcement.
+    let conflicts: [LandCommit]
+    /// True iff the workspace's working-copy commit is non-empty AND
+    /// undescribed — the one situation where `workspace-land`'s
+    /// `--message` actually reaches the landed commit. Drives whether
+    /// `Dialogs.confirmLand` shows a free-text field at all: false means
+    /// there is nothing for a message to describe, so no field is shown.
+    let needsMessage: Bool
+    /// The user's OWN default-workspace commits that are not part of this
+    /// land at all and will be left on a fork once `bookmark` moves out
+    /// from under them. Empty means landing won't fork the default
+    /// workspace. Non-empty drives the post-land rebase offer — see
+    /// `AppStore.reviewAndLandWorkspace`.
+    let diverging: [LandCommit]
+}
+
 @MainActor
 protocol WorkspaceEngineProviding: AnyObject {
     func createWorkspace(projectPath: String) async throws -> WorkspaceRow
     func deleteWorkspace(_ workspace: WorkspaceRow) async throws
-    func landWorkspace(_ workspace: WorkspaceRow, message: String, createTrunk: String?) async throws -> LandResult
+    func landWorkspace(_ workspace: WorkspaceRow, message: String?, createTrunk: String?) async throws -> LandResult
+    func previewLand(_ workspace: WorkspaceRow) async throws -> LandPreview
+    /// Rebases the default workspace's diverging commits (see
+    /// `LandPreview.diverging`) onto the project's trunk bookmark. Returns
+    /// how many commits were rebased. Only ever called after the user
+    /// explicitly opts in via `Dialogs.confirmRebaseOntoTrunk`, immediately
+    /// following a successful land — never automatically.
+    func rebaseOntoTrunk(projectPath: String) async throws -> Int
 }
 
 /// Production conformer: drives the `agents-cli` babashka script as a
@@ -71,6 +135,10 @@ final class WorkspaceEngineCLI: WorkspaceEngineProviding {
         // landWorkspace below treats its presence as a signal to skip the
         // usual directory cleanup, not as a failure.
         let warning: String?
+        // Present only on workspace-land-preview's success envelope.
+        let preview: LandPreviewPayload?
+        // Present only on rebase-onto-trunk's success envelope.
+        let rebased: RebasedPayload?
     }
 
     private struct WorkspacePayload: Decodable {
@@ -84,6 +152,27 @@ final class WorkspaceEngineCLI: WorkspaceEngineProviding {
         let commit_id: String
         let bookmark: String
         let workspace: String
+    }
+
+    /// One entry of `LandPreviewPayload.commits`/`.conflicts`/`.diverging`
+    /// — same shape reused for all three, matching the CLI's own contract.
+    private struct LandCommitPayload: Decodable {
+        let id: String
+        let subject: String
+    }
+
+    private struct LandPreviewPayload: Decodable {
+        let bookmark: String
+        let bookmark_commit: String
+        let commits: [LandCommitPayload]
+        let conflicts: [LandCommitPayload]
+        let needs_message: Bool
+        let diverging: [LandCommitPayload]
+    }
+
+    private struct RebasedPayload: Decodable {
+        let count: Int
+        let bookmark: String
     }
 
     private struct ErrorPayload: Decodable {
@@ -100,6 +189,7 @@ final class WorkspaceEngineCLI: WorkspaceEngineProviding {
         case "land-conflict": return .landConflict(payload.message)
         case "nothing-to-land": return .nothingToLand(payload.message)
         case "shared-history": return .sharedHistory(payload.message)
+        case "rebase-conflict": return .rebaseConflict(payload.message)
         default: return .failed(payload.message)
         }
     }
@@ -318,8 +408,25 @@ final class WorkspaceEngineCLI: WorkspaceEngineProviding {
         try fm.trashItem(at: URL(fileURLWithPath: workspace.path), resultingItemURL: nil)
     }
 
-    func landWorkspace(_ workspace: WorkspaceRow, message: String, createTrunk: String?) async throws -> LandResult {
-        var args = ["--project", workspace.projectPath, "--name", workspace.name, "--message", message]
+    func landWorkspace(_ workspace: WorkspaceRow, message: String?, createTrunk: String?) async throws -> LandResult {
+        var args = ["--project", workspace.projectPath, "--name", workspace.name]
+        // `--message` is OMITTED entirely for a nil (or blank) message —
+        // never sent as `--message ""`. agents-cli's own flag validation
+        // treats a blank flag VALUE as though the flag were never passed at
+        // all (`bad-args: Missing required --message`), so `--message ""`
+        // fails the call outright rather than landing with no message. That
+        // rejection is correct for a flag that's actually required, but
+        // `--message` isn't one here: the CLI only ever reads it back for
+        // the one case where the workspace's own working-copy commit is
+        // non-empty and undescribed — `LandPreview.needsMessage` is the
+        // app's advance signal for exactly that case, and it's false for
+        // the ordinary "session already committed its work" land. Omitting
+        // the flag (rather than sending it empty) is what lets that
+        // ordinary case succeed instead of tripping the CLI's required-flag
+        // check.
+        if let message, !message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            args += ["--message", message]
+        }
         if let createTrunk {
             args += ["--create-trunk", createTrunk]
         }
@@ -365,5 +472,38 @@ final class WorkspaceEngineCLI: WorkspaceEngineProviding {
         }
 
         return LandResult(commitID: payload.commit_id, bookmark: payload.bookmark, cleanupWarning: cleanupWarning)
+    }
+
+    func previewLand(_ workspace: WorkspaceRow) async throws -> LandPreview {
+        let envelope = try await run("workspace-land-preview", args: ["--project", workspace.projectPath, "--name", workspace.name])
+        // workspace-land-preview always includes a preview payload on
+        // success; a missing one here would mean the CLI contract was
+        // violated (same reasoning as createWorkspace's workspace-payload
+        // check above).
+        guard let payload = envelope.preview else {
+            throw EngineError.failed("agents-cli workspace-land-preview returned ok with no preview payload")
+        }
+        func commits(_ payloads: [LandCommitPayload]) -> [LandCommit] {
+            payloads.map { LandCommit(id: $0.id, subject: $0.subject) }
+        }
+        return LandPreview(
+            bookmark: payload.bookmark,
+            bookmarkCommit: payload.bookmark_commit,
+            commits: commits(payload.commits),
+            conflicts: commits(payload.conflicts),
+            needsMessage: payload.needs_message,
+            diverging: commits(payload.diverging)
+        )
+    }
+
+    func rebaseOntoTrunk(projectPath: String) async throws -> Int {
+        let envelope = try await run("rebase-onto-trunk", args: ["--project", projectPath])
+        // rebase-onto-trunk always includes a rebased payload on success;
+        // a missing one here would mean the CLI contract was violated (same
+        // reasoning as createWorkspace's workspace-payload check above).
+        guard let payload = envelope.rebased else {
+            throw EngineError.failed("agents-cli rebase-onto-trunk returned ok with no rebased payload")
+        }
+        return payload.count
     }
 }

@@ -313,13 +313,18 @@ private struct WorkspaceRowView: View {
     /// presentations can never drift apart.
     @ViewBuilder
     private var menuItems: some View {
-        // Direct store/Dialogs call, not actions.perform: this targets
-        // the specific right-clicked workspace, row-targeted the same
-        // way the rest of this context menu is.
+        // Row-targeted, not actions.perform: this targets the specific
+        // right-clicked workspace, the same way the rest of this context
+        // menu is. Routes through AppStore.reviewAndLandWorkspace rather
+        // than a direct `Dialogs` call (unlike "Change Label…"/"Delete
+        // Workspace…" below): landing now needs an async preview fetched
+        // before any dialog can even be shown, and that orchestration lives
+        // on AppStore — see DialogPresenting.swift's doc comment on
+        // confirmLand/confirmRebaseOntoTrunk for why. `LiveDialogPresenter()`
+        // is constructed fresh here rather than injected, same as every
+        // other direct `Dialogs`-driven call in this file.
         Button("Keep Changes…") {
-            if let message = Dialogs.promptLandMessage(workspace: workspace) {
-                Task { await store.landWorkspace(workspace.id, message: message) }
-            }
+            Task { await store.reviewAndLandWorkspace(workspace.id, dialogs: LiveDialogPresenter()) }
         }
         // Direct store call, not actions.perform: this targets the
         // specific right-clicked workspace, row-targeted the same way

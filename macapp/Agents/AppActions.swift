@@ -196,14 +196,22 @@ final class AppActions {
                   let workspace = store.workspaces.first(where: { $0.projectPath == projectPath && $0.name == name })
             else { return false }
             // Cancel still counts as handled, same reasoning as
-            // .deleteWorkspace above: once a workspace is resolved we
-            // scheduled the prompt, so the menu item did its job regardless
-            // of choice.
-            present {
-                if let message = self.dialogs.promptLandMessage(workspace: workspace) {
-                    Task { await self.store.landWorkspace(workspace.id, message: message) }
-                }
-            }
+            // .deleteWorkspace above — but note there is no `present { ... }`
+            // wrapper here, unlike every other dialog-presenting case in
+            // this function. `present` exists to defer a dialog past the
+            // runloop turn AppKit is still using to dispatch the triggering
+            // keydown (see its doc comment — the risk is a modal loop
+            // running mid-dispatch and leaking that keystroke into the
+            // hosted terminal). This flow starts with an async preview
+            // (a subprocess round-trip via AppStore.reviewAndLandWorkspace)
+            // before any dialog can even be built, so that risk window is
+            // long past by the time a dialog actually shows — deferring
+            // again on top of it would be redundant, not incorrect. Once
+            // the workspace is resolved here the shortcut/menu item has
+            // done its job by starting the Task, regardless of what the
+            // user eventually decides in whichever dialog(s) it goes on to
+            // present.
+            Task { await self.store.reviewAndLandWorkspace(workspace.id, dialogs: self.dialogs) }
             return true
 
         case .showShortcutHelp:

@@ -65,40 +65,161 @@ enum Dialogs {
         return alert.runModal() == .alertFirstButtonReturn
     }
 
-    /// Prompts for the landing message when keeping (landing) a
-    /// workspace's changes. The session's own commits land with their own
-    /// messages (merge model — see agents-cli's workspace-land); this
-    /// message only ever describes trailing uncommitted work, and even then
-    /// only when the agent didn't describe it itself. It's still required:
-    /// whether it will be needed isn't knowable before landing. Returns the
-    /// trimmed message iff the user confirmed with non-blank input; nil on
-    /// Cancel OR on blank input (a blank message is treated the same as
-    /// cancelling — never risks landing an undescribed commit).
-    static func promptLandMessage(workspace: WorkspaceRow) -> String? {
+    /// Caps how many commits `landReviewText` will list one-per-line before
+    /// collapsing the rest into a trailing "…and N more" — a workspace with
+    /// an unusually long commit chain must not be able to produce an
+    /// effectively unbounded NSAlert.
+    private static let maxRenderedLandCommits = 10
+
+    /// Renders one `LandCommit` per line, bullet-prefixed, for
+    /// `landReviewText` below — shared by the "will land" and "will
+    /// conflict" sections since both show the same shape of list. An empty
+    /// `subject` (an undescribed commit) renders as an explicit
+    /// "(no description)" rather than a blank bullet, which would read as a
+    /// rendering bug rather than a truthful description of the commit.
+    private static func renderedCommitList(_ commits: [LandCommit]) -> [String] {
+        let shown = commits.prefix(maxRenderedLandCommits)
+        var lines = shown.map { commit -> String in
+            let subject = commit.subject.isEmpty ? "(no description)" : commit.subject
+            return "  \u{2022} \(subject)"
+        }
+        let remaining = commits.count - shown.count
+        if remaining > 0 {
+            lines.append("  \u{2026}and \(remaining) more")
+        }
+        return lines
+    }
+
+    /// Builds `confirmLand`'s informative text: what will land, whether it
+    /// conflicts, and whether the default workspace will fork — the actual
+    /// substance of "review before landing" that replaced the old free-text
+    /// prompt. Built as explicit lines (not one auto-wrapped paragraph)
+    /// because the whole point is that each of these facts must be legible
+    /// on its own, not blur together.
+    private static func landReviewText(preview: LandPreview) -> String {
+        var lines: [String] = []
+
+        let commitWord = preview.commits.count == 1 ? "commit" : "commits"
+        lines.append("\(preview.commits.count) \(commitWord) will land on \(preview.bookmark) (\(preview.bookmarkCommit)):")
+        lines.append("")
+        lines.append(contentsOf: renderedCommitList(preview.commits))
+        lines.append("")
+
+        // This is a REPORT, not the enforcement point: agents-cli's own
+        // workspace-land independently refuses a conflicting land with its
+        // own land-conflict error regardless of what the user picks here.
+        // Swapping which button is destructive/default below is the actual
+        // safeguard against a reflexive Return confirming a known-bad land;
+        // this text is just telling the user why.
+        if preview.conflicts.isEmpty {
+            lines.append("\u{2713} No conflicts with \(preview.bookmark)")
+        } else {
+            let conflictWord = preview.conflicts.count == 1 ? "commit" : "commits"
+            lines.append("\u{26A0} \(preview.conflicts.count) \(conflictWord) will conflict with \(preview.bookmark):")
+            lines.append(contentsOf: renderedCommitList(preview.conflicts))
+        }
+
+        if !preview.diverging.isEmpty {
+            let divergingWord = preview.diverging.count == 1 ? "commit" : "commits"
+            lines.append("\u{26A0} Your main workspace has \(preview.diverging.count) \(divergingWord) not on \(preview.bookmark);")
+            lines.append("  they will fork. You can rebase after landing.")
+        }
+
+        if preview.needsMessage {
+            lines.append("")
+            lines.append("This session left uncommitted changes with no description of their own — describe them below.")
+        }
+
+        return lines.joined(separator: "\n")
+    }
+
+    /// Presents the "review before landing" confirmation that replaces the
+    /// old `promptLandMessage` free-text prompt (see `LandDecision`'s doc
+    /// comment in DialogPresenting.swift for the bug that motivated the
+    /// replacement, and `AppStore.reviewAndLandWorkspace` for the
+    /// preview→dialog→land→optional-rebase flow this is one step of). The
+    /// free-text field is added ONLY when `preview.needsMessage` is true —
+    /// the CLI only ever reads it back in that one case, so showing it
+    /// unconditionally (as the old prompt did) was asking for input that
+    /// was almost always thrown away.
+    ///
+    /// When `preview.conflicts` is non-empty, Cancel (not Keep Changes)
+    /// becomes the default/first button and Keep Changes is marked
+    /// destructive — so a reflexive Return keypress cannot confirm a land
+    /// the app already knows will conflict. This is advance warning only:
+    /// agents-cli's own workspace-land independently refuses a conflicting
+    /// land with `land-conflict` regardless, so nothing here is the actual
+    /// enforcement point.
+    static func confirmLand(workspace: WorkspaceRow, preview: LandPreview) -> LandDecision {
         let alert = NSAlert()
-        alert.messageText = "Keep Changes in \u{201C}\(workspace.displayName)\u{201D}?"
-        alert.informativeText =
-            "Lands the session's commits on main as they are, then removes the workspace and moves its directory to the Bin. The message below is only used to describe changes the session left uncommitted."
-        alert.addButton(withTitle: "Keep Changes")
-        alert.addButton(withTitle: "Cancel")
+        // "Keep changes from …", not the Title-Case "Keep Changes in …"
+        // the old promptLandMessage used above — this exact wording and
+        // layout was specified by the user for this dialog; don't
+        // "correct" the casing to match its sibling dialogs.
+        alert.messageText = "Keep changes from \u{201C}\(workspace.displayName)\u{201D}?"
+        alert.informativeText = landReviewText(preview: preview)
 
-        let textField = NSTextField(frame: NSRect(x: 0, y: 0, width: 240, height: 24))
-        textField.placeholderString = "Describe any uncommitted changes…"
-        alert.accessoryView = textField
-        alert.window.initialFirstResponder = textField
+        let hasConflicts = !preview.conflicts.isEmpty
+        if hasConflicts {
+            alert.alertStyle = .warning
+            alert.addButton(withTitle: "Cancel")
+            let keepButton = alert.addButton(withTitle: "Keep Changes")
+            keepButton.hasDestructiveAction = true
+        } else {
+            alert.addButton(withTitle: "Keep Changes")
+            alert.addButton(withTitle: "Cancel")
+        }
 
-        guard alert.runModal() == .alertFirstButtonReturn else { return nil }
+        var textField: NSTextField?
+        if preview.needsMessage {
+            let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 300, height: 24))
+            field.placeholderString = "Describe any uncommitted changes…"
+            alert.accessoryView = field
+            alert.window.initialFirstResponder = field
+            textField = field
+        }
+
+        let response = alert.runModal()
+        // Button order (and therefore which response value means "confirm")
+        // flips with hasConflicts above, so which comparison is correct
+        // flips right along with it.
+        let confirmed = hasConflicts ? response == .alertSecondButtonReturn : response == .alertFirstButtonReturn
+        guard confirmed else { return .cancel }
+
+        guard let textField else { return .land(message: nil) }
         let trimmed = textField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? nil : trimmed
+        return .land(message: trimmed.isEmpty ? nil : trimmed)
+    }
+
+    /// Offered once, immediately after a successful land, only when that
+    /// land's preview reported non-empty `diverging` commits — i.e. trunk's
+    /// move just left the user's own default-workspace commits behind on a
+    /// fork. Declining is a complete, legitimate answer (not "cancel
+    /// something"): the fork is harmless until the user next works in the
+    /// default workspace, so "Not Now" just means "I'll deal with it
+    /// myself later." See `AppStore.reviewAndLandWorkspace`.
+    static func confirmRebaseOntoTrunk(count: Int, bookmark: String) -> Bool {
+        let alert = NSAlert()
+        let commitWord = count == 1 ? "commit" : "commits"
+        alert.messageText = "Rebase onto \u{201C}\(bookmark)\u{201D}?"
+        alert.informativeText =
+            "Your main workspace has \(count) \(commitWord) that forked off when \(bookmark) moved. Rebase them onto \(bookmark) now?"
+        alert.addButton(withTitle: "Rebase")
+        alert.addButton(withTitle: "Not Now")
+        return alert.runModal() == .alertFirstButtonReturn
     }
 
     /// Prompts for a new workspace's sidebar label. Returns nil iff the user
     /// cancelled — in that case no workspace should be created at all.
     /// Otherwise returns the (untrimmed) field value as-is, including when
-    /// it's blank: unlike `promptLandMessage` above, blank input here is NOT
-    /// collapsed to nil, because blank is a meaningful "no label, use the
-    /// generated name" answer, distinct from cancelling. It's on the caller
-    /// (`AppStore.createWorkspace`) to trim and decide what blank means.
+    /// it's blank: blank input here is NOT collapsed to nil, because blank
+    /// is a meaningful "no label, use the generated name" answer, distinct
+    /// from cancelling. It's on the caller (`AppStore.createWorkspace`) to
+    /// trim and decide what blank means. (The now-removed `promptLandMessage`
+    /// used to collapse blank into the SAME nil its own Cancel path
+    /// returned, which is exactly the bug `LandDecision` in
+    /// DialogPresenting.swift exists to make impossible — see that type's
+    /// doc comment.)
     static func promptNewWorkspaceLabel() -> String? {
         let alert = NSAlert()
         alert.messageText = "New Workspace"

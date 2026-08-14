@@ -11,7 +11,11 @@ final class FakeDialogs: DialogPresenting {
     var nextProjectDirectory: String? = nil
     var nextConfirmRemove: Bool = true
     var nextConfirmDeleteWorkspace: Bool = true
-    var nextLandMessage: String? = nil
+    /// Defaults to `.cancel` — the enum's own version of "user cancelled",
+    /// matching this file's existing default-to-cancelled convention for
+    /// every other optional-returning method below.
+    var nextLandDecision: LandDecision = .cancel
+    var nextConfirmRebaseOntoTrunk: Bool = true
     var nextRenameName: String? = nil
     /// Defaults to "" (NOT nil) — meaning "user confirmed without typing a
     /// custom label" — because that's the outcome existing `.newWorkspace`
@@ -22,7 +26,8 @@ final class FakeDialogs: DialogPresenting {
     private(set) var chooseProjectDirectoryCallCount: Int = 0
     private(set) var confirmRemoveCalls: [Project] = []
     private(set) var confirmDeleteWorkspaceCalls: [WorkspaceRow] = []
-    private(set) var promptLandMessageCalls: [WorkspaceRow] = []
+    private(set) var confirmLandCalls: [(workspace: WorkspaceRow, preview: LandPreview)] = []
+    private(set) var confirmRebaseOntoTrunkCalls: [(count: Int, bookmark: String)] = []
     private(set) var promptRenameCalls: [String] = []
     private(set) var promptNewWorkspaceLabelCallCount: Int = 0
 
@@ -41,9 +46,14 @@ final class FakeDialogs: DialogPresenting {
         return nextConfirmDeleteWorkspace
     }
 
-    func promptLandMessage(workspace: WorkspaceRow) -> String? {
-        promptLandMessageCalls.append(workspace)
-        return nextLandMessage
+    func confirmLand(workspace: WorkspaceRow, preview: LandPreview) -> LandDecision {
+        confirmLandCalls.append((workspace: workspace, preview: preview))
+        return nextLandDecision
+    }
+
+    func confirmRebaseOntoTrunk(count: Int, bookmark: String) -> Bool {
+        confirmRebaseOntoTrunkCalls.append((count: count, bookmark: bookmark))
+        return nextConfirmRebaseOntoTrunk
     }
 
     func promptRename(currentName: String) -> String? {

@@ -333,11 +333,20 @@ final class AppActionsTests: XCTestCase {
         XCTAssertFalse(actions.perform(.keepWorkspaceChanges))
     }
 
+    // `.keepWorkspaceChanges` no longer presents a dialog synchronously at
+    // all — it resolves the workspace, starts a Task running
+    // AppStore.reviewAndLandWorkspace (preview -> confirmLand -> land), and
+    // returns true immediately regardless of what that Task eventually
+    // decides. So "cancel still counts as handled" now means something
+    // slightly different than it does for the other cases above: `perform`
+    // returns true before the preview has even started, not just before the
+    // user has answered a dialog. These tests poll for the eventual dialog/
+    // engine call instead of asserting on it synchronously.
     func test07b_keepWorkspaceChangesCancelReturnsTrueWithoutCallingEngine() async {
         let fake = FakeWorkspaceEngine()
         let (store, _, _) = TestSupport.makeStore(engine: fake)
         let dialogs = FakeDialogs()
-        dialogs.nextLandMessage = nil
+        dialogs.nextLandDecision = .cancel
         let actions = makeActions(store: store, dialogs: dialogs)
         store.addProject(path: "/tmp/proj-A")
         let wsRow = WorkspaceRow(projectPath: "/tmp/proj-A", name: "ws-a", path: "/tmp/workspaces/ws-a", label: nil)
@@ -346,15 +355,16 @@ final class AppActionsTests: XCTestCase {
 
         XCTAssertTrue(actions.perform(.keepWorkspaceChanges), "cancel still counts as handled")
 
+        await waitUntil { !dialogs.confirmLandCalls.isEmpty }
         XCTAssertTrue(fake.landCalls.isEmpty)
-        XCTAssertEqual(dialogs.promptLandMessageCalls, [wsRow])
+        XCTAssertEqual(dialogs.confirmLandCalls.first?.workspace, wsRow)
     }
 
     func test07c_keepWorkspaceChangesConfirmCallsEngineLand() async {
         let fake = FakeWorkspaceEngine()
         let (store, _, _) = TestSupport.makeStore(engine: fake)
         let dialogs = FakeDialogs()
-        dialogs.nextLandMessage = "Ship it"
+        dialogs.nextLandDecision = .land(message: "Ship it")
         let actions = makeActions(store: store, dialogs: dialogs)
         store.addProject(path: "/tmp/proj-A")
         let wsRow = WorkspaceRow(projectPath: "/tmp/proj-A", name: "ws-a", path: "/tmp/workspaces/ws-a", label: nil)
@@ -367,6 +377,37 @@ final class AppActionsTests: XCTestCase {
         await waitUntil { !fake.landCalls.isEmpty }
         XCTAssertEqual(fake.landCalls.first?.workspace, wsRow)
         XCTAssertEqual(fake.landCalls.first?.message, "Ship it")
+    }
+
+    // The bug that motivated replacing `promptLandMessage`'s `String?` with
+    // `LandDecision`: confirming with a blank/absent message must still
+    // land, not silently no-op. `.land(message: nil)` is exactly what
+    // `Dialogs.confirmLand` now returns for "confirmed, field left blank"
+    // (see LandDecision's doc comment in DialogPresenting.swift) — this
+    // pins that AppStore actually calls through to the engine for it,
+    // passing an empty string rather than treating nil as cancel.
+    func test07d_keepWorkspaceChangesConfirmWithNilMessageStillLands() async {
+        let fake = FakeWorkspaceEngine()
+        let (store, _, _) = TestSupport.makeStore(engine: fake)
+        let dialogs = FakeDialogs()
+        dialogs.nextLandDecision = .land(message: nil)
+        let actions = makeActions(store: store, dialogs: dialogs)
+        store.addProject(path: "/tmp/proj-A")
+        let wsRow = WorkspaceRow(projectPath: "/tmp/proj-A", name: "ws-a", path: "/tmp/workspaces/ws-a", label: nil)
+        fake.nextCreateResult = .success(wsRow)
+        await store.createWorkspace(in: "/tmp/proj-A")
+        fake.nextLandResult = .success(LandResult(commitID: "abc123", bookmark: "main"))
+
+        XCTAssertTrue(actions.perform(.keepWorkspaceChanges))
+
+        await waitUntil { !fake.landCalls.isEmpty }
+        XCTAssertEqual(fake.landCalls.first?.workspace, wsRow, "the land must actually go through the engine, not silently no-op")
+        // "No message" must reach the engine AS nil, so the CLI invocation
+        // omits --message entirely. Asserting "" here would be asserting the
+        // very bug this rewrite fixed: agents-cli rejects a blank flag value
+        // as a missing required flag, so an empty string would fail the land
+        // outright against the real CLI while passing against this fake.
+        XCTAssertNil(fake.landCalls.first?.message, "a nil LandDecision message stays nil — never coerced to a blank flag value")
     }
 
     // MARK: - 8: .selectSession

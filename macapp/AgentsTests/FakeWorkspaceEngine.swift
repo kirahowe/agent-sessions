@@ -14,10 +14,24 @@ final class FakeWorkspaceEngine: WorkspaceEngineProviding {
     var nextLandResult: Result<LandResult, EngineError> = .success(
         LandResult(commitID: "unset", bookmark: "main")
     )
+    /// Defaults to a no-conflicts, no-message-needed, non-diverging
+    /// preview — the "boring" case most tests that don't care about
+    /// `previewLand`'s content should get for free.
+    var nextPreviewResult: Result<LandPreview, EngineError> = .success(
+        LandPreview(bookmark: "main", bookmarkCommit: "unset", commits: [], conflicts: [], needsMessage: false, diverging: [])
+    )
+    var nextRebaseResult: Result<Int, EngineError> = .success(0)
 
     private(set) var createCalls: [String] = []       // projectPath args
     private(set) var deleteCalls: [WorkspaceRow] = []
-    private(set) var landCalls: [(workspace: WorkspaceRow, message: String, createTrunk: String?)] = []
+    // `message` is optional for the same reason the protocol's is: nil means
+    // "no message at all", which the real engine turns into an OMITTED
+    // --message flag rather than a blank one. Recording it as a plain String
+    // would let a test assert `== ""` and pass while the real CLI rejects
+    // that exact call as a missing required flag.
+    private(set) var landCalls: [(workspace: WorkspaceRow, message: String?, createTrunk: String?)] = []
+    private(set) var previewLandCalls: [WorkspaceRow] = []
+    private(set) var rebaseOntoTrunkCalls: [String] = []   // projectPath args
 
     func createWorkspace(projectPath: String) async throws -> WorkspaceRow {
         createCalls.append(projectPath)
@@ -29,8 +43,18 @@ final class FakeWorkspaceEngine: WorkspaceEngineProviding {
         _ = try nextDeleteResult.get()
     }
 
-    func landWorkspace(_ workspace: WorkspaceRow, message: String, createTrunk: String?) async throws -> LandResult {
+    func landWorkspace(_ workspace: WorkspaceRow, message: String?, createTrunk: String?) async throws -> LandResult {
         landCalls.append((workspace: workspace, message: message, createTrunk: createTrunk))
         return try nextLandResult.get()
+    }
+
+    func previewLand(_ workspace: WorkspaceRow) async throws -> LandPreview {
+        previewLandCalls.append(workspace)
+        return try nextPreviewResult.get()
+    }
+
+    func rebaseOntoTrunk(projectPath: String) async throws -> Int {
+        rebaseOntoTrunkCalls.append(projectPath)
+        return try nextRebaseResult.get()
     }
 }

@@ -1654,4 +1654,266 @@ final class AppStoreTests: XCTestCase {
             "dockBadgeLabel must pass an arbitrary blocked count straight through as its decimal string, so the Dock badge always shows the user exactly how many sessions are blocked rather than some capped or rounded approximation"
         )
     }
+
+    // MARK: - 67: reviewAndLandWorkspace
+
+    /// Sets up a workspace and a scripted preview result, ready for
+    /// `store.reviewAndLandWorkspace` to be called against it. Shared setup
+    /// for the whole `reviewAndLandWorkspace` section below, mirroring how
+    /// `test33a` etc. above hand-roll the same create-then-land setup for
+    /// `landWorkspace` — pulled into a helper here because this section has
+    /// many more variants to cover (dialog decision x preview shape x
+    /// engine outcome) than `landWorkspace`'s own section needed.
+    private func makeLandableWorkspace(
+        store: AppStore, fake: FakeWorkspaceEngine, pathA: String = "/tmp/proj-A"
+    ) async -> WorkspaceRow {
+        store.addProject(path: pathA)
+        let wsRow = WorkspaceRow(projectPath: pathA, name: "ws-a", path: "/tmp/workspaces/ws-a", label: nil)
+        fake.nextCreateResult = .success(wsRow)
+        await store.createWorkspace(in: pathA)
+        return wsRow
+    }
+
+    /// THE regression test for the bug that motivated replacing
+    /// `promptLandMessage`'s `String?` with `LandDecision`: confirming with
+    /// a blank/absent message must still land — not silently no-op the way
+    /// the old `nil`-collapsing prompt did (see `LandDecision`'s doc
+    /// comment in DialogPresenting.swift). `.land(message: nil)` is exactly
+    /// what `Dialogs.confirmLand` returns for "confirmed, field left blank
+    /// or not shown at all"; this asserts the engine's `landWorkspace` was
+    /// actually invoked for it, with teardown following through exactly as
+    /// a normal successful land does.
+    func test67_reviewAndLandWorkspaceConfirmedWithNilMessageStillLandsAndTearsDown() async {
+        let fake = FakeWorkspaceEngine()
+        let (store, spy, _) = TestSupport.makeStore(engine: fake)
+        let wsRow = await makeLandableWorkspace(store: store, fake: fake)
+        let wsSessionID = store.sessions.first { $0.target == .workspace(projectPath: wsRow.projectPath, name: wsRow.name) }!.id
+
+        let dialogs = FakeDialogs()
+        dialogs.nextLandDecision = .land(message: nil)
+        fake.nextLandResult = .success(LandResult(commitID: "abc123", bookmark: "main"))
+
+        await store.reviewAndLandWorkspace(wsRow.id, dialogs: dialogs)
+
+        XCTAssertEqual(fake.landCalls.count, 1, "the engine's landWorkspace must actually be called — this is the bug that must never regress")
+        XCTAssertNil(fake.landCalls.first?.message, "a nil LandDecision message stays nil — never coerced to a blank flag value the CLI would reject")
+        XCTAssertTrue(spy.closedIDs.contains(wsSessionID))
+        XCTAssertFalse(store.workspaces.contains { $0.id == wsRow.id })
+    }
+
+    // MARK: - 68
+
+    func test68_reviewAndLandWorkspaceCancelDoesNotLand() async {
+        let fake = FakeWorkspaceEngine()
+        let (store, spy, _) = TestSupport.makeStore(engine: fake)
+        let wsRow = await makeLandableWorkspace(store: store, fake: fake)
+
+        let dialogs = FakeDialogs()
+        dialogs.nextLandDecision = .cancel
+
+        await store.reviewAndLandWorkspace(wsRow.id, dialogs: dialogs)
+
+        XCTAssertTrue(fake.landCalls.isEmpty)
+        XCTAssertTrue(spy.closedIDs.isEmpty)
+        XCTAssertTrue(store.workspaces.contains { $0.id == wsRow.id })
+    }
+
+    // MARK: - 69
+
+    /// Pins the entire point of this change: when the preview says no
+    /// message is needed, the dialog must not even be ASKED for one — this
+    /// asserts the preview `Dialogs.confirmLand` actually received carries
+    /// `needsMessage == false`, and that a land can still complete with a
+    /// nil message despite there having been no field to fill in at all.
+    func test69_reviewAndLandWorkspaceNeedsMessageFalsePassesThatThroughToTheDialog() async {
+        let fake = FakeWorkspaceEngine()
+        let (store, _, _) = TestSupport.makeStore(engine: fake)
+        let wsRow = await makeLandableWorkspace(store: store, fake: fake)
+
+        fake.nextPreviewResult = .success(
+            LandPreview(bookmark: "main", bookmarkCommit: "efdd547", commits: [LandCommit(id: "abc", subject: "do a thing")], conflicts: [], needsMessage: false, diverging: [])
+        )
+        let dialogs = FakeDialogs()
+        dialogs.nextLandDecision = .land(message: nil)
+        fake.nextLandResult = .success(LandResult(commitID: "abc123", bookmark: "main"))
+
+        await store.reviewAndLandWorkspace(wsRow.id, dialogs: dialogs)
+
+        XCTAssertEqual(dialogs.confirmLandCalls.count, 1)
+        XCTAssertEqual(dialogs.confirmLandCalls.first?.preview.needsMessage, false)
+        XCTAssertNil(fake.landCalls.first?.message, "needsMessage false means no field was shown, so nothing to send — and nil, not \"\", is what omits the flag")
+    }
+
+    // MARK: - 70
+
+    /// A `noTrunk` failure from the PREVIEW (not from `landWorkspace`
+    /// itself) must feed the same `pendingTrunkBootstrap` recovery path —
+    /// see `reviewAndLandWorkspace`'s doc comment for why its `message` is
+    /// always empty in this case (there's no dialog to have sourced one
+    /// from yet). The retry itself — RootView's "Create" button — calls
+    /// `landWorkspace` directly with `createTrunk` set, exactly as it did
+    /// before this change; this test drives that same call to confirm nothing
+    /// about the retry path broke.
+    func test70_noTrunkFromPreviewSetsPendingTrunkBootstrapAndTheExistingRetryStillLands() async {
+        let fake = FakeWorkspaceEngine()
+        let (store, spy, _) = TestSupport.makeStore(engine: fake)
+        let wsRow = await makeLandableWorkspace(store: store, fake: fake)
+
+        fake.nextPreviewResult = .failure(.noTrunk("no main/master/trunk bookmark exists"))
+        let dialogs = FakeDialogs()
+
+        await store.reviewAndLandWorkspace(wsRow.id, dialogs: dialogs)
+
+        XCTAssertTrue(dialogs.confirmLandCalls.isEmpty, "no preview means there's nothing for confirmLand to show")
+        XCTAssertNil(store.lastError, "noTrunk is recoverable via pendingTrunkBootstrap, not a dead-end lastError")
+        XCTAssertEqual(store.pendingTrunkBootstrap?.workspaceID, wsRow.id)
+        // nil, not "": the preview failed before any dialog ran, so no
+        // message was ever collected — and the retry must not send a blank
+        // --message the CLI would reject as missing.
+        XCTAssertNil(store.pendingTrunkBootstrap?.message)
+
+        // The retry: RootView's "Create" button calls landWorkspace directly.
+        fake.nextLandResult = .success(LandResult(commitID: "def456", bookmark: "main"))
+        let landed = await store.landWorkspace(wsRow.id, message: store.pendingTrunkBootstrap!.message, createTrunk: "main")
+
+        XCTAssertTrue(landed)
+        XCTAssertEqual(fake.landCalls.last?.createTrunk, "main")
+        // Teardown itself is already thoroughly covered by test33a/test36 —
+        // this test's own focus is the bootstrap hand-off (pendingTrunkBootstrap's
+        // empty message flowing correctly into the retry call), so a light
+        // touch here is enough to confirm the retry actually completed.
+        XCTAssertFalse(store.workspaces.contains { $0.id == wsRow.id })
+        XCTAssertFalse(spy.closedIDs.isEmpty)
+    }
+
+    // MARK: - 71
+
+    func test71_nothingToLandFromPreviewSurfacesAsLastErrorWithoutTeardown() async {
+        let fake = FakeWorkspaceEngine()
+        let (store, spy, _) = TestSupport.makeStore(engine: fake)
+        let wsRow = await makeLandableWorkspace(store: store, fake: fake)
+        let sessionsBefore = store.sessions
+        let workspacesBefore = store.workspaces
+
+        fake.nextPreviewResult = .failure(.nothingToLand("workspace has no changes to land"))
+        let dialogs = FakeDialogs()
+
+        await store.reviewAndLandWorkspace(wsRow.id, dialogs: dialogs)
+
+        XCTAssertEqual(store.lastError, "workspace has no changes to land")
+        XCTAssertTrue(spy.closedIDs.isEmpty)
+        XCTAssertEqual(store.sessions, sessionsBefore)
+        XCTAssertEqual(store.workspaces, workspacesBefore)
+    }
+
+    // MARK: - 72
+
+    func test72_sharedHistoryFromPreviewSurfacesAsLastErrorWithoutTeardown() async {
+        let fake = FakeWorkspaceEngine()
+        let (store, spy, _) = TestSupport.makeStore(engine: fake)
+        let wsRow = await makeLandableWorkspace(store: store, fake: fake)
+        let sessionsBefore = store.sessions
+        let workspacesBefore = store.workspaces
+
+        fake.nextPreviewResult = .failure(.sharedHistory("workspace shares history with another workspace"))
+        let dialogs = FakeDialogs()
+
+        await store.reviewAndLandWorkspace(wsRow.id, dialogs: dialogs)
+
+        XCTAssertEqual(store.lastError, "workspace shares history with another workspace")
+        XCTAssertTrue(spy.closedIDs.isEmpty)
+        XCTAssertEqual(store.sessions, sessionsBefore)
+        XCTAssertEqual(store.workspaces, workspacesBefore)
+    }
+
+    // MARK: - 73
+
+    func test73_divergingPreviewOffersRebaseAndConfirmingCallsEngine() async {
+        let fake = FakeWorkspaceEngine()
+        let (store, _, _) = TestSupport.makeStore(engine: fake)
+        let wsRow = await makeLandableWorkspace(store: store, fake: fake)
+
+        fake.nextPreviewResult = .success(
+            LandPreview(
+                bookmark: "main", bookmarkCommit: "efdd547",
+                commits: [LandCommit(id: "abc", subject: "do a thing")],
+                conflicts: [], needsMessage: false,
+                diverging: [LandCommit(id: "def", subject: "unrelated local work"), LandCommit(id: "ghi", subject: "more local work")]
+            )
+        )
+        let dialogs = FakeDialogs()
+        dialogs.nextLandDecision = .land(message: nil)
+        dialogs.nextConfirmRebaseOntoTrunk = true
+        fake.nextLandResult = .success(LandResult(commitID: "abc123", bookmark: "main"))
+        fake.nextRebaseResult = .success(2)
+
+        await store.reviewAndLandWorkspace(wsRow.id, dialogs: dialogs)
+
+        XCTAssertEqual(dialogs.confirmRebaseOntoTrunkCalls.count, 1)
+        XCTAssertEqual(dialogs.confirmRebaseOntoTrunkCalls.first?.count, 2)
+        XCTAssertEqual(dialogs.confirmRebaseOntoTrunkCalls.first?.bookmark, "main")
+        XCTAssertEqual(fake.rebaseOntoTrunkCalls, [wsRow.projectPath])
+    }
+
+    // MARK: - 74
+
+    func test74_divergingPreviewDecliningRebaseDoesNotCallEngine() async {
+        let fake = FakeWorkspaceEngine()
+        let (store, _, _) = TestSupport.makeStore(engine: fake)
+        let wsRow = await makeLandableWorkspace(store: store, fake: fake)
+
+        fake.nextPreviewResult = .success(
+            LandPreview(
+                bookmark: "main", bookmarkCommit: "efdd547",
+                commits: [LandCommit(id: "abc", subject: "do a thing")],
+                conflicts: [], needsMessage: false,
+                diverging: [LandCommit(id: "def", subject: "unrelated local work")]
+            )
+        )
+        let dialogs = FakeDialogs()
+        dialogs.nextLandDecision = .land(message: nil)
+        dialogs.nextConfirmRebaseOntoTrunk = false
+        fake.nextLandResult = .success(LandResult(commitID: "abc123", bookmark: "main"))
+
+        await store.reviewAndLandWorkspace(wsRow.id, dialogs: dialogs)
+
+        XCTAssertEqual(dialogs.confirmRebaseOntoTrunkCalls.count, 1, "the offer must still be made")
+        XCTAssertTrue(fake.rebaseOntoTrunkCalls.isEmpty, "declining must not call the engine")
+    }
+
+    // MARK: - 75
+
+    /// A failed rebase must never retroactively make a successful land look
+    /// failed — same asymmetry `landWorkspace`'s own `cleanupWarning`
+    /// handling documents for the leftover-directory case (see its doc
+    /// comment). Teardown (sessions/rows/selection) already happened as
+    /// part of the land succeeding; the rebase is a separate, optional step
+    /// the user opted into AFTERWARD.
+    func test75_rebaseFailureSetsLastErrorButLandTeardownStaysIntact() async {
+        let fake = FakeWorkspaceEngine()
+        let (store, spy, _) = TestSupport.makeStore(engine: fake)
+        let wsRow = await makeLandableWorkspace(store: store, fake: fake)
+        let wsSessionID = store.sessions.first { $0.target == .workspace(projectPath: wsRow.projectPath, name: wsRow.name) }!.id
+
+        fake.nextPreviewResult = .success(
+            LandPreview(
+                bookmark: "main", bookmarkCommit: "efdd547",
+                commits: [LandCommit(id: "abc", subject: "do a thing")],
+                conflicts: [], needsMessage: false,
+                diverging: [LandCommit(id: "def", subject: "unrelated local work")]
+            )
+        )
+        let dialogs = FakeDialogs()
+        dialogs.nextLandDecision = .land(message: nil)
+        dialogs.nextConfirmRebaseOntoTrunk = true
+        fake.nextLandResult = .success(LandResult(commitID: "abc123", bookmark: "main"))
+        fake.nextRebaseResult = .failure(.rebaseConflict("rebase hit a conflict"))
+
+        await store.reviewAndLandWorkspace(wsRow.id, dialogs: dialogs)
+
+        XCTAssertEqual(store.lastError, "rebase hit a conflict")
+        XCTAssertTrue(spy.closedIDs.contains(wsSessionID), "the land's own teardown must still have happened")
+        XCTAssertFalse(store.sessions.contains { $0.id == wsSessionID })
+        XCTAssertFalse(store.workspaces.contains { $0.id == wsRow.id }, "the land itself must still read as successful")
+    }
 }

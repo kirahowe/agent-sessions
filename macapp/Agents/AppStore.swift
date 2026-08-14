@@ -13,7 +13,7 @@ final class AppStore: ObservableObject {
     /// and retrying, so the UI needs to offer that instead of just showing a
     /// dead-end error message. Carries the original workspace id + message
     /// so the retry doesn't require the user to retype anything.
-    @Published var pendingTrunkBootstrap: (workspaceID: String, message: String)?
+    @Published var pendingTrunkBootstrap: (workspaceID: String, message: String?)?
     /// What each live session's agent is currently doing, as reported by
     /// Claude Code hooks via desktop-notification OSC sequences (see
     /// `SessionActivity`). Deliberately NOT part of `PersistedState`/
@@ -218,7 +218,7 @@ final class AppStore: ObservableObject {
     /// would kill a live terminal for a change that was never actually
     /// landed — so nothing local changes until the engine confirms success.
     @discardableResult
-    func landWorkspace(_ id: WorkspaceRow.ID, message: String, createTrunk: String? = nil) async -> Bool {
+    func landWorkspace(_ id: WorkspaceRow.ID, message: String?, createTrunk: String? = nil) async -> Bool {
         guard let workspace = workspaces.first(where: { $0.id == id }) else { return false }
 
         let result: LandResult
@@ -262,6 +262,90 @@ final class AppStore: ObservableObject {
             lastError = cleanupWarning
         }
         return true
+    }
+
+    /// The async front half of "Keep Changes…": fetches a preview of what
+    /// landing would actually do, shows it to the user, lands iff they
+    /// confirm, and — only when landing left the default workspace's own
+    /// commits forked off trunk — offers to rebase them back on. This is
+    /// what replaced the old flow, where `AppActions` called
+    /// `dialogs.promptLandMessage` synchronously before ever touching the
+    /// engine (see `LandDecision`'s doc comment in DialogPresenting.swift
+    /// for why that prompt's message was mostly discarded work).
+    ///
+    /// `landWorkspace` above still does the actual land + teardown, called
+    /// from here as one step — kept separate so it stays a small, direct
+    /// "just land it" operation callable on its own, which matters because
+    /// RootView's trunk-bootstrap retry (bound to `pendingTrunkBootstrap`)
+    /// calls it directly, bypassing this function and its preview entirely
+    /// (see the `.noTrunk` catch below for why that bypass is correct, not
+    /// just expedient).
+    ///
+    /// `dialogs` is a parameter rather than a stored property, like every
+    /// other AppStore dependency that isn't state/persistence: AppStore's
+    /// whole reason for existing separately from AppActions is to stay
+    /// AppKit-free and unit-testable without a running NSAlert modal loop
+    /// (see DialogPresenting.swift's doc comment) — a stored `dialogs`
+    /// here would undo that for the entire type, not just this method.
+    func reviewAndLandWorkspace(_ id: WorkspaceRow.ID, dialogs: any DialogPresenting) async {
+        guard let workspace = workspaces.first(where: { $0.id == id }) else { return }
+
+        let preview: LandPreview
+        do {
+            preview = try await engine.previewLand(workspace)
+        } catch EngineError.noTrunk {
+            // Same recoverable path as landWorkspace's own `.noTrunk` catch
+            // below — the UI offers to create the trunk bookmark and retry
+            // rather than a dead-end error (see RootView.swift's alert bound
+            // to `pendingTrunkBootstrap`). The one thing that's genuinely
+            // different here: landWorkspace's catch reuses the message ITS
+            // caller already collected, because the OLD flow always
+            // prompted for a message before ever attempting to land. This
+            // preview fails BEFORE `dialogs.confirmLand` ever runs — there
+            // is nothing to preview without a trunk to land onto, so the
+            // one dialog that could source a message never gets the chance
+            // to. Recording nil here is safe in practice, not just
+            // convenient: `needsMessage` is only ever true for the rare
+            // non-empty-and-undescribed working-copy case, and the retry
+            // this sets up (RootView's "Create" button) calls
+            // `landWorkspace` directly rather than back through this
+            // function — the exact same bootstrap path that already existed
+            // before this change, just now also reachable from a preview
+            // failure instead of only a land failure.
+            pendingTrunkBootstrap = (workspaceID: id, message: nil)
+            return
+        } catch let error as EngineError {
+            lastError = error.message
+            return
+        } catch {
+            lastError = "\(error)"
+            return
+        }
+
+        let decision = dialogs.confirmLand(workspace: workspace, preview: preview)
+        guard case .land(let message) = decision else { return }
+
+        let landed = await landWorkspace(id, message: message, createTrunk: nil)
+        guard landed, !preview.diverging.isEmpty else { return }
+
+        guard dialogs.confirmRebaseOntoTrunk(count: preview.diverging.count, bookmark: preview.bookmark) else { return }
+
+        do {
+            _ = try await engine.rebaseOntoTrunk(projectPath: workspace.projectPath)
+        } catch let error as EngineError {
+            // landWorkspace's teardown (sessions/rows/selection) already
+            // ran, unconditionally, before this point — this rebase is
+            // something the user opted into only AFTER the land already
+            // succeeded, so its failure must never retroactively make a
+            // successful land look failed. Same asymmetry landWorkspace's
+            // own `cleanupWarning` handling documents for the leftover-
+            // directory case; this rides the same non-fatal `lastError`
+            // alert rather than anything that could be mistaken for the
+            // land itself having failed.
+            lastError = error.message
+        } catch {
+            lastError = "\(error)"
+        }
     }
 
     func setWorkspaceLabel(_ id: WorkspaceRow.ID, label: String?) {
