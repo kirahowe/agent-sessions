@@ -152,7 +152,13 @@ final class TerminalCenter: SessionTerminating {
 /// is weak, so `TerminalCenter` retains this object itself (alongside the
 /// view/controller in its cache entry).
 @MainActor
-final class SessionDelegateProxy: TerminalSurfaceTitleDelegate, TerminalSurfaceCloseDelegate, TerminalSurfaceDesktopNotificationDelegate {
+final class SessionDelegateProxy:
+    TerminalSurfaceTitleDelegate,
+    TerminalSurfaceCloseDelegate,
+    TerminalSurfaceDesktopNotificationDelegate,
+    TerminalSurfaceBellDelegate,
+    TerminalSurfaceProgressReportDelegate
+{
     let sessionID: String
     weak var center: TerminalCenter?
 
@@ -199,6 +205,57 @@ final class SessionDelegateProxy: TerminalSurfaceTitleDelegate, TerminalSurfaceC
             signal = .structured(message)
         } else {
             signal = .notification(title: title, body: body)
+        }
+        center?.handleSessionSignal(sessionID: sessionID, signal: signal)
+    }
+
+    /// A bare BEL — the lowest-fidelity signal in the whole design, carrying
+    /// no text at all to classify.
+    ///
+    /// Shells do ring the bell for their own reasons (an ambiguous tab
+    /// completion, a readline error), so this is noisier than a notification.
+    /// Three properties keep that harmless rather than annoying: the reducer
+    /// may only ever *raise* on a bell and never downgrade an existing
+    /// `.blocked`, bells for the session the user is already looking at are
+    /// dropped, and any session speaking the structured protocol ignores
+    /// them outright. The bells that survive all three come from a
+    /// background session the user isn't watching — which is exactly the
+    /// case where an agent ringing the bell means what it says.
+    ///
+    /// The BEL that terminates an OSC sequence doesn't reach here: the
+    /// parser consumes it as a string terminator, so our own hook's
+    /// `\033]777;...\a` never doubles as a bell.
+    func terminalDidRingBell() {
+        center?.handleSessionSignal(sessionID: sessionID, signal: .bell)
+    }
+
+    /// OSC 9;4 progress reporting, mapped to a semantic signal HERE rather
+    /// than carried into the reducer — `TerminalProgressState` is a
+    /// libghostty type, and `SessionAttention` stays Foundation-only.
+    ///
+    /// `percent` is deliberately ignored. Nothing in this design renders a
+    /// progress bar; the only question being asked of a progress report is
+    /// whether the agent is demonstrably alive and working, and the state
+    /// alone answers that.
+    ///
+    /// `.remove` is dropped rather than mapped: it means the emitter tore
+    /// its progress bar down, which is equally consistent with "finished"
+    /// and "gave up / was interrupted." With no way to tell those apart,
+    /// raising would cry wolf on an abandoned task and clearing would hide
+    /// a finished one, so the honest move is to say nothing and let a
+    /// notification or the hook speak instead.
+    func terminalDidReportProgress(state: TerminalProgressState, percent: Int?) {
+        let signal: AttentionSignal
+        switch state {
+        case .set, .indeterminate:
+            signal = .working
+        case .error, .pause:
+            // Both mean the run stopped short of finishing and is sitting
+            // there — a raise, at the same fidelity as a bell: something
+            // wants the user, with nothing to say what.
+            signal = .bell
+        case .remove:
+            return
         }
         center?.handleSessionSignal(sessionID: sessionID, signal: signal)
     }

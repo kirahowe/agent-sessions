@@ -82,4 +82,63 @@ final class SessionDelegateProxyTests: XCTestCase {
             "the proxy must not trim, normalise or otherwise pre-chew the text — all interpretation belongs to AttentionClassifier, and a proxy that quietly cleaned up the input would put two different normalisation rules in play with only one of them tested"
         )
     }
+
+    // MARK: - 4
+
+    func test04_bellForwardsAsBellSignal() {
+        proxy.terminalDidRingBell()
+
+        XCTAssertEqual(
+            received.first?.signal, .bell,
+            "a bare BEL must reach the reducer — this conformance is the app's only subscription to it, and because the package registers delegates by conditional-casting the single delegate object, dropping the conformance would compile cleanly and simply never fire"
+        )
+    }
+
+    // MARK: - 5
+
+    func test05_progressSetAndIndeterminateForwardAsWorking() {
+        proxy.terminalDidReportProgress(state: .set, percent: 42)
+        proxy.terminalDidReportProgress(state: .indeterminate, percent: nil)
+
+        XCTAssertEqual(
+            received.map(\.signal), [.working, .working],
+            "an agent actively reporting progress is demonstrably busy, so both the determinate and indeterminate states must map to .working — mapping either one to a raise instead would light up the sidebar for a session that is visibly getting on with its job"
+        )
+    }
+
+    // MARK: - 6
+
+    func test06_progressErrorAndPauseForwardAsRaises() {
+        proxy.terminalDidReportProgress(state: .error, percent: nil)
+        proxy.terminalDidReportProgress(state: .pause, percent: 60)
+
+        XCTAssertEqual(
+            received.map(\.signal), [.bell, .bell],
+            "error and pause both mean the run stopped short and is sitting there — they must raise, at bell fidelity, rather than being treated as more work in progress"
+        )
+    }
+
+    // MARK: - 7
+
+    func test07_progressRemoveIsDroppedEntirely() {
+        proxy.terminalDidReportProgress(state: .remove, percent: nil)
+
+        XCTAssertTrue(
+            received.isEmpty,
+            "a progress bar being torn down is equally consistent with 'finished' and 'gave up', so it must produce no signal at all — mapping it to a raise would cry wolf on every abandoned task, and mapping it to .working would clear a genuine indicator the moment an unrelated progress bar disappeared"
+        )
+    }
+
+    // MARK: - 8
+
+    /// `percent` is not part of any signal — nothing in this design renders
+    /// progress — so the same state must produce the same signal whatever
+    /// number rides along with it.
+    func test08_progressPercentDoesNotAffectTheSignal() {
+        for percent in [nil, 0, 50, 100] as [Int?] {
+            received = []
+            proxy.terminalDidReportProgress(state: .set, percent: percent)
+            XCTAssertEqual(received.map(\.signal), [.working], "progress percent \(String(describing: percent)) must not change which signal a .set report produces")
+        }
+    }
 }
