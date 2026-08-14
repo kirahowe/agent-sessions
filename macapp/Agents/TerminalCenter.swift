@@ -180,16 +180,26 @@ final class SessionDelegateProxy: TerminalSurfaceTitleDelegate, TerminalSurfaceC
     /// in.
     ///
     /// A nil parse result means this notification isn't the structured
-    /// `agents:status` protocol — either a genuine desktop notification from
-    /// some other program in the shell (e.g. an npm build finishing), or an
-    /// agent's own free-text turn/permission notification. This stage keeps
-    /// behaviour identical to today and drops that case unhandled; routing
-    /// it as `AttentionSignal.notification` for `AttentionClassifier` to
-    /// score is the next stage, not this one.
+    /// `agents:status` protocol — either an agent's own free-text
+    /// turn/permission notification (Gemini CLI natively, Claude Code with
+    /// `preferredNotifChannel` set) or a genuine desktop notification from
+    /// some other program in the shell (an npm build finishing, say). Both
+    /// go through as `.notification` for the reducer to classify, and that
+    /// conflation is deliberate: a notification firing at all means
+    /// *something* wants the user, which is exactly what an unread-style
+    /// indicator is for. A session that speaks the structured protocol is
+    /// unaffected either way — the reducer's latch drops these for it.
+    ///
+    /// Note this proxy no longer decides anything. `parseStatusMessage` only
+    /// picks which signal case the text belongs to; whether either one
+    /// changes the indicator is `SessionAttention.reduce`'s call alone.
     func terminalDidRequestDesktopNotification(title: String, body: String) {
-        guard let message = SessionActivity.parseStatusMessage(title: title, body: body) else {
-            return
+        let signal: AttentionSignal
+        if let message = SessionActivity.parseStatusMessage(title: title, body: body) {
+            signal = .structured(message)
+        } else {
+            signal = .notification(title: title, body: body)
         }
-        center?.handleSessionSignal(sessionID: sessionID, signal: .structured(message))
+        center?.handleSessionSignal(sessionID: sessionID, signal: signal)
     }
 }
