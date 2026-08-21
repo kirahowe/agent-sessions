@@ -70,15 +70,26 @@ struct SidebarView: View {
         }
         .listStyle(.sidebar)
         .environment(\.defaultMinListRowHeight, 28)
-        .safeAreaInset(edge: .bottom) {
-            Button {
-                actions?.perform(.addProject)
-            } label: {
-                Text("Add Project…")
-                    .frame(maxWidth: .infinity)
+        // `spacing: 0` plus an opaque bar behind the whole inset: without a
+        // background the List scrolls *through* the button, and a long session
+        // list ends up rendering rows on top of the label. The Divider is the
+        // usual macOS bottom-bar hairline marking where scrollable content ends.
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            VStack(spacing: 0) {
+                Divider()
+                Button {
+                    actions?.perform(.addProject)
+                } label: {
+                    Label("Add Project…", systemImage: "plus")
+                        .frame(maxWidth: .infinity)
+                }
+                // Explicit, because a Button inside a `.sidebar` List otherwise
+                // inherits a borderless style and renders as bare accent text.
+                .buttonStyle(.bordered)
+                .controlSize(.large)
+                .padding(12)
             }
-            .controlSize(.large)
-            .padding(12)
+            .background(.bar)
         }
     }
 
