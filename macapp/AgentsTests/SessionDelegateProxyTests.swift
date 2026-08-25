@@ -28,12 +28,16 @@ final class SessionDelegateProxyTests: XCTestCase {
     private var center: TerminalCenter!
     private var proxy: SessionDelegateProxy!
     private var received: [(id: String, signal: AttentionSignal)] = []
+    private var receivedOmpEvents: [(id: String, event: OmpSessionEvent)] = []
 
     override func setUp() async throws {
         try await super.setUp()
         let center = TerminalCenter()
         center.onSessionSignal = { [weak self] id, signal in
             self?.received.append((id, signal))
+        }
+        center.onOmpSessionEvent = { [weak self] id, event in
+            self?.receivedOmpEvents.append((id, event))
         }
         self.center = center
         proxy = SessionDelegateProxy(sessionID: sessionID, center: center)
@@ -43,6 +47,7 @@ final class SessionDelegateProxyTests: XCTestCase {
         proxy = nil
         center = nil
         received = []
+        receivedOmpEvents = []
         try await super.tearDown()
     }
 
@@ -140,5 +145,35 @@ final class SessionDelegateProxyTests: XCTestCase {
             proxy.terminalDidReportProgress(state: .set, percent: percent)
             XCTAssertEqual(received.map(\.signal), [.working], "progress percent \(String(describing: percent)) must not change which signal a .set report produces")
         }
+    }
+
+    // MARK: - OMP Warp CLI-agent protocol
+
+    func testValidOmpNotificationUsesDistinctCallbackAndNeverBecomesAttentionSignal() {
+        proxy.terminalDidRequestDesktopNotification(
+            title: OmpSessionEvent.notificationTitle,
+            body: #"{"event":"prompt_submit","v":1,"agent":"omp","session_id":"omp-123","query":"Fix it"}"#
+        )
+
+        XCTAssertTrue(received.isEmpty)
+        XCTAssertEqual(receivedOmpEvents.map(\.id), [sessionID])
+        XCTAssertEqual(receivedOmpEvents.first?.event.sessionID, "omp-123")
+        XCTAssertEqual(receivedOmpEvents.first?.event.query, "Fix it")
+    }
+
+    func testMalformedOrUnsupportedWarpNotificationIsConsumed() {
+        for body in [
+            "not json",
+            #"{"event":"stop","v":2,"agent":"omp","session_id":"omp-123"}"#,
+            #"{"event":"stop","v":1,"agent":"other","session_id":"omp-123"}"#,
+        ] {
+            proxy.terminalDidRequestDesktopNotification(
+                title: OmpSessionEvent.notificationTitle,
+                body: body
+            )
+        }
+
+        XCTAssertTrue(received.isEmpty)
+        XCTAssertTrue(receivedOmpEvents.isEmpty)
     }
 }

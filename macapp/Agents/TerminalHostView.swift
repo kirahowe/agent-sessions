@@ -31,7 +31,8 @@ struct TerminalHostView: NSViewRepresentable {
 
         let terminalView = center.terminalView(
             for: selectedID,
-            workingDirectory: store.workingDirectory(for: row)
+            workingDirectory: store.workingDirectory(for: row),
+            restoredOmpResume: row.ompResume
         )
 
         if terminalView.superview !== containerView {
@@ -44,6 +45,8 @@ struct TerminalHostView: NSViewRepresentable {
                 terminalView.bottomAnchor.constraint(equalTo: containerView.bottomAnchor),
             ])
         }
+
+        center.showResumeHintIfNeeded(for: selectedID)
 
         for subview in containerView.subviews {
             subview.isHidden = subview !== terminalView

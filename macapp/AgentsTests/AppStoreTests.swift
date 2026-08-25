@@ -564,12 +564,12 @@ final class AppStoreTests: XCTestCase {
 
     // MARK: - 21b
 
-    // The upgrade path for existing users: a v2 state.json written before
-    // `customName`/`agentTitle` existed omits those keys entirely. Decoding
-    // must treat them as nil rather than throwing — a throw would move the
-    // file aside as "corrupt" and silently wipe the user's projects/sessions
-    // on the very first launch after the update.
-    func test21b_v2JSONWithoutCustomNameOrAgentTitleDecodesThoseAsNil() throws {
+    // The upgrade path for existing users: an older v2 state.json omits
+    // `customName`, `agentTitle`, and `ompResume`. Decoding must treat them as
+    // nil rather than throwing — a throw would move the file aside as
+    // "corrupt" and silently wipe the user's projects/sessions on the very
+    // first launch after the update.
+    func test21b_oldV2JSONWithoutOptionalSessionMetadataDecodesItAsNil() throws {
         let url = TestSupport.freshStateURL()
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
 
@@ -584,6 +584,7 @@ final class AppStoreTests: XCTestCase {
         let session = store.sessions.first { $0.id == "s-1" }!
         XCTAssertNil(session.customName)
         XCTAssertNil(session.agentTitle)
+        XCTAssertNil(session.ompResume)
         // With neither present the display name falls back to the auto label.
         XCTAssertEqual(session.displayName, "Session 1")
         XCTAssertNil(session.subtitle)
@@ -2146,5 +2147,88 @@ final class AppStoreTests: XCTestCase {
             store.attention[sessionA.id]?.activity, .yourTurn,
             "selection changes alone must never attend a session — without the app-active flag ever being set true, a notification for the selected session must still raise, or a store that never received the seed call would silently swallow every notification for whatever happens to be selected"
         )
+    }
+
+    // MARK: - OMP session resume
+
+    func test87_ompCallbackPersistsAndEnrichesResumeMetadataWithoutRaisingAttention() {
+        let (store, spy, url) = TestSupport.makeStore()
+        store.addProject(path: "/tmp/proj-A")
+        let sessionID = store.sessions.first!.id
+
+        spy.onTitleChange?(sessionID, "π ⠙ Repair persistence")
+        spy.onOmpSessionEvent?(
+            sessionID,
+            OmpSessionEvent(name: "session_start", sessionID: "omp-1", query: nil)
+        )
+
+        XCTAssertEqual(
+            store.sessions.first?.ompResume,
+            OmpSessionResumeMetadata(
+                sessionID: "omp-1",
+                title: "Repair persistence",
+                prompt: nil
+            )
+        )
+        XCTAssertNil(store.attention[sessionID])
+
+        spy.onOmpSessionEvent?(
+            sessionID,
+            OmpSessionEvent(name: "prompt_submit", sessionID: "omp-1", query: "Make it durable")
+        )
+        spy.onTitleChange?(sessionID, "zsh: /tmp/proj-A")
+
+        XCTAssertEqual(store.sessions.first?.ompResume?.title, "Repair persistence")
+        XCTAssertEqual(store.sessions.first?.ompResume?.prompt, "Make it durable")
+
+        let restored = AppStore(terminals: SpyTerminals(), stateURL: url, engine: FakeWorkspaceEngine())
+        XCTAssertEqual(restored.sessions.first?.ompResume, store.sessions.first?.ompResume)
+    }
+
+    func test88_newOmpSessionIDReplacesPriorMetadataAndLaterDecoratedTitleEnrichesIt() {
+        let (store, spy, _) = TestSupport.makeStore()
+        store.addProject(path: "/tmp/proj-A")
+        let sessionID = store.sessions.first!.id
+
+        spy.onTitleChange?(sessionID, "π > Old task")
+        spy.onOmpSessionEvent?(
+            sessionID,
+            OmpSessionEvent(name: "prompt_submit", sessionID: "omp-old", query: "Old prompt")
+        )
+        spy.onTitleChange?(sessionID, "π > New task")
+        spy.onOmpSessionEvent?(
+            sessionID,
+            OmpSessionEvent(name: "session_start", sessionID: "omp-new", query: nil)
+        )
+
+        XCTAssertEqual(
+            store.sessions.first?.ompResume,
+            OmpSessionResumeMetadata(sessionID: "omp-new", title: "New task", prompt: nil)
+        )
+
+        spy.onTitleChange?(sessionID, "π ! New task needs input")
+        XCTAssertEqual(store.sessions.first?.ompResume?.title, "New task needs input")
+    }
+
+    func test89_shellTitleDoesNotEnrichOrClearExistingOmpResumeMetadata() {
+        let (store, spy, _) = TestSupport.makeStore()
+        store.addProject(path: "/tmp/proj-A")
+        let sessionID = store.sessions.first!.id
+
+        spy.onTitleChange?(sessionID, "zsh: /tmp/proj-A")
+        spy.onOmpSessionEvent?(
+            sessionID,
+            OmpSessionEvent(name: "session_start", sessionID: "omp-1", query: nil)
+        )
+        spy.onOmpSessionEvent?(
+            sessionID,
+            OmpSessionEvent(name: "tool_complete", sessionID: "omp-1", query: nil)
+        )
+
+        XCTAssertNil(store.sessions.first?.ompResume?.title)
+        XCTAssertEqual(store.sessions.first?.ompResume?.sessionID, "omp-1")
+
+        spy.onTitleChange?(sessionID, "π > Recognized OMP task")
+        XCTAssertEqual(store.sessions.first?.ompResume?.title, "Recognized OMP task")
     }
 }

@@ -64,6 +64,9 @@ struct SessionRow: Identifiable, Codable, Hashable {
     // AppStore.setSessionTitle): a shell quietly clearing its title must not
     // wipe the remembered one.
     var agentTitle: String? = nil
+    // Resume information announced by OMP's Warp CLI-agent protocol.
+    // Optional for backward-compatible decoding of existing v2 state files.
+    var ompResume: OmpSessionResumeMetadata? = nil
 
     var projectPath: String { target.projectPath }
 

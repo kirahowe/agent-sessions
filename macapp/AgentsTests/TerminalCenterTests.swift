@@ -87,4 +87,11 @@ final class TerminalCenterTests: XCTestCase {
             "TerminalCenter.sessionEnvVars sets AGENTS_APP to an empty string — the hook's guard treats an unset-or-empty value identically, so this would disable every session's sidebar status indicator just as completely as dropping the key entirely"
         )
     }
+
+    func testSessionEnvVarsEnablesWarpCliAgentProtocol() {
+        XCTAssertEqual(
+            TerminalCenter.sessionEnvVars["WARP_CLI_AGENT_PROTOCOL_VERSION"],
+            "1"
+        )
+    }
 }

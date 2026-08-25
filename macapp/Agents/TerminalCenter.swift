@@ -11,6 +11,9 @@ final class TerminalCenter: SessionTerminating {
         let view: TerminalView
         let controller: TerminalController
         let delegateProxy: SessionDelegateProxy
+        let restoredOmpResume: OmpSessionResumeMetadata?
+        var resumeHintScheduled = false
+        var didShowResumeHint = false
     }
 
     private var entries: [String: Entry] = [:]
@@ -65,7 +68,10 @@ final class TerminalCenter: SessionTerminating {
     /// the hook just sees an unset variable and exits 0 before ever writing
     /// its escape, so nothing in this app's logs would even hint at why the
     /// dots stopped appearing.
-    static let sessionEnvVars: [String: String] = ["AGENTS_APP": "1"]
+    static let sessionEnvVars: [String: String] = [
+        "AGENTS_APP": "1",
+        "WARP_CLI_AGENT_PROTOCOL_VERSION": "1",
+    ]
 
     /// Invoked with the session id after the underlying shell process exits
     /// and the terminal has already been torn down.
@@ -81,10 +87,19 @@ final class TerminalCenter: SessionTerminating {
     /// `SessionDelegateProxy.terminalDidChangeTitle`.
     var onTitleChange: ((String, String) -> Void)?
 
+    /// Invoked with a decoded OMP Warp CLI-agent event. Notifications with
+    /// the Warp title that fail decoding are consumed by the delegate proxy
+    /// and never arrive here or at the attention classifier.
+    var onOmpSessionEvent: ((String, OmpSessionEvent) -> Void)?
+
     /// Lazily creates (on first call) or returns the cached `TerminalView`
     /// for a session, spawning the user's login shell rooted at
     /// `workingDirectory`.
-    func terminalView(for sessionID: String, workingDirectory: String) -> TerminalView {
+    func terminalView(
+        for sessionID: String,
+        workingDirectory: String,
+        restoredOmpResume: OmpSessionResumeMetadata?
+    ) -> TerminalView {
         if let entry = entries[sessionID] {
             return entry.view
         }
@@ -111,8 +126,47 @@ final class TerminalCenter: SessionTerminating {
         let controller = TerminalController(terminalConfiguration: Self.terminalConfiguration)
         view.controller = controller
 
-        entries[sessionID] = Entry(view: view, controller: controller, delegateProxy: proxy)
+        entries[sessionID] = Entry(
+            view: view,
+            controller: controller,
+            delegateProxy: proxy,
+            restoredOmpResume: restoredOmpResume
+        )
         return view
+    }
+
+    /// Prints a resume hint exactly once, and only when metadata was already
+    /// present when this live surface was created. Metadata learned from OMP
+    /// running in the current surface is intentionally never injected back
+    /// into that active session.
+    func showResumeHintIfNeeded(for sessionID: String) {
+        guard var entry = entries[sessionID],
+              entry.view.superview != nil,
+              !entry.resumeHintScheduled,
+              !entry.didShowResumeHint,
+              entry.restoredOmpResume != nil
+        else { return }
+
+        // Give AppKit one run-loop turn to create the Ghostty surface after
+        // the view enters the hierarchy; sendText is intentionally a no-op
+        // before that surface exists.
+        entry.resumeHintScheduled = true
+        entries[sessionID] = entry
+        DispatchQueue.main.async { [weak self] in
+            self?.deliverResumeHint(for: sessionID)
+        }
+    }
+
+    private func deliverResumeHint(for sessionID: String) {
+        guard var entry = entries[sessionID],
+              entry.resumeHintScheduled,
+              !entry.didShowResumeHint,
+              let metadata = entry.restoredOmpResume
+        else { return }
+
+        entry.didShowResumeHint = true
+        entries[sessionID] = entry
+        entry.view.sendText(OmpSessionResumeMetadata.resumeHintCommand(for: metadata))
     }
 
     /// Tears down a session's terminal: removes the view from its superview
@@ -143,6 +197,10 @@ final class TerminalCenter: SessionTerminating {
     /// window title. Just forwards — same reasoning as `handleSessionSignal`.
     func handleTitleChange(sessionID: String, title: String) {
         onTitleChange?(sessionID, title)
+    }
+
+    func handleOmpSessionEvent(sessionID: String, event: OmpSessionEvent) {
+        onOmpSessionEvent?(sessionID, event)
     }
 }
 
@@ -185,21 +243,22 @@ final class SessionDelegateProxy:
     /// all the registration this proxy needs — nothing else has to opt it
     /// in.
     ///
-    /// A nil parse result means this notification isn't the structured
-    /// `agents:status` protocol — either an agent's own free-text
-    /// turn/permission notification (Gemini CLI natively, Claude Code with
-    /// `preferredNotifChannel` set) or a genuine desktop notification from
-    /// some other program in the shell (an npm build finishing, say). Both
-    /// go through as `.notification` for the reducer to classify, and that
-    /// conflation is deliberate: a notification firing at all means
-    /// *something* wants the user, which is exactly what an unread-style
-    /// indicator is for. A session that speaks the structured protocol is
-    /// unaffected either way — the reducer's latch drops these for it.
+    /// Warp CLI-agent notifications take a separate route: valid version-1
+    /// OMP envelopes are forwarded as OMP events, while every malformed or
+    /// unsupported notification carrying Warp's magic title is consumed.
+    /// Neither kind is allowed to fall through to fuzzy attention.
     ///
-    /// Note this proxy no longer decides anything. `parseStatusMessage` only
-    /// picks which signal case the text belongs to; whether either one
-    /// changes the indicator is `SessionAttention.reduce`'s call alone.
+    /// Other notifications are split between the structured `agents:status`
+    /// protocol and free text for `AttentionClassifier`; all attention-state
+    /// decisions remain in `SessionAttention.reduce`.
     func terminalDidRequestDesktopNotification(title: String, body: String) {
+        if title == OmpSessionEvent.notificationTitle {
+            if let event = OmpSessionEvent.parseNotification(title: title, body: body) {
+                center?.handleOmpSessionEvent(sessionID: sessionID, event: event)
+            }
+            return
+        }
+
         let signal: AttentionSignal
         if let message = SessionActivity.parseStatusMessage(title: title, body: body) {
             signal = .structured(message)

@@ -117,6 +117,9 @@ final class AppStore: ObservableObject {
         terminals.onTitleChange = { [weak self] id, title in
             self?.setSessionTitle(title, for: id)
         }
+        terminals.onOmpSessionEvent = { [weak self] id, event in
+            self?.handleOmpSessionEvent(event, for: id)
+        }
         load()
         seedSessionCounters()
     }
@@ -543,8 +546,54 @@ final class AppStore: ObservableObject {
     func setSessionTitle(_ title: String, for sessionID: String) {
         guard let index = sessions.firstIndex(where: { $0.id == sessionID }) else { return }
         let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty, sessions[index].agentTitle != trimmed else { return }
-        sessions[index].agentTitle = trimmed
+        guard !trimmed.isEmpty else { return }
+
+        var changed = false
+        if sessions[index].agentTitle != trimmed {
+            sessions[index].agentTitle = trimmed
+            changed = true
+        }
+        if var resume = sessions[index].ompResume,
+           let cleanTitle = OmpSessionResumeMetadata.normalizedDecoratedTitle(trimmed),
+           resume.title != cleanTitle
+        {
+            resume.title = cleanTitle
+            sessions[index].ompResume = resume
+            changed = true
+        }
+        guard changed else { return }
+        save()
+    }
+
+    /// Persists the resumable OMP session announced for one terminal row.
+    /// A changed OMP session id replaces the prior snapshot; subsequent
+    /// events for the same id only fill or update the title/prompt fields.
+    func handleOmpSessionEvent(_ event: OmpSessionEvent, for sessionID: String) {
+        guard let index = sessions.firstIndex(where: { $0.id == sessionID }) else { return }
+
+        let rawTitle = sessions[index].agentTitle
+        let currentDecoratedTitle = rawTitle.flatMap {
+            OmpSessionResumeMetadata.normalizedDecoratedTitle($0)
+        }
+        var next: OmpSessionResumeMetadata
+        if let existing = sessions[index].ompResume, existing.sessionID == event.sessionID {
+            next = existing
+            if next.title == nil {
+                next.title = currentDecoratedTitle
+            }
+            if let query = event.query {
+                next.prompt = query
+            }
+        } else {
+            next = OmpSessionResumeMetadata(
+                sessionID: event.sessionID,
+                title: currentDecoratedTitle,
+                prompt: event.query
+            )
+        }
+
+        guard sessions[index].ompResume != next else { return }
+        sessions[index].ompResume = next
         save()
     }
 
