@@ -23,6 +23,28 @@ The generated `macapp/Agents.xcodeproj` and build output under `macapp/.build`
 are gitignored — `bb gen` regenerates the project from `macapp/project.yml`
 whenever you need it.
 
+## Resuming OMP sessions after a restart
+
+The app remembers the last OMP session associated with each terminal. After
+relaunching Agents, opening a restored terminal starts a fresh shell and prints
+the remembered session title, an optional prompt preview, and an explicit
+resume command:
+
+```text
+OMP session: Add optional OMP session resume
+Prompt: Persist the last session for each terminal
+Resume: omp --resume 01a03bbc-0713-729c-a74b-b66f49ddeddd
+```
+
+Agents never runs that command automatically. Resuming can rebuild provider
+caches and spend tokens, so the decision stays with you.
+
+This integration currently supports OMP's default profile. It needs no hook or
+OMP configuration: terminals spawned by Agents opt into OMP's built-in
+CLI-agent protocol, then persist the session metadata OMP reports. Named OMP
+profiles are not included in that protocol yet, so Agents cannot construct a
+profile-qualified resume command for them.
+
 ## Waiting indicators
 
 Sessions show an indicator in the sidebar when their agent needs you:
