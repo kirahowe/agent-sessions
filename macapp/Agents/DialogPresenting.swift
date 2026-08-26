@@ -14,6 +14,11 @@ enum LandDecision: Equatable {
     case land(message: String?)
 }
 
+struct NewWorkspacePromptResult: Equatable {
+    let projectPath: String
+    let label: String
+}
+
 /// Abstracts AppKit dialog presentation away from `AppActions` so its
 /// routing logic can be tested without a running NSAlert/NSOpenPanel modal
 /// loop — mirrors the `SessionTerminating`/`WorkspaceEngineProviding` seams
@@ -22,17 +27,14 @@ enum LandDecision: Equatable {
 /// inject a fake. Covers the 7 operations `AppActions` actually calls.
 /// `promptRename` has two callers: this seam, for the selection-targeted
 /// menu item/shortcut routed through `AppActions`, and a direct call from
-/// SidebarView's row-targeted "Rename…" context-menu item, which acts on a
-/// specific row rather than `store.selection` and so has no need of
-/// `AppActions` or this seam at all. `promptNewWorkspaceLabel` is the same
-/// shape: this seam for the global `.newWorkspace` action, plus a direct
-/// `Dialogs.promptNewWorkspaceLabel()` call from SidebarView's
-/// project-header "New Workspace" item, which acts on a specific project
-/// rather than app-wide state. `promptWorkspaceLabel(currentLabel:)` is the
-/// odd one out, like `promptRename`'s second caller: it's called ONLY from
-/// SidebarView's row-targeted "Change Label…" context-menu item, which acts
-/// on a specific workspace row rather than `store.selection`, so it has no
-/// need of `AppActions` or this seam at all. `confirmLand`/
+/// SidebarView's row-targeted "Rename…" context-menu item. The new-workspace
+/// prompt is likewise used both here and directly by SidebarView, but always
+/// receives every open project so either entry point can choose the target.
+/// `promptWorkspaceLabel(currentLabel:)` is the odd one out, like
+/// `promptRename`'s second caller: it's called ONLY from SidebarView's
+/// row-targeted "Change Label…" context-menu item, which acts on a specific
+/// workspace row rather than `store.selection`, so it has no need of
+/// `AppActions` or this seam at all. `confirmLand`/
 /// `confirmRebaseOntoTrunk` are a THIRD shape: both of their callers — the
 /// selection-targeted `.keepWorkspaceChanges` case in `AppActions`, and
 /// SidebarView's row-targeted "Keep Changes…" context-menu item — reach
@@ -51,7 +53,7 @@ protocol DialogPresenting {
     func confirmLand(workspace: WorkspaceRow, preview: LandPreview) -> LandDecision
     func confirmRebaseOntoTrunk(count: Int, bookmark: String) -> Bool
     func promptRename(currentName: String) -> String?
-    func promptNewWorkspaceLabel() -> String?
+    func promptNewWorkspace(projects: [Project], defaultProject: Project?) -> NewWorkspacePromptResult?
 }
 
 /// Production conformer: forwards straight through to `Dialogs`.
@@ -77,5 +79,7 @@ struct LiveDialogPresenter: DialogPresenting {
         Dialogs.confirmRebaseOntoTrunk(count: count, bookmark: bookmark)
     }
     func promptRename(currentName: String) -> String? { Dialogs.promptRename(currentName: currentName) }
-    func promptNewWorkspaceLabel() -> String? { Dialogs.promptNewWorkspaceLabel() }
+    func promptNewWorkspace(projects: [Project], defaultProject: Project?) -> NewWorkspacePromptResult? {
+        Dialogs.promptNewWorkspace(projects: projects, defaultProject: defaultProject)
+    }
 }

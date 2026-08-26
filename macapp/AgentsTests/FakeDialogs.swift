@@ -17,11 +17,7 @@ final class FakeDialogs: DialogPresenting {
     var nextLandDecision: LandDecision = .cancel
     var nextConfirmRebaseOntoTrunk: Bool = true
     var nextRenameName: String? = nil
-    /// Defaults to "" (NOT nil) — meaning "user confirmed without typing a
-    /// custom label" — because that's the outcome existing `.newWorkspace`
-    /// tests already assume when they don't touch this fake. A nil default
-    /// would silently turn every one of those into a cancel and break them.
-    var nextNewWorkspaceLabel: String? = ""
+    var nextNewWorkspaceResult: NewWorkspacePromptResult? = nil
 
     private(set) var chooseProjectDirectoryCallCount: Int = 0
     private(set) var confirmRemoveCalls: [Project] = []
@@ -29,7 +25,7 @@ final class FakeDialogs: DialogPresenting {
     private(set) var confirmLandCalls: [(workspace: WorkspaceRow, preview: LandPreview)] = []
     private(set) var confirmRebaseOntoTrunkCalls: [(count: Int, bookmark: String)] = []
     private(set) var promptRenameCalls: [String] = []
-    private(set) var promptNewWorkspaceLabelCallCount: Int = 0
+    private(set) var promptNewWorkspaceCalls: [(projects: [Project], defaultProject: Project?)] = []
 
     func chooseProjectDirectory() -> String? {
         chooseProjectDirectoryCallCount += 1
@@ -61,8 +57,11 @@ final class FakeDialogs: DialogPresenting {
         return nextRenameName
     }
 
-    func promptNewWorkspaceLabel() -> String? {
-        promptNewWorkspaceLabelCallCount += 1
-        return nextNewWorkspaceLabel
+    func promptNewWorkspace(
+        projects: [Project],
+        defaultProject: Project?
+    ) -> NewWorkspacePromptResult? {
+        promptNewWorkspaceCalls.append((projects: projects, defaultProject: defaultProject))
+        return nextNewWorkspaceResult
     }
 }

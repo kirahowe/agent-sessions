@@ -196,77 +196,118 @@ final class AppActionsTests: XCTestCase {
         XCTAssertEqual(dialogs.confirmRemoveCalls, [project])
     }
 
-    // MARK: - 5: .newWorkspace (exercises private resolveProject() through perform)
+    // MARK: - 5: .newWorkspace
 
-    func test05a_newWorkspaceUsesSelectedSessionsProject() async {
+    func test05a_newWorkspacePassesOpenProjectsAndSelectedProjectAsDefault() async {
         let fake = FakeWorkspaceEngine()
         let (store, _, _) = TestSupport.makeStore(engine: fake)
-        let actions = makeActions(store: store)
+        let dialogs = FakeDialogs()
+        let actions = makeActions(store: store, dialogs: dialogs)
         store.addProject(path: "/tmp/proj-A")
-        store.addProject(path: "/tmp/proj-B") // selection now in B's session
+        store.addProject(path: "/tmp/proj-B") // selection now belongs to B
+        dialogs.nextNewWorkspaceResult = NewWorkspacePromptResult(
+            projectPath: "/tmp/proj-B",
+            label: ""
+        )
 
         XCTAssertTrue(actions.perform(.newWorkspace))
 
+        XCTAssertEqual(dialogs.promptNewWorkspaceCalls.count, 1)
+        XCTAssertEqual(dialogs.promptNewWorkspaceCalls[0].projects, store.projects)
+        XCTAssertEqual(dialogs.promptNewWorkspaceCalls[0].defaultProject?.path, "/tmp/proj-B")
         await waitUntil { !fake.createCalls.isEmpty }
         XCTAssertEqual(fake.createCalls, ["/tmp/proj-B"])
     }
 
-    func test05b_newWorkspaceFallsBackToSingleProjectWithNoSelection() async {
+    func test05b_newWorkspaceUsesPromptProjectInsteadOfSelectedDefault() async {
         let fake = FakeWorkspaceEngine()
         let (store, _, _) = TestSupport.makeStore(engine: fake)
-        let actions = makeActions(store: store)
+        let dialogs = FakeDialogs()
+        let actions = makeActions(store: store, dialogs: dialogs)
         store.addProject(path: "/tmp/proj-A")
-        store.selection = nil
+        store.addProject(path: "/tmp/proj-B") // selection now belongs to B
+        dialogs.nextNewWorkspaceResult = NewWorkspacePromptResult(
+            projectPath: "/tmp/proj-A",
+            label: ""
+        )
 
         XCTAssertTrue(actions.perform(.newWorkspace))
 
+        XCTAssertEqual(dialogs.promptNewWorkspaceCalls[0].defaultProject?.path, "/tmp/proj-B")
         await waitUntil { !fake.createCalls.isEmpty }
         XCTAssertEqual(fake.createCalls, ["/tmp/proj-A"])
     }
 
-    func test05c_newWorkspaceFalseWhenAmbiguous() {
-        let fake = FakeWorkspaceEngine()
-        let (store, _, _) = TestSupport.makeStore(engine: fake)
-        let actions = makeActions(store: store)
-        store.addProject(path: "/tmp/proj-A")
-        store.addProject(path: "/tmp/proj-B")
-        store.selection = nil
-
-        XCTAssertFalse(actions.perform(.newWorkspace))
-        XCTAssertTrue(fake.createCalls.isEmpty)
-    }
-
-    func test05d_newWorkspaceCancelReturnsTrueButCreatesNoWorkspace() {
+    func test05c_newWorkspaceWithNoSelectionOffersAllProjectsWithoutADefault() async {
         let fake = FakeWorkspaceEngine()
         let (store, _, _) = TestSupport.makeStore(engine: fake)
         let dialogs = FakeDialogs()
-        dialogs.nextNewWorkspaceLabel = nil
+        let actions = makeActions(store: store, dialogs: dialogs)
+        store.addProject(path: "/tmp/proj-A")
+        store.addProject(path: "/tmp/proj-B")
+        store.selection = nil
+        dialogs.nextNewWorkspaceResult = NewWorkspacePromptResult(
+            projectPath: "/tmp/proj-A",
+            label: ""
+        )
+
+        XCTAssertTrue(actions.perform(.newWorkspace))
+
+        XCTAssertEqual(dialogs.promptNewWorkspaceCalls.count, 1)
+        XCTAssertEqual(dialogs.promptNewWorkspaceCalls[0].projects, store.projects)
+        XCTAssertNil(dialogs.promptNewWorkspaceCalls[0].defaultProject)
+        await waitUntil { !fake.createCalls.isEmpty }
+        XCTAssertEqual(fake.createCalls, ["/tmp/proj-A"])
+    }
+
+    func test05d_newWorkspaceFalseOnlyWhenNoProjectsAreOpen() {
+        let fake = FakeWorkspaceEngine()
+        let (store, _, _) = TestSupport.makeStore(engine: fake)
+        let dialogs = FakeDialogs()
+        let actions = makeActions(store: store, dialogs: dialogs)
+
+        XCTAssertFalse(actions.perform(.newWorkspace))
+        XCTAssertTrue(dialogs.promptNewWorkspaceCalls.isEmpty)
+        XCTAssertTrue(fake.createCalls.isEmpty)
+    }
+
+    func test05e_newWorkspaceCancelReturnsTrueButCreatesNoWorkspace() {
+        let fake = FakeWorkspaceEngine()
+        let (store, _, _) = TestSupport.makeStore(engine: fake)
+        let dialogs = FakeDialogs()
+        dialogs.nextNewWorkspaceResult = nil
         let actions = makeActions(store: store, dialogs: dialogs)
         store.addProject(path: "/tmp/proj-A")
 
         XCTAssertTrue(actions.perform(.newWorkspace), "cancel still counts as handled")
 
-        // A cancelled dialog never even schedules the Task, so this is safe
-        // to assert synchronously without the polling helper.
+        XCTAssertEqual(dialogs.promptNewWorkspaceCalls.count, 1)
+        XCTAssertEqual(dialogs.promptNewWorkspaceCalls[0].projects, store.projects)
+        XCTAssertEqual(dialogs.promptNewWorkspaceCalls[0].defaultProject?.path, "/tmp/proj-A")
+        // A cancelled dialog never schedules the creation task.
         XCTAssertTrue(fake.createCalls.isEmpty)
     }
 
-    func test05e_newWorkspaceConfirmWithLabelCreatesWorkspaceCarryingThatLabel() async {
+    func test05f_newWorkspacePreservesPromptLabelForCreation() async {
         let fake = FakeWorkspaceEngine()
         let (store, _, _) = TestSupport.makeStore(engine: fake)
         let dialogs = FakeDialogs()
-        dialogs.nextNewWorkspaceLabel = "my label"
+        dialogs.nextNewWorkspaceResult = NewWorkspacePromptResult(
+            projectPath: "/tmp/proj-A",
+            label: "my label"
+        )
         let actions = makeActions(store: store, dialogs: dialogs)
         store.addProject(path: "/tmp/proj-A")
-        let wsRow = WorkspaceRow(projectPath: "/tmp/proj-A", name: "calm-river", path: "/tmp/workspaces/calm-river", label: nil)
+        let wsRow = WorkspaceRow(
+            projectPath: "/tmp/proj-A",
+            name: "calm-river",
+            path: "/tmp/workspaces/calm-river",
+            label: nil
+        )
         fake.nextCreateResult = .success(wsRow)
 
         XCTAssertTrue(actions.perform(.newWorkspace))
 
-        // Waits on the store state this test actually asserts, not on the
-        // engine call that precedes it: the append happens after the
-        // `await engine.createWorkspace`, so a createCalls-based wait would
-        // only be safe while the fake happens never to suspend.
         await waitUntil { !store.workspaces.isEmpty }
         XCTAssertEqual(store.workspaces.first?.label, "my label")
     }

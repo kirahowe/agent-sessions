@@ -162,13 +162,23 @@ final class AppActions {
             return store.selectSession(at: index)
 
         case .newWorkspace:
-            guard let project = resolveProject() else { return false }
+            let projects = store.projects
+            guard !projects.isEmpty else { return false }
+            let defaultProject = selectedProject()
             // Cancel still counts as handled, same reasoning as .addProject
             // above: once the dialog is scheduled the shortcut/menu item did
             // its job regardless of the user's choice.
             present {
-                if let label = self.dialogs.promptNewWorkspaceLabel() {
-                    Task { await self.store.createWorkspace(in: project.path, label: label) }
+                if let result = self.dialogs.promptNewWorkspace(
+                    projects: projects,
+                    defaultProject: defaultProject
+                ) {
+                    Task {
+                        await self.store.createWorkspace(
+                            in: result.projectPath,
+                            label: result.label
+                        )
+                    }
                 }
             }
             return true
@@ -220,18 +230,20 @@ final class AppActions {
         }
     }
 
-    /// Resolves which project an unqualified, selection-driven action
-    /// targets: the selected session's project, or (with no selection) the
-    /// single project if exactly one exists. Anything more ambiguous
-    /// resolves to nil. Shared by `.removeProject` and `.newWorkspace` —
-    /// both need "the project implied by current context," not a
-    /// row-targeted project (row-targeted creation/removal goes straight
-    /// through the store from SidebarView instead).
+    /// Returns the project represented by the current session selection.
+    private func selectedProject() -> Project? {
+        guard let selection = store.selection,
+              let row = store.sessions.first(where: { $0.id == selection })
+        else { return nil }
+        return store.projects.first(where: { $0.path == row.projectPath })
+    }
+
+    /// Resolves the target for an unqualified project-removal action: the
+    /// selected session's project, or the only project when exactly one is
+    /// open.
     private func resolveProject() -> Project? {
-        if let selection = store.selection,
-           let row = store.sessions.first(where: { $0.id == selection })
-        {
-            return store.projects.first(where: { $0.path == row.projectPath })
+        if let selectedProject = selectedProject() {
+            return selectedProject
         }
         if store.projects.count == 1 {
             return store.projects.first

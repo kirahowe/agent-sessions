@@ -102,13 +102,19 @@ struct SidebarView: View {
     /// button, so the two presentations can never drift apart.
     @ViewBuilder
     private func projectHeaderMenuItems(_ project: Project) -> some View {
-        // Direct store/Dialogs call, not actions.perform: this creates a
-        // workspace in the specific right-clicked project, not
-        // whatever project AppActions' .newWorkspace would resolve
-        // from selection (see design rationale in AppActions.swift).
+        // This project provides the initial selection, while the prompt still
+        // offers every open project as a possible workspace location.
         Button("New Workspace") {
-            if let label = Dialogs.promptNewWorkspaceLabel() {
-                Task { await store.createWorkspace(in: project.path, label: label) }
+            if let result = Dialogs.promptNewWorkspace(
+                projects: store.projects,
+                defaultProject: project
+            ) {
+                Task {
+                    await store.createWorkspace(
+                        in: result.projectPath,
+                        label: result.label
+                    )
+                }
             }
         }
         // Direct store/Dialogs call, not actions.perform: this

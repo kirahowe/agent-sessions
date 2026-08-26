@@ -209,32 +209,57 @@ enum Dialogs {
         return alert.runModal() == .alertFirstButtonReturn
     }
 
-    /// Prompts for a new workspace's sidebar label. Returns nil iff the user
-    /// cancelled — in that case no workspace should be created at all.
-    /// Otherwise returns the (untrimmed) field value as-is, including when
-    /// it's blank: blank input here is NOT collapsed to nil, because blank
-    /// is a meaningful "no label, use the generated name" answer, distinct
-    /// from cancelling. It's on the caller (`AppStore.createWorkspace`) to
-    /// trim and decide what blank means. (The now-removed `promptLandMessage`
-    /// used to collapse blank into the SAME nil its own Cancel path
-    /// returned, which is exactly the bug `LandDecision` in
-    /// DialogPresenting.swift exists to make impossible — see that type's
-    /// doc comment.)
-    static func promptNewWorkspaceLabel() -> String? {
+    /// Prompts for the project that will contain a new workspace and its
+    /// optional sidebar label. The label is returned untrimmed, including
+    /// when blank; nil means the user cancelled.
+    static func promptNewWorkspace(
+        projects: [Project],
+        defaultProject: Project?
+    ) -> NewWorkspacePromptResult? {
+        precondition(!projects.isEmpty)
+
         let alert = NSAlert()
         alert.messageText = "New Workspace"
         alert.informativeText =
-            "This sets a sidebar label only — the workspace keeps its own generated name on disk. Leave blank to use that generated name."
+            "Choose a project and optionally set a sidebar label. The workspace keeps its generated name on disk."
         alert.addButton(withTitle: "Create")
         alert.addButton(withTitle: "Cancel")
 
-        let textField = NSTextField(frame: NSRect(x: 0, y: 0, width: 240, height: 24))
-        textField.placeholderString = "Sidebar label (optional)"
-        alert.accessoryView = textField
-        alert.window.initialFirstResponder = textField
+        let duplicateNameCounts = Dictionary(grouping: projects, by: \.name).mapValues(\.count)
+        let projectPicker = NSPopUpButton(frame: .zero, pullsDown: false)
+        projectPicker.addItems(withTitles: projects.map { project in
+            duplicateNameCounts[project.name, default: 0] > 1 ? project.path : project.name
+        })
+        let selectedIndex = defaultProject.flatMap { defaultProject in
+            projects.firstIndex { $0.path == defaultProject.path }
+        } ?? 0
+        projectPicker.selectItem(at: selectedIndex)
+
+        let labelField = NSTextField(frame: .zero)
+        labelField.placeholderString = "Optional"
+
+        let projectCaption = NSTextField(labelWithString: "Project")
+        let labelCaption = NSTextField(labelWithString: "Label")
+        projectCaption.alignment = .right
+        labelCaption.alignment = .right
+
+        let accessory = NSGridView(views: [
+            [projectCaption, projectPicker],
+            [labelCaption, labelField],
+        ])
+        accessory.columnSpacing = 8
+        accessory.rowSpacing = 8
+        projectPicker.widthAnchor.constraint(equalToConstant: 320).isActive = true
+        labelField.widthAnchor.constraint(equalTo: projectPicker.widthAnchor).isActive = true
+        accessory.frame = NSRect(origin: .zero, size: accessory.fittingSize)
+        alert.accessoryView = accessory
+        alert.window.initialFirstResponder = labelField
 
         guard alert.runModal() == .alertFirstButtonReturn else { return nil }
-        return textField.stringValue
+        return NewWorkspacePromptResult(
+            projectPath: projects[projectPicker.indexOfSelectedItem].path,
+            label: labelField.stringValue
+        )
     }
 
     /// Prompts for a workspace's sidebar label, pre-filled with
