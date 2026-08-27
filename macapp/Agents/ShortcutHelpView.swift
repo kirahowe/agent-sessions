@@ -36,8 +36,7 @@ struct ShortcutHelpView: View {
             } else if let shortcut = Keymap.standard[action] {
                 shortcutDisplay = shortcut.displayString
             } else {
-                // Menu-only action (e.g. removeProject, deleteWorkspace):
-                // no physical shortcut exists.
+                // Menu-only actions have no physical shortcut.
                 shortcutDisplay = "—"
             }
             rows.append(Row(id: action.helpTitle, title: action.helpTitle, shortcut: shortcutDisplay))

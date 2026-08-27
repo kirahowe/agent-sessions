@@ -712,82 +712,75 @@ final class AppStoreTests: XCTestCase {
         XCTAssertTrue(store.sessions.contains { $0.target == .workspace(projectPath: pathA, name: "ws-a") && $0.name == "Session 3" })
     }
 
-    // MARK: - 26
+    // MARK: - 26: close without adding
 
-    func test26a_deleteWorkspaceTearsDownSessionsRemovesRowAndClearsSelectionWhenInside() async {
-        let fake = FakeWorkspaceEngine()
-        let (store, spy, _) = TestSupport.makeStore(engine: fake)
-        let pathA = "/tmp/proj-A"
-        store.addProject(path: pathA)
-
-        let wsRow = WorkspaceRow(projectPath: pathA, name: "ws-a", path: "/tmp/workspaces/ws-a", label: nil)
-        fake.nextCreateResult = .success(wsRow)
-        await store.createWorkspace(in: pathA) // ws: Session 1, selected
-        store.newSession(in: .workspace(projectPath: pathA, name: "ws-a")) // ws: Session 2, selected
-
-        let wsSessionIDs = store.sessions
-            .filter { $0.target == .workspace(projectPath: pathA, name: "ws-a") }
-            .map(\.id)
-        XCTAssertEqual(wsSessionIDs.count, 2)
-        XCTAssertTrue(wsSessionIDs.contains(store.selection!))
-
-        await store.deleteWorkspace(wsRow.id)
-
-        XCTAssertEqual(spy.closedIDs.count, wsSessionIDs.count, "each session must be closed exactly once")
-        XCTAssertEqual(Set(spy.closedIDs), Set(wsSessionIDs))
-        XCTAssertTrue(store.sessions.filter { $0.target == .workspace(projectPath: pathA, name: "ws-a") }.isEmpty)
-        XCTAssertFalse(store.workspaces.contains { $0.id == wsRow.id })
-        XCTAssertEqual(fake.deleteCalls, [wsRow])
-        XCTAssertNil(store.selection)
+    private func makeClosableWorkspace(
+        store: AppStore,
+        fake: FakeWorkspaceEngine,
+        path: String = "/tmp/proj-A"
+    ) async -> WorkspaceRow {
+        store.addProject(path: path)
+        let workspace = WorkspaceRow(
+            projectPath: path,
+            name: "ws-a",
+            path: "/tmp/workspaces/ws-a",
+            label: nil
+        )
+        fake.nextCreateResult = .success(workspace)
+        await store.createWorkspace(in: path)
+        return workspace
     }
 
-    func test26b_deleteWorkspaceLeavesUnrelatedRootSelectionUntouched() async {
+    func test26_closeWithoutAddingTearsDownBeforeForgetAndKeepsFailureRetryMarker() async {
+        let fake = FakeWorkspaceEngine()
+        let (store, spy, _) = TestSupport.makeStore(engine: fake)
+        let workspace = await makeClosableWorkspace(store: store, fake: fake)
+        let sessionID = store.sessions.first {
+            $0.target == .workspace(projectPath: workspace.projectPath, name: workspace.name)
+        }!.id
+        fake.nextPreviewResult = .failure(.nothingToLand("nothing to add"))
+        await store.prepareCloseWorkspace(workspace.id)
+        fake.nextDeleteResult = .failure(.failed("forget failed"))
+
+        await store.closeWithoutAddingWorkspace()
+
+        XCTAssertTrue(spy.closedIDs.contains(sessionID))
+        XCTAssertFalse(store.sessions.contains { $0.id == sessionID })
+        XCTAssertTrue(store.workspaces.contains { $0.id == workspace.id })
+        XCTAssertEqual(fake.deleteCalls, [workspace])
+        XCTAssertEqual(store.closeWorkspace?.phase, .failure(message: "forget failed"))
+    }
+
+    func test27_changedWorkspaceRequiresInSheetConfirmationBeforeClosingWithoutAdding() async {
         let fake = FakeWorkspaceEngine()
         let (store, _, _) = TestSupport.makeStore(engine: fake)
-        let pathA = "/tmp/proj-A"
-        store.addProject(path: pathA) // root: Session 1, selected
-        let rootSelection = store.selection
+        let workspace = await makeClosableWorkspace(store: store, fake: fake)
+        fake.nextPreviewResult = .success(
+            LandPreview(
+                bookmark: "ignored",
+                bookmarkCommit: "ignored",
+                commits: [LandCommit(id: "1", subject: "A useful change")],
+                conflicts: [],
+                needsMessage: false,
+                diverging: []
+            )
+        )
+        await store.prepareCloseWorkspace(workspace.id)
 
-        let wsRow = WorkspaceRow(projectPath: pathA, name: "ws-a", path: "/tmp/workspaces/ws-a", label: nil)
-        fake.nextCreateResult = .success(wsRow)
-        await store.createWorkspace(in: pathA) // ws: Session 1, now selected
+        await store.closeWithoutAddingWorkspace()
+        XCTAssertTrue(fake.deleteCalls.isEmpty)
 
-        // Re-select the root session explicitly: createWorkspace moves
-        // selection to its new session, and this variant is about a
-        // pre-existing ROOT selection surviving an unrelated workspace's
-        // deletion, not about createWorkspace's own selection behavior
-        // (already covered by test23).
-        store.selection = rootSelection
+        store.requestCloseWithoutAdding()
+        guard case .confirmCloseWithoutAdding(let returnTo)? = store.closeWorkspace?.phase else {
+            return XCTFail("expected destructive confirmation state")
+        }
+        XCTAssertEqual(returnTo, .ready(changes: ["A useful change"]))
 
-        await store.deleteWorkspace(wsRow.id)
-
-        XCTAssertEqual(store.selection, rootSelection)
-        XCTAssertTrue(store.workspaces.isEmpty)
+        await store.closeWithoutAddingWorkspace()
+        XCTAssertEqual(fake.deleteCalls, [workspace])
+        XCTAssertFalse(store.workspaces.contains { $0.id == workspace.id })
+        XCTAssertEqual(store.closeWorkspace?.phase, .success(addedChanges: 0, notice: nil))
     }
-
-    // MARK: - 27
-
-    func test27_deleteWorkspaceEngineFailureKeepsWorkspaceRowAsRetryMarker() async {
-        let fake = FakeWorkspaceEngine()
-        let (store, spy, _) = TestSupport.makeStore(engine: fake)
-        let pathA = "/tmp/proj-A"
-        store.addProject(path: pathA)
-
-        let wsRow = WorkspaceRow(projectPath: pathA, name: "ws-a", path: "/tmp/workspaces/ws-a", label: nil)
-        fake.nextCreateResult = .success(wsRow)
-        await store.createWorkspace(in: pathA)
-        let wsSessionID = store.sessions.first { $0.target == .workspace(projectPath: pathA, name: "ws-a") }!.id
-
-        fake.nextDeleteResult = .failure(.failed("jj workspace forget failed"))
-
-        await store.deleteWorkspace(wsRow.id)
-
-        XCTAssertTrue(spy.closedIDs.contains(wsSessionID), "the session was already torn down before the engine call")
-        XCTAssertFalse(store.sessions.contains { $0.id == wsSessionID })
-        XCTAssertTrue(store.workspaces.contains { $0.id == wsRow.id }, "engine failure must leave the row as a visible retry marker")
-        XCTAssertEqual(store.lastError, "jj workspace forget failed")
-    }
-
     // MARK: - 28
 
     func test28_orderedTargetsGroupsRootBeforeWorkspacesPerProjectInCreationOrder() async {
@@ -954,213 +947,148 @@ final class AppStoreTests: XCTestCase {
         XCTAssertEqual(store.selection, created?.id)
     }
 
-    // MARK: - 33
+    // MARK: - 33: unified close flow
 
-    func test33a_landWorkspaceSuccessTearsDownSessionsRemovesRowAndClearsSelectionWhenInside() async {
+    func test33_cleanAddClosesWorkspaceThenAutomaticallyReconcilesProject() async {
         let fake = FakeWorkspaceEngine()
-        let (store, spy, url) = TestSupport.makeStore(engine: fake)
-        let pathA = "/tmp/proj-A"
-        store.addProject(path: pathA)
+        let (store, spy, _) = TestSupport.makeStore(engine: fake)
+        let workspace = await makeClosableWorkspace(store: store, fake: fake)
+        let workspaceSessionIDs = store.sessions.filter {
+            $0.target == .workspace(projectPath: workspace.projectPath, name: workspace.name)
+        }.map(\.id)
+        fake.nextPreviewResult = .success(
+            LandPreview(
+                bookmark: "ignored",
+                bookmarkCommit: "ignored",
+                commits: [
+                    LandCommit(id: "1", subject: "First change"),
+                    LandCommit(id: "2", subject: "Second change"),
+                ],
+                conflicts: [],
+                needsMessage: false,
+                diverging: []
+            )
+        )
+        var workspaceWasRemovedBeforeReconciliation = false
+        fake.onRebaseOntoTrunk = {
+            workspaceWasRemovedBeforeReconciliation = !store.workspaces.contains {
+                $0.id == workspace.id
+            }
+        }
 
-        let wsRow = WorkspaceRow(projectPath: pathA, name: "ws-a", path: "/tmp/workspaces/ws-a", label: nil)
-        fake.nextCreateResult = .success(wsRow)
-        await store.createWorkspace(in: pathA) // ws: Session 1, selected
-        store.newSession(in: .workspace(projectPath: pathA, name: "ws-a")) // ws: Session 2, selected
+        await store.prepareCloseWorkspace(workspace.id)
+        await store.addChangesAndCloseWorkspace()
 
-        let wsSessionIDs = store.sessions
-            .filter { $0.target == .workspace(projectPath: pathA, name: "ws-a") }
-            .map(\.id)
-        XCTAssertEqual(wsSessionIDs.count, 2)
-        XCTAssertTrue(wsSessionIDs.contains(store.selection!))
-
-        fake.nextLandResult = .success(LandResult(commitID: "abc123", bookmark: "main"))
-        let landed = await store.landWorkspace(wsRow.id, message: "Ship it")
-
-        XCTAssertTrue(landed)
         XCTAssertEqual(fake.landCalls.count, 1)
-        XCTAssertEqual(fake.landCalls.first?.workspace, wsRow)
-        XCTAssertEqual(fake.landCalls.first?.message, "Ship it")
-        XCTAssertNil(fake.landCalls.first?.createTrunk)
-        XCTAssertEqual(spy.closedIDs.count, wsSessionIDs.count, "each session must be closed exactly once")
-        XCTAssertEqual(Set(spy.closedIDs), Set(wsSessionIDs))
-        XCTAssertTrue(store.sessions.filter { $0.target == .workspace(projectPath: pathA, name: "ws-a") }.isEmpty)
-        XCTAssertFalse(store.workspaces.contains { $0.id == wsRow.id })
-        XCTAssertNil(store.selection)
-        XCTAssertNil(store.lastError, "a nil cleanupWarning must leave lastError untouched")
-
-        // The removal must persist across a fresh AppStore load from the
-        // same stateURL, not just live in the in-memory store.
-        let spy2 = SpyTerminals()
-        let store2 = AppStore(terminals: spy2, stateURL: url, engine: FakeWorkspaceEngine())
-        XCTAssertFalse(store2.workspaces.contains { $0.id == wsRow.id })
-        XCTAssertTrue(store2.sessions.filter { $0.target == .workspace(projectPath: pathA, name: "ws-a") }.isEmpty)
+        XCTAssertNil(fake.landCalls.first?.message)
+        XCTAssertEqual(fake.rebaseOntoTrunkCalls, [workspace.projectPath])
+        XCTAssertTrue(workspaceWasRemovedBeforeReconciliation)
+        XCTAssertEqual(Set(spy.closedIDs), Set(workspaceSessionIDs))
+        XCTAssertFalse(store.workspaces.contains { $0.id == workspace.id })
+        XCTAssertEqual(
+            store.closeWorkspace?.phase,
+            .success(addedChanges: 2, notice: nil)
+        )
     }
 
-    func test33b_landWorkspaceSuccessLeavesUnrelatedRootSelectionUntouched() async {
-        let fake = FakeWorkspaceEngine()
-        let (store, _, _) = TestSupport.makeStore(engine: fake)
-        let pathA = "/tmp/proj-A"
-        store.addProject(path: pathA) // root: Session 1, selected
-        let rootSelection = store.selection
-
-        let wsRow = WorkspaceRow(projectPath: pathA, name: "ws-a", path: "/tmp/workspaces/ws-a", label: nil)
-        fake.nextCreateResult = .success(wsRow)
-        await store.createWorkspace(in: pathA) // ws: Session 1, now selected
-
-        // Re-select the root session explicitly: createWorkspace moves
-        // selection to its new session, and this variant is about a
-        // pre-existing ROOT selection surviving an unrelated workspace's
-        // landing, not about createWorkspace's own selection behavior.
-        store.selection = rootSelection
-
-        fake.nextLandResult = .success(LandResult(commitID: "abc123", bookmark: "main"))
-        let landed = await store.landWorkspace(wsRow.id, message: "Ship it")
-
-        XCTAssertTrue(landed)
-        XCTAssertEqual(store.selection, rootSelection)
-        XCTAssertTrue(store.workspaces.isEmpty)
-    }
-
-    /// The land itself succeeded (jj already forgot the workspace and
-    /// advanced the bookmark, irreversibly) even though the leftover
-    /// directory couldn't be trashed — so teardown must still fully happen,
-    /// and the warning must surface as a non-fatal lastError rather than
-    /// making landWorkspace look like it failed.
-    func test33c_landWorkspaceCleanupWarningSurfacesAsLastErrorButTeardownStillHappens() async {
+    func test34_landConflictRaceLeavesWorkspaceAndSessionsAndShowsAttention() async {
         let fake = FakeWorkspaceEngine()
         let (store, spy, _) = TestSupport.makeStore(engine: fake)
-        let pathA = "/tmp/proj-A"
-        store.addProject(path: pathA)
-
-        let wsRow = WorkspaceRow(projectPath: pathA, name: "ws-a", path: "/tmp/workspaces/ws-a", label: nil)
-        fake.nextCreateResult = .success(wsRow)
-        await store.createWorkspace(in: pathA) // ws: Session 1, selected
-        store.newSession(in: .workspace(projectPath: pathA, name: "ws-a")) // ws: Session 2, selected
-
-        let wsSessionIDs = store.sessions
-            .filter { $0.target == .workspace(projectPath: pathA, name: "ws-a") }
-            .map(\.id)
-        XCTAssertEqual(wsSessionIDs.count, 2)
-        XCTAssertTrue(wsSessionIDs.contains(store.selection!))
-
-        fake.nextLandResult = .success(LandResult(commitID: "abc123", bookmark: "main", cleanupWarning: "some warning"))
-        let landed = await store.landWorkspace(wsRow.id, message: "Ship it")
-
-        XCTAssertTrue(landed)
-        XCTAssertEqual(spy.closedIDs.count, wsSessionIDs.count, "each session must be closed exactly once")
-        XCTAssertEqual(Set(spy.closedIDs), Set(wsSessionIDs))
-        XCTAssertTrue(store.sessions.filter { $0.target == .workspace(projectPath: pathA, name: "ws-a") }.isEmpty)
-        XCTAssertFalse(store.workspaces.contains { $0.id == wsRow.id })
-        XCTAssertNil(store.selection)
-        XCTAssertEqual(store.lastError, "some warning")
-    }
-
-    // MARK: - 34
-
-    func test34_landWorkspaceConflictFailureLeavesEverythingIntact() async {
-        let fake = FakeWorkspaceEngine()
-        let (store, spy, _) = TestSupport.makeStore(engine: fake)
-        let pathA = "/tmp/proj-A"
-        store.addProject(path: pathA)
-
-        let wsRow = WorkspaceRow(projectPath: pathA, name: "ws-a", path: "/tmp/workspaces/ws-a", label: nil)
-        fake.nextCreateResult = .success(wsRow)
-        await store.createWorkspace(in: pathA) // ws: Session 1, selected
-
+        let workspace = await makeClosableWorkspace(store: store, fake: fake)
+        fake.nextPreviewResult = .success(
+            LandPreview(
+                bookmark: "ignored",
+                bookmarkCommit: "ignored",
+                commits: [LandCommit(id: "1", subject: "Change")],
+                conflicts: [],
+                needsMessage: false,
+                diverging: []
+            )
+        )
+        await store.prepareCloseWorkspace(workspace.id)
         let sessionsBefore = store.sessions
-        let workspacesBefore = store.workspaces
-        let selectionBefore = store.selection
+        fake.nextLandResult = .failure(.landConflict("implementation detail"))
 
-        fake.nextLandResult = .failure(.landConflict("trunk moved since this workspace was created"))
-        let landed = await store.landWorkspace(wsRow.id, message: "Ship it")
+        await store.addChangesAndCloseWorkspace()
 
-        XCTAssertFalse(landed)
-        XCTAssertTrue(spy.closedIDs.isEmpty, "a land-conflict must leave the workspace fully intact, sessions included")
-        XCTAssertEqual(store.sessions, sessionsBefore)
-        XCTAssertEqual(store.workspaces, workspacesBefore)
-        XCTAssertEqual(store.selection, selectionBefore)
-        XCTAssertEqual(store.lastError, "trunk moved since this workspace was created")
-        XCTAssertNil(store.pendingTrunkBootstrap)
-    }
-
-    // MARK: - 35
-
-    func test35_landWorkspaceNoTrunkFailureSetsPendingTrunkBootstrapWithoutLastError() async {
-        let fake = FakeWorkspaceEngine()
-        let (store, spy, _) = TestSupport.makeStore(engine: fake)
-        let pathA = "/tmp/proj-A"
-        store.addProject(path: pathA)
-
-        let wsRow = WorkspaceRow(projectPath: pathA, name: "ws-a", path: "/tmp/workspaces/ws-a", label: nil)
-        fake.nextCreateResult = .success(wsRow)
-        await store.createWorkspace(in: pathA)
-
-        let sessionsBefore = store.sessions
-        let workspacesBefore = store.workspaces
-        let selectionBefore = store.selection
-
-        fake.nextLandResult = .failure(.noTrunk("no main/master/trunk bookmark exists"))
-        let landed = await store.landWorkspace(wsRow.id, message: "Ship it")
-
-        XCTAssertFalse(landed)
         XCTAssertTrue(spy.closedIDs.isEmpty)
         XCTAssertEqual(store.sessions, sessionsBefore)
-        XCTAssertEqual(store.workspaces, workspacesBefore)
-        XCTAssertEqual(store.selection, selectionBefore)
-        XCTAssertNil(store.lastError, "noTrunk is recoverable via pendingTrunkBootstrap, not a dead-end lastError")
-        XCTAssertEqual(store.pendingTrunkBootstrap?.workspaceID, wsRow.id)
-        XCTAssertEqual(store.pendingTrunkBootstrap?.message, "Ship it")
+        XCTAssertTrue(store.workspaces.contains { $0.id == workspace.id })
+        XCTAssertTrue(fake.rebaseOntoTrunkCalls.isEmpty)
+        guard case .conflictAttention? = store.closeWorkspace?.phase else {
+            return XCTFail("race-time overlap must become attention")
+        }
     }
 
-    // MARK: - 36
-
-    func test36_retryLandWorkspaceWithCreateTrunkPassesThroughAndSucceeds() async {
+    func test35_requiredSummaryMustBeNonemptyBeforeLand() async {
         let fake = FakeWorkspaceEngine()
         let (store, _, _) = TestSupport.makeStore(engine: fake)
-        let pathA = "/tmp/proj-A"
-        store.addProject(path: pathA)
+        let workspace = await makeClosableWorkspace(store: store, fake: fake)
+        fake.nextPreviewResult = .success(
+            LandPreview(
+                bookmark: "ignored",
+                bookmarkCommit: "ignored",
+                commits: [LandCommit(id: "1", subject: "")],
+                conflicts: [],
+                needsMessage: true,
+                diverging: []
+            )
+        )
+        await store.prepareCloseWorkspace(workspace.id)
 
-        let wsRow = WorkspaceRow(projectPath: pathA, name: "ws-a", path: "/tmp/workspaces/ws-a", label: nil)
-        fake.nextCreateResult = .success(wsRow)
-        await store.createWorkspace(in: pathA)
+        store.setCloseWorkspaceSummary("   ")
+        await store.addChangesAndCloseWorkspace()
+        XCTAssertTrue(fake.landCalls.isEmpty)
+        XCTAssertEqual(
+            store.closeWorkspace?.phase,
+            .summaryRequired(changes: ["Undescribed change"])
+        )
 
-        fake.nextLandResult = .failure(.noTrunk("no main/master/trunk bookmark exists"))
-        _ = await store.landWorkspace(wsRow.id, message: "Ship it")
-        XCTAssertNotNil(store.pendingTrunkBootstrap, "precondition: a prior noTrunk failure set the pending retry")
+        store.setCloseWorkspaceSummary("Describe the change")
+        await store.addChangesAndCloseWorkspace()
+        XCTAssertEqual(fake.landCalls.first?.message, "Describe the change")
+    }
 
-        fake.nextLandResult = .success(LandResult(commitID: "def456", bookmark: "main"))
-        let landed = await store.landWorkspace(wsRow.id, message: "Ship it", createTrunk: "main")
+    func test36_projectSetupRequiresSummaryForwardsItAndReportsUnknownCount() async {
+        let fake = FakeWorkspaceEngine()
+        let (store, _, _) = TestSupport.makeStore(engine: fake)
+        let workspace = await makeClosableWorkspace(store: store, fake: fake)
+        fake.nextPreviewResult = .failure(.noTrunk("storage-specific message"))
 
+        await store.prepareCloseWorkspace(workspace.id)
+        XCTAssertEqual(store.closeWorkspace?.phase, .projectSetupRequired)
+
+        store.setCloseWorkspaceSummary(" \n ")
+        await store.setUpProjectAndCloseWorkspace()
+        XCTAssertTrue(fake.landCalls.isEmpty)
+        XCTAssertEqual(store.closeWorkspace?.phase, .projectSetupRequired)
+
+        store.setCloseWorkspaceSummary("  Establish project progress  ")
+        fake.nextLandResult = .success(LandResult(commitID: "abc", bookmark: "main"))
+        await store.setUpProjectAndCloseWorkspace()
+
+        XCTAssertEqual(fake.landCalls.last?.message, "Establish project progress")
         XCTAssertEqual(fake.landCalls.last?.createTrunk, "main")
-        XCTAssertTrue(landed)
-        XCTAssertTrue(store.workspaces.isEmpty)
+        XCTAssertEqual(fake.rebaseOntoTrunkCalls, [workspace.projectPath])
+        XCTAssertEqual(
+            store.closeWorkspace?.phase,
+            .success(addedChanges: nil, notice: nil)
+        )
+        XCTAssertFalse(store.workspaces.contains { $0.id == workspace.id })
     }
 
-    // MARK: - 37
-
-    func test37_landWorkspaceNothingToLandFailureSetsLastError() async {
+    func test37_nothingToLandBecomesCloseOnlyAndClosesWithoutAnotherConfirmation() async {
         let fake = FakeWorkspaceEngine()
-        let (store, spy, _) = TestSupport.makeStore(engine: fake)
-        let pathA = "/tmp/proj-A"
-        store.addProject(path: pathA)
+        let (store, _, _) = TestSupport.makeStore(engine: fake)
+        let workspace = await makeClosableWorkspace(store: store, fake: fake)
+        fake.nextPreviewResult = .failure(.nothingToLand("nothing"))
 
-        let wsRow = WorkspaceRow(projectPath: pathA, name: "ws-a", path: "/tmp/workspaces/ws-a", label: nil)
-        fake.nextCreateResult = .success(wsRow)
-        await store.createWorkspace(in: pathA)
+        await store.prepareCloseWorkspace(workspace.id)
+        XCTAssertEqual(store.closeWorkspace?.phase, .noChanges)
 
-        let sessionsBefore = store.sessions
-        let workspacesBefore = store.workspaces
-        let selectionBefore = store.selection
-
-        fake.nextLandResult = .failure(.nothingToLand("workspace has no changes to land"))
-        let landed = await store.landWorkspace(wsRow.id, message: "Ship it")
-
-        XCTAssertFalse(landed)
-        XCTAssertTrue(spy.closedIDs.isEmpty)
-        XCTAssertEqual(store.sessions, sessionsBefore)
-        XCTAssertEqual(store.workspaces, workspacesBefore)
-        XCTAssertEqual(store.selection, selectionBefore)
-        XCTAssertEqual(store.lastError, "workspace has no changes to land")
+        await store.closeWithoutAddingWorkspace()
+        XCTAssertEqual(fake.deleteCalls, [workspace])
+        XCTAssertEqual(store.closeWorkspace?.phase, .success(addedChanges: 0, notice: nil))
     }
 
     // MARK: - 38
@@ -1666,266 +1594,200 @@ final class AppStoreTests: XCTestCase {
         )
     }
 
-    // MARK: - 67: reviewAndLandWorkspace
+    // MARK: - 67: close state edge cases
 
-    /// Sets up a workspace and a scripted preview result, ready for
-    /// `store.reviewAndLandWorkspace` to be called against it. Shared setup
-    /// for the whole `reviewAndLandWorkspace` section below, mirroring how
-    /// `test33a` etc. above hand-roll the same create-then-land setup for
-    /// `landWorkspace` — pulled into a helper here because this section has
-    /// many more variants to cover (dialog decision x preview shape x
-    /// engine outcome) than `landWorkspace`'s own section needed.
-    private func makeLandableWorkspace(
-        store: AppStore, fake: FakeWorkspaceEngine, pathA: String = "/tmp/proj-A"
-    ) async -> WorkspaceRow {
-        store.addProject(path: pathA)
-        let wsRow = WorkspaceRow(projectPath: pathA, name: "ws-a", path: "/tmp/workspaces/ws-a", label: nil)
-        fake.nextCreateResult = .success(wsRow)
-        await store.createWorkspace(in: pathA)
-        return wsRow
-    }
-
-    /// THE regression test for the bug that motivated replacing
-    /// `promptLandMessage`'s `String?` with `LandDecision`: confirming with
-    /// a blank/absent message must still land — not silently no-op the way
-    /// the old `nil`-collapsing prompt did (see `LandDecision`'s doc
-    /// comment in DialogPresenting.swift). `.land(message: nil)` is exactly
-    /// what `Dialogs.confirmLand` returns for "confirmed, field left blank
-    /// or not shown at all"; this asserts the engine's `landWorkspace` was
-    /// actually invoked for it, with teardown following through exactly as
-    /// a normal successful land does.
-    func test67_reviewAndLandWorkspaceConfirmedWithNilMessageStillLandsAndTearsDown() async {
+    func test67_knownConflictShowsDetailsAndNeverOffersAddOperation() async {
         let fake = FakeWorkspaceEngine()
-        let (store, spy, _) = TestSupport.makeStore(engine: fake)
-        let wsRow = await makeLandableWorkspace(store: store, fake: fake)
-        let wsSessionID = store.sessions.first { $0.target == .workspace(projectPath: wsRow.projectPath, name: wsRow.name) }!.id
+        let (store, _, _) = TestSupport.makeStore(engine: fake)
+        let workspace = await makeClosableWorkspace(store: store, fake: fake)
+        fake.nextPreviewResult = .success(
+            LandPreview(
+                bookmark: "ignored",
+                bookmarkCommit: "ignored",
+                commits: [LandCommit(id: "1", subject: "Change")],
+                conflicts: [LandCommit(id: "Sources/App.swift", subject: "Sources/App.swift")],
+                needsMessage: false,
+                diverging: []
+            )
+        )
 
-        let dialogs = FakeDialogs()
-        dialogs.nextLandDecision = .land(message: nil)
-        fake.nextLandResult = .success(LandResult(commitID: "abc123", bookmark: "main"))
+        await store.prepareCloseWorkspace(workspace.id)
 
-        await store.reviewAndLandWorkspace(wsRow.id, dialogs: dialogs)
-
-        XCTAssertEqual(fake.landCalls.count, 1, "the engine's landWorkspace must actually be called — this is the bug that must never regress")
-        XCTAssertNil(fake.landCalls.first?.message, "a nil LandDecision message stays nil — never coerced to a blank flag value the CLI would reject")
-        XCTAssertTrue(spy.closedIDs.contains(wsSessionID))
-        XCTAssertFalse(store.workspaces.contains { $0.id == wsRow.id })
-    }
-
-    // MARK: - 68
-
-    func test68_reviewAndLandWorkspaceCancelDoesNotLand() async {
-        let fake = FakeWorkspaceEngine()
-        let (store, spy, _) = TestSupport.makeStore(engine: fake)
-        let wsRow = await makeLandableWorkspace(store: store, fake: fake)
-
-        let dialogs = FakeDialogs()
-        dialogs.nextLandDecision = .cancel
-
-        await store.reviewAndLandWorkspace(wsRow.id, dialogs: dialogs)
-
+        XCTAssertEqual(
+            store.closeWorkspace?.phase,
+            .conflictAttention(
+                message: "These changes overlap newer project progress and need attention.",
+                details: ["Sources/App.swift"]
+            )
+        )
+        await store.addChangesAndCloseWorkspace()
         XCTAssertTrue(fake.landCalls.isEmpty)
-        XCTAssertTrue(spy.closedIDs.isEmpty)
-        XCTAssertTrue(store.workspaces.contains { $0.id == wsRow.id })
     }
 
-    // MARK: - 69
-
-    /// Pins the entire point of this change: when the preview says no
-    /// message is needed, the dialog must not even be ASKED for one — this
-    /// asserts the preview `Dialogs.confirmLand` actually received carries
-    /// `needsMessage == false`, and that a land can still complete with a
-    /// nil message despite there having been no field to fill in at all.
-    func test69_reviewAndLandWorkspaceNeedsMessageFalsePassesThatThroughToTheDialog() async {
+    func test68_cancelDismissesPreparedFlowAndSecondFlowCannotReplaceActiveSheet() async {
         let fake = FakeWorkspaceEngine()
         let (store, _, _) = TestSupport.makeStore(engine: fake)
-        let wsRow = await makeLandableWorkspace(store: store, fake: fake)
-
-        fake.nextPreviewResult = .success(
-            LandPreview(bookmark: "main", bookmarkCommit: "efdd547", commits: [LandCommit(id: "abc", subject: "do a thing")], conflicts: [], needsMessage: false, diverging: [])
+        let first = await makeClosableWorkspace(store: store, fake: fake)
+        let second = WorkspaceRow(
+            projectPath: first.projectPath,
+            name: "ws-b",
+            path: "/tmp/workspaces/ws-b",
+            label: nil
         )
-        let dialogs = FakeDialogs()
-        dialogs.nextLandDecision = .land(message: nil)
-        fake.nextLandResult = .success(LandResult(commitID: "abc123", bookmark: "main"))
+        fake.nextCreateResult = .success(second)
+        await store.createWorkspace(in: first.projectPath)
+        fake.nextPreviewResult = .failure(.nothingToLand("nothing"))
 
-        await store.reviewAndLandWorkspace(wsRow.id, dialogs: dialogs)
+        await store.prepareCloseWorkspace(first.id)
+        await store.prepareCloseWorkspace(second.id)
 
-        XCTAssertEqual(dialogs.confirmLandCalls.count, 1)
-        XCTAssertEqual(dialogs.confirmLandCalls.first?.preview.needsMessage, false)
-        XCTAssertNil(fake.landCalls.first?.message, "needsMessage false means no field was shown, so nothing to send — and nil, not \"\", is what omits the flag")
+        XCTAssertEqual(store.closeWorkspace?.workspaceID, first.id)
+        XCTAssertEqual(fake.previewLandCalls, [first])
+
+        store.cancelCloseWorkspace()
+        XCTAssertNil(store.closeWorkspace)
+        XCTAssertTrue(fake.landCalls.isEmpty)
+        XCTAssertTrue(fake.deleteCalls.isEmpty)
     }
 
-    // MARK: - 70
-
-    /// A `noTrunk` failure from the PREVIEW (not from `landWorkspace`
-    /// itself) must feed the same `pendingTrunkBootstrap` recovery path —
-    /// see `reviewAndLandWorkspace`'s doc comment for why its `message` is
-    /// always empty in this case (there's no dialog to have sourced one
-    /// from yet). The retry itself — RootView's "Create" button — calls
-    /// `landWorkspace` directly with `createTrunk` set, exactly as it did
-    /// before this change; this test drives that same call to confirm nothing
-    /// about the retry path broke.
-    func test70_noTrunkFromPreviewSetsPendingTrunkBootstrapAndTheExistingRetryStillLands() async {
+    func test69_reconciliationConflictIsNonfatalAttentionAfterSuccessfulClose() async {
         let fake = FakeWorkspaceEngine()
         let (store, spy, _) = TestSupport.makeStore(engine: fake)
-        let wsRow = await makeLandableWorkspace(store: store, fake: fake)
+        let workspace = await makeClosableWorkspace(store: store, fake: fake)
+        let sessionID = store.sessions.first {
+            $0.target == .workspace(projectPath: workspace.projectPath, name: workspace.name)
+        }!.id
+        fake.nextPreviewResult = .success(
+            LandPreview(
+                bookmark: "ignored",
+                bookmarkCommit: "ignored",
+                commits: [LandCommit(id: "1", subject: "Change")],
+                conflicts: [],
+                needsMessage: false,
+                diverging: [LandCommit(id: "advisory", subject: "Ignored")]
+            )
+        )
+        fake.nextRebaseResult = .failure(.rebaseConflict("root overlap"))
 
-        fake.nextPreviewResult = .failure(.noTrunk("no main/master/trunk bookmark exists"))
-        let dialogs = FakeDialogs()
+        await store.prepareCloseWorkspace(workspace.id)
+        await store.addChangesAndCloseWorkspace()
 
-        await store.reviewAndLandWorkspace(wsRow.id, dialogs: dialogs)
+        XCTAssertTrue(spy.closedIDs.contains(sessionID))
+        XCTAssertFalse(store.workspaces.contains { $0.id == workspace.id })
+        XCTAssertEqual(fake.rebaseOntoTrunkCalls, [workspace.projectPath])
+        XCTAssertEqual(
+            store.closeWorkspace?.phase,
+            .projectAttention(addedChanges: 1, notice: nil)
+        )
+        XCTAssertNil(store.lastError)
+        XCTAssertTrue(store.projectWorkingCopyAttention.contains(workspace.projectPath))
 
-        XCTAssertTrue(dialogs.confirmLandCalls.isEmpty, "no preview means there's nothing for confirmLand to show")
-        XCTAssertNil(store.lastError, "noTrunk is recoverable via pendingTrunkBootstrap, not a dead-end lastError")
-        XCTAssertEqual(store.pendingTrunkBootstrap?.workspaceID, wsRow.id)
-        // nil, not "": the preview failed before any dialog ran, so no
-        // message was ever collected — and the retry must not send a blank
-        // --message the CLI would reject as missing.
-        XCTAssertNil(store.pendingTrunkBootstrap?.message)
+        store.cancelCloseWorkspace()
 
-        // The retry: RootView's "Create" button calls landWorkspace directly.
-        fake.nextLandResult = .success(LandResult(commitID: "def456", bookmark: "main"))
-        let landed = await store.landWorkspace(wsRow.id, message: store.pendingTrunkBootstrap!.message, createTrunk: "main")
-
-        XCTAssertTrue(landed)
-        XCTAssertEqual(fake.landCalls.last?.createTrunk, "main")
-        // Teardown itself is already thoroughly covered by test33a/test36 —
-        // this test's own focus is the bootstrap hand-off (pendingTrunkBootstrap's
-        // empty message flowing correctly into the retry call), so a light
-        // touch here is enough to confirm the retry actually completed.
-        XCTAssertFalse(store.workspaces.contains { $0.id == wsRow.id })
-        XCTAssertFalse(spy.closedIDs.isEmpty)
+        XCTAssertNil(store.closeWorkspace)
+        XCTAssertTrue(
+            store.projectWorkingCopyAttention.contains(workspace.projectPath),
+            "dismissing the close sheet must not clear project working-copy attention"
+        )
     }
 
-    // MARK: - 71
+    func test69b_manualReconciliationRetryStaysFlaggedUntilItSucceeds() async {
+        let fake = FakeWorkspaceEngine()
+        let (store, _, _) = TestSupport.makeStore(engine: fake)
+        let workspace = await makeClosableWorkspace(store: store, fake: fake)
+        fake.nextPreviewResult = .success(
+            LandPreview(
+                bookmark: "ignored",
+                bookmarkCommit: "ignored",
+                commits: [LandCommit(id: "1", subject: "Change")],
+                conflicts: [],
+                needsMessage: false,
+                diverging: []
+            )
+        )
+        fake.nextRebaseResult = .failure(.rebaseConflict("root overlap"))
+        await store.prepareCloseWorkspace(workspace.id)
+        await store.addChangesAndCloseWorkspace()
+        store.cancelCloseWorkspace()
+        XCTAssertTrue(store.projectWorkingCopyAttention.contains(workspace.projectPath))
 
-    func test71_nothingToLandFromPreviewSurfacesAsLastErrorWithoutTeardown() async {
+        fake.nextRebaseResult = .failure(.rebaseConflict("still overlapping"))
+        await store.refreshProjectWorkspace(workspace.projectPath)
+
+        XCTAssertEqual(
+            fake.rebaseOntoTrunkCalls,
+            [workspace.projectPath, workspace.projectPath]
+        )
+        XCTAssertTrue(
+            store.projectWorkingCopyAttention.contains(workspace.projectPath),
+            "a failed manual retry must keep project attention set"
+        )
+
+        fake.nextRebaseResult = .success(0)
+        await store.refreshProjectWorkspace(workspace.projectPath)
+
+        XCTAssertEqual(
+            fake.rebaseOntoTrunkCalls,
+            [workspace.projectPath, workspace.projectPath, workspace.projectPath]
+        )
+        XCTAssertFalse(
+            store.projectWorkingCopyAttention.contains(workspace.projectPath),
+            "a successful manual retry must clear project attention"
+        )
+    }
+
+    func test70_cleanupWarningRemainsSuccessfulCloseFollowUp() async {
+        let fake = FakeWorkspaceEngine()
+        let (store, _, _) = TestSupport.makeStore(engine: fake)
+        let workspace = await makeClosableWorkspace(store: store, fake: fake)
+        fake.nextPreviewResult = .success(
+            LandPreview(
+                bookmark: "ignored",
+                bookmarkCommit: "ignored",
+                commits: [LandCommit(id: "1", subject: "Change")],
+                conflicts: [],
+                needsMessage: false,
+                diverging: []
+            )
+        )
+        fake.nextLandResult = .success(
+            LandResult(
+                commitID: "abc",
+                bookmark: "ignored",
+                cleanupWarning: "The workspace folder remains on disk."
+            )
+        )
+
+        await store.prepareCloseWorkspace(workspace.id)
+        await store.addChangesAndCloseWorkspace()
+
+        XCTAssertEqual(
+            store.closeWorkspace?.phase,
+            .success(
+                addedChanges: 1,
+                notice: "The workspace folder remains on disk."
+            )
+        )
+        XCTAssertFalse(store.workspaces.contains { $0.id == workspace.id })
+        XCTAssertNil(store.lastError)
+    }
+
+    func test71_prepareFailureStaysInSheetWithoutTearingDownWorkspace() async {
         let fake = FakeWorkspaceEngine()
         let (store, spy, _) = TestSupport.makeStore(engine: fake)
-        let wsRow = await makeLandableWorkspace(store: store, fake: fake)
+        let workspace = await makeClosableWorkspace(store: store, fake: fake)
+        fake.nextPreviewResult = .failure(.sharedHistory("Changes cannot be isolated"))
         let sessionsBefore = store.sessions
-        let workspacesBefore = store.workspaces
 
-        fake.nextPreviewResult = .failure(.nothingToLand("workspace has no changes to land"))
-        let dialogs = FakeDialogs()
+        await store.prepareCloseWorkspace(workspace.id)
 
-        await store.reviewAndLandWorkspace(wsRow.id, dialogs: dialogs)
-
-        XCTAssertEqual(store.lastError, "workspace has no changes to land")
+        XCTAssertEqual(
+            store.closeWorkspace?.phase,
+            .failure(message: "Changes cannot be isolated")
+        )
         XCTAssertTrue(spy.closedIDs.isEmpty)
         XCTAssertEqual(store.sessions, sessionsBefore)
-        XCTAssertEqual(store.workspaces, workspacesBefore)
-    }
-
-    // MARK: - 72
-
-    func test72_sharedHistoryFromPreviewSurfacesAsLastErrorWithoutTeardown() async {
-        let fake = FakeWorkspaceEngine()
-        let (store, spy, _) = TestSupport.makeStore(engine: fake)
-        let wsRow = await makeLandableWorkspace(store: store, fake: fake)
-        let sessionsBefore = store.sessions
-        let workspacesBefore = store.workspaces
-
-        fake.nextPreviewResult = .failure(.sharedHistory("workspace shares history with another workspace"))
-        let dialogs = FakeDialogs()
-
-        await store.reviewAndLandWorkspace(wsRow.id, dialogs: dialogs)
-
-        XCTAssertEqual(store.lastError, "workspace shares history with another workspace")
-        XCTAssertTrue(spy.closedIDs.isEmpty)
-        XCTAssertEqual(store.sessions, sessionsBefore)
-        XCTAssertEqual(store.workspaces, workspacesBefore)
-    }
-
-    // MARK: - 73
-
-    func test73_divergingPreviewOffersRebaseAndConfirmingCallsEngine() async {
-        let fake = FakeWorkspaceEngine()
-        let (store, _, _) = TestSupport.makeStore(engine: fake)
-        let wsRow = await makeLandableWorkspace(store: store, fake: fake)
-
-        fake.nextPreviewResult = .success(
-            LandPreview(
-                bookmark: "main", bookmarkCommit: "efdd547",
-                commits: [LandCommit(id: "abc", subject: "do a thing")],
-                conflicts: [], needsMessage: false,
-                diverging: [LandCommit(id: "def", subject: "unrelated local work"), LandCommit(id: "ghi", subject: "more local work")]
-            )
-        )
-        let dialogs = FakeDialogs()
-        dialogs.nextLandDecision = .land(message: nil)
-        dialogs.nextConfirmRebaseOntoTrunk = true
-        fake.nextLandResult = .success(LandResult(commitID: "abc123", bookmark: "main"))
-        fake.nextRebaseResult = .success(2)
-
-        await store.reviewAndLandWorkspace(wsRow.id, dialogs: dialogs)
-
-        XCTAssertEqual(dialogs.confirmRebaseOntoTrunkCalls.count, 1)
-        XCTAssertEqual(dialogs.confirmRebaseOntoTrunkCalls.first?.count, 2)
-        XCTAssertEqual(dialogs.confirmRebaseOntoTrunkCalls.first?.bookmark, "main")
-        XCTAssertEqual(fake.rebaseOntoTrunkCalls, [wsRow.projectPath])
-    }
-
-    // MARK: - 74
-
-    func test74_divergingPreviewDecliningRebaseDoesNotCallEngine() async {
-        let fake = FakeWorkspaceEngine()
-        let (store, _, _) = TestSupport.makeStore(engine: fake)
-        let wsRow = await makeLandableWorkspace(store: store, fake: fake)
-
-        fake.nextPreviewResult = .success(
-            LandPreview(
-                bookmark: "main", bookmarkCommit: "efdd547",
-                commits: [LandCommit(id: "abc", subject: "do a thing")],
-                conflicts: [], needsMessage: false,
-                diverging: [LandCommit(id: "def", subject: "unrelated local work")]
-            )
-        )
-        let dialogs = FakeDialogs()
-        dialogs.nextLandDecision = .land(message: nil)
-        dialogs.nextConfirmRebaseOntoTrunk = false
-        fake.nextLandResult = .success(LandResult(commitID: "abc123", bookmark: "main"))
-
-        await store.reviewAndLandWorkspace(wsRow.id, dialogs: dialogs)
-
-        XCTAssertEqual(dialogs.confirmRebaseOntoTrunkCalls.count, 1, "the offer must still be made")
-        XCTAssertTrue(fake.rebaseOntoTrunkCalls.isEmpty, "declining must not call the engine")
-    }
-
-    // MARK: - 75
-
-    /// A failed rebase must never retroactively make a successful land look
-    /// failed — same asymmetry `landWorkspace`'s own `cleanupWarning`
-    /// handling documents for the leftover-directory case (see its doc
-    /// comment). Teardown (sessions/rows/selection) already happened as
-    /// part of the land succeeding; the rebase is a separate, optional step
-    /// the user opted into AFTERWARD.
-    func test75_rebaseFailureSetsLastErrorButLandTeardownStaysIntact() async {
-        let fake = FakeWorkspaceEngine()
-        let (store, spy, _) = TestSupport.makeStore(engine: fake)
-        let wsRow = await makeLandableWorkspace(store: store, fake: fake)
-        let wsSessionID = store.sessions.first { $0.target == .workspace(projectPath: wsRow.projectPath, name: wsRow.name) }!.id
-
-        fake.nextPreviewResult = .success(
-            LandPreview(
-                bookmark: "main", bookmarkCommit: "efdd547",
-                commits: [LandCommit(id: "abc", subject: "do a thing")],
-                conflicts: [], needsMessage: false,
-                diverging: [LandCommit(id: "def", subject: "unrelated local work")]
-            )
-        )
-        let dialogs = FakeDialogs()
-        dialogs.nextLandDecision = .land(message: nil)
-        dialogs.nextConfirmRebaseOntoTrunk = true
-        fake.nextLandResult = .success(LandResult(commitID: "abc123", bookmark: "main"))
-        fake.nextRebaseResult = .failure(.rebaseConflict("rebase hit a conflict"))
-
-        await store.reviewAndLandWorkspace(wsRow.id, dialogs: dialogs)
-
-        XCTAssertEqual(store.lastError, "rebase hit a conflict")
-        XCTAssertTrue(spy.closedIDs.contains(wsSessionID), "the land's own teardown must still have happened")
-        XCTAssertFalse(store.sessions.contains { $0.id == wsSessionID })
-        XCTAssertFalse(store.workspaces.contains { $0.id == wsRow.id }, "the land itself must still read as successful")
+        XCTAssertTrue(store.workspaces.contains { $0.id == workspace.id })
     }
 
     // MARK: - 76

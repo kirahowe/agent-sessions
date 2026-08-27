@@ -1,6 +1,44 @@
 import Combine
 import Foundation
 
+enum CloseWorkspaceProgress: Equatable {
+    case addingChanges
+    case closing
+}
+
+indirect enum CloseWorkspacePhase: Equatable {
+    case preparing
+    case ready(changes: [String])
+    case summaryRequired(changes: [String])
+    case noChanges
+    case confirmCloseWithoutAdding(returnTo: CloseWorkspacePhase)
+    case applying(CloseWorkspaceProgress)
+    case conflictAttention(message: String, details: [String])
+    case projectSetupRequired
+    case success(addedChanges: Int?, notice: String?)
+    case projectAttention(addedChanges: Int?, notice: String?)
+    case failure(message: String)
+}
+
+struct CloseWorkspacePresentation: Identifiable, Equatable {
+    let workspaceID: WorkspaceRow.ID
+    let workspaceName: String
+    let projectName: String
+    var summary = ""
+    var phase: CloseWorkspacePhase
+
+    var id: WorkspaceRow.ID { workspaceID }
+
+    var isBusy: Bool {
+        switch phase {
+        case .preparing, .applying:
+            return true
+        default:
+            return false
+        }
+    }
+}
+
 @MainActor
 final class AppStore: ObservableObject {
     @Published var projects: [Project] = []
@@ -10,12 +48,7 @@ final class AppStore: ObservableObject {
         didSet { updateAttention() }
     }
     @Published var lastError: String?
-    /// Set (instead of `lastError`) when `landWorkspace` fails with
-    /// `.noTrunk` — that error is recoverable by creating the trunk bookmark
-    /// and retrying, so the UI needs to offer that instead of just showing a
-    /// dead-end error message. Carries the original workspace id + message
-    /// so the retry doesn't require the user to retype anything.
-    @Published var pendingTrunkBootstrap: (workspaceID: String, message: String?)?
+    @Published var closeWorkspace: CloseWorkspacePresentation?
     /// What each live session's agent is currently doing, resolved from
     /// every signal source (structured hook payloads, classified free-text
     /// notifications, bells, and the user's own focus) by
@@ -25,6 +58,10 @@ final class AppStore: ObservableObject {
     /// no meaningful value to restore after a relaunch — see
     /// `SessionActivity`'s doc comment.
     @Published private(set) var attention: [String: AttentionState] = [:]
+    /// Project working copies whose progress could not be reconciled, keyed
+    /// by project path so attention survives dismissal of the close sheet.
+    /// Like live session attention, this is intentionally in-memory only.
+    @Published private(set) var projectWorkingCopyAttention: Set<String> = []
 
     /// Count of sessions currently `.blocked` — agents actively burning the
     /// user's time waiting on a permission prompt, as opposed to `.yourTurn`
@@ -147,9 +184,8 @@ final class AppStore: ObservableObject {
         sessions.removeAll { $0.projectPath == project.path }
         pruneLiveSessionState()
         projects.removeAll { $0.path == project.path }
-        // Local bookkeeping only: removing a project from the app must never
-        // destroy the user's on-disk jj workspaces, so we drop our local
-        // WorkspaceRow records without ever calling engine.deleteWorkspace.
+        // Removing a project is local bookkeeping only: never destroy its
+        // on-disk workspaces.
         workspaces.removeAll { $0.projectPath == project.path }
         if let selection, removedIDs.contains(selection) {
             self.selection = nil
@@ -171,8 +207,6 @@ final class AppStore: ObservableObject {
             }
             workspaces.append(row)
             newSession(in: .workspace(projectPath: row.projectPath, name: row.name))
-            // newSession already calls save() at the end, so no extra save()
-            // call needed here.
         } catch let error as EngineError {
             lastError = error.message
         } catch {
@@ -180,71 +214,241 @@ final class AppStore: ObservableObject {
         }
     }
 
-    func deleteWorkspace(_ id: WorkspaceRow.ID) async {
-        guard let workspace = workspaces.first(where: { $0.id == id }) else { return }
-        let target = TargetRef.workspace(projectPath: workspace.projectPath, name: workspace.name)
+    /// Starts the single close-workspace experience. The state is installed
+    /// before awaiting the preview so RootView can present a stable sheet for
+    /// the complete asynchronous operation. A second request is ignored until
+    /// the current sheet is dismissed.
+    func prepareCloseWorkspace(_ id: WorkspaceRow.ID) async {
+        guard closeWorkspace == nil,
+              let workspace = workspaces.first(where: { $0.id == id })
+        else { return }
 
-        let removedIDs = sessions.filter { $0.target == target }.map(\.id)
-        for sessionID in removedIDs {
-            terminals.closeSession(sessionID)
+        let projectName = projects.first(where: { $0.path == workspace.projectPath })?.name
+            ?? URL(fileURLWithPath: workspace.projectPath).lastPathComponent
+        closeWorkspace = CloseWorkspacePresentation(
+            workspaceID: id,
+            workspaceName: workspace.displayName,
+            projectName: projectName,
+            phase: .preparing
+        )
+
+        do {
+            let preview = try await engine.previewLand(workspace)
+            guard closeWorkspace?.workspaceID == id else { return }
+            let changes = preview.commits.map { change in
+                change.subject.isEmpty ? "Undescribed change" : change.subject
+            }
+            if !preview.conflicts.isEmpty {
+                closeWorkspace?.phase = .conflictAttention(
+                    message: "These changes overlap newer project progress and need attention.",
+                    details: preview.conflicts.map { conflict in
+                        conflict.subject.isEmpty ? "Conflicting change" : conflict.subject
+                    }
+                )
+            } else if changes.isEmpty {
+                closeWorkspace?.phase = .noChanges
+            } else if preview.needsMessage {
+                closeWorkspace?.phase = .summaryRequired(changes: changes)
+            } else {
+                closeWorkspace?.phase = .ready(changes: changes)
+            }
+        } catch EngineError.nothingToLand {
+            guard closeWorkspace?.workspaceID == id else { return }
+            closeWorkspace?.phase = .noChanges
+        } catch EngineError.noTrunk {
+            guard closeWorkspace?.workspaceID == id else { return }
+            closeWorkspace?.phase = .projectSetupRequired
+        } catch let error as EngineError {
+            guard closeWorkspace?.workspaceID == id else { return }
+            closeWorkspace?.phase = .failure(message: error.message)
+        } catch {
+            guard closeWorkspace?.workspaceID == id else { return }
+            closeWorkspace?.phase = .failure(message: "\(error)")
         }
-        sessions.removeAll { $0.target == target }
-        pruneLiveSessionState()
-        if let selection, removedIDs.contains(selection) {
-            self.selection = nil
+    }
+
+    func setCloseWorkspaceSummary(_ summary: String) {
+        guard closeWorkspace != nil else { return }
+        closeWorkspace?.summary = summary
+    }
+
+    func cancelCloseWorkspace() {
+        guard closeWorkspace?.isBusy == false else { return }
+        closeWorkspace = nil
+    }
+
+    func requestCloseWithoutAdding() {
+        guard let phase = closeWorkspace?.phase else { return }
+        switch phase {
+        case .ready, .summaryRequired, .conflictAttention:
+            closeWorkspace?.phase = .confirmCloseWithoutAdding(returnTo: phase)
+        default:
+            break
         }
+    }
+
+    func cancelCloseWithoutAdding() {
+        guard let phase = closeWorkspace?.phase,
+              case .confirmCloseWithoutAdding(let returnTo) = phase
+        else { return }
+        closeWorkspace?.phase = returnTo
+    }
+    /// Adds the prepared changes, closes the workspace only after the engine
+    /// confirms success, then silently reconciles the project working copy.
+    /// A race-time overlap changes the sheet to attention without touching the
+    /// workspace or any of its sessions.
+    func addChangesAndCloseWorkspace() async {
+        guard let presentation = closeWorkspace,
+              let workspace = workspaces.first(where: { $0.id == presentation.workspaceID })
+        else { return }
+
+        let changeCount: Int
+        switch presentation.phase {
+        case .ready(let changes):
+            changeCount = changes.count
+        case .summaryRequired(let changes):
+            guard !presentation.summary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+            changeCount = changes.count
+        default:
+            return
+        }
+
+        closeWorkspace?.phase = .applying(.addingChanges)
+        await applyWorkspaceChanges(
+            workspace,
+            message: presentation.summary,
+            createTrunk: nil,
+            changeCount: changeCount
+        )
+    }
+
+    /// Recovery for projects without shared progress yet. The engine keeps
+    /// the bootstrap name as an implementation detail; the sheet talks only
+    /// about establishing the project's starting progress.
+    func setUpProjectAndCloseWorkspace() async {
+        guard let presentation = closeWorkspace,
+              case .projectSetupRequired = presentation.phase,
+              let workspace = workspaces.first(where: { $0.id == presentation.workspaceID })
+        else { return }
+
+        let summary = presentation.summary.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !summary.isEmpty else { return }
+
+        closeWorkspace?.phase = .applying(.addingChanges)
+        await applyWorkspaceChanges(
+            workspace,
+            message: summary,
+            createTrunk: "main",
+            changeCount: nil
+        )
+    }
+
+    private func applyWorkspaceChanges(
+        _ workspace: WorkspaceRow,
+        message: String,
+        createTrunk: String?,
+        changeCount: Int?
+    ) async {
+        let result: LandResult
+        do {
+            let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
+            result = try await engine.landWorkspace(
+                workspace,
+                message: trimmed.isEmpty ? nil : trimmed,
+                createTrunk: createTrunk
+            )
+        } catch EngineError.noTrunk {
+            closeWorkspace?.phase = .projectSetupRequired
+            return
+        } catch EngineError.landConflict {
+            closeWorkspace?.phase = .conflictAttention(
+                message: "Project progress changed while these changes were being added. The workspace is unchanged and needs attention.",
+                details: []
+            )
+            return
+        } catch EngineError.nothingToLand {
+            closeWorkspace?.phase = .noChanges
+            return
+        } catch let error as EngineError {
+            closeWorkspace?.phase = .failure(message: error.message)
+            return
+        } catch {
+            closeWorkspace?.phase = .failure(message: "\(error)")
+            return
+        }
+
+        tearDownClosedWorkspace(workspace)
+
+        let reconciled = await reconcileProjectWorkspace(workspace.projectPath)
+        closeWorkspace?.phase = reconciled
+            ? .success(
+                addedChanges: changeCount,
+                notice: result.cleanupWarning
+            )
+            : .projectAttention(
+                addedChanges: changeCount,
+                notice: result.cleanupWarning
+            )
+    }
+
+    /// Retries reconciliation for a project whose working copy needs attention.
+    /// Failures remain silent and keep the project flagged for another retry.
+    func refreshProjectWorkspace(_ projectPath: String) async {
+        _ = await reconcileProjectWorkspace(projectPath)
+    }
+
+    @discardableResult
+    private func reconcileProjectWorkspace(_ projectPath: String) async -> Bool {
+        do {
+            _ = try await engine.rebaseOntoTrunk(projectPath: projectPath)
+            projectWorkingCopyAttention.remove(projectPath)
+            return true
+        } catch {
+            projectWorkingCopyAttention.insert(projectPath)
+            return false
+        }
+    }
+
+    /// Closes without adding. A workspace known to have changes reaches this
+    /// operation only through the in-sheet destructive confirmation; the
+    /// no-changes state closes directly without an unnecessary second prompt.
+    /// Session teardown intentionally precedes the engine call, preserving the
+    /// existing forget-operation ordering.
+    func closeWithoutAddingWorkspace() async {
+        guard let presentation = closeWorkspace,
+              let workspace = workspaces.first(where: { $0.id == presentation.workspaceID })
+        else { return }
+        switch presentation.phase {
+        case .noChanges, .confirmCloseWithoutAdding:
+            break
+        default:
+            return
+        }
+
+        closeWorkspace?.phase = .applying(.closing)
+        tearDownWorkspaceSessions(workspace)
 
         do {
             try await engine.deleteWorkspace(workspace)
-            workspaces.removeAll { $0.id == id }
+            workspaces.removeAll { $0.id == workspace.id }
+            save()
+            closeWorkspace?.phase = .success(addedChanges: 0, notice: nil)
         } catch let error as EngineError {
-            // The terminals/session rows are already torn down above; restoring
-            // them would just desync the app from reality. Leave the
-            // WorkspaceRow in place instead, as a visible "retry me" marker.
-            lastError = error.message
+            closeWorkspace?.phase = .failure(message: error.message)
+            save()
         } catch {
-            lastError = "\(error)"
+            closeWorkspace?.phase = .failure(message: "\(error)")
+            save()
         }
+    }
+
+    private func tearDownClosedWorkspace(_ workspace: WorkspaceRow) {
+        tearDownWorkspaceSessions(workspace)
+        workspaces.removeAll { $0.id == workspace.id }
         save()
     }
 
-    /// Lands (squashes onto trunk and advances the bookmark for) a
-    /// workspace's changes, then tears down its sessions and removes it.
-    /// Returns whether it actually landed.
-    ///
-    /// ORDER MATTERS here, and is the INVERSE of `deleteWorkspace` above:
-    /// the engine call happens FIRST, and local teardown (sessions, rows,
-    /// selection) only happens on success. `deleteWorkspace` can safely tear
-    /// sessions down before calling the engine because forgetting a
-    /// workspace isn't expected to be meaningfully "rejected" — any engine
-    /// failure there just leaves the row as a retry marker regardless. But
-    /// `land-conflict` is a first-class, EXPECTED outcome here (e.g. trunk
-    /// moved since the workspace was created) that leaves the workspace
-    /// fully intact on purpose, specifically so the user keeps working in
-    /// it. Tearing sessions down before knowing whether the land succeeded
-    /// would kill a live terminal for a change that was never actually
-    /// landed — so nothing local changes until the engine confirms success.
-    @discardableResult
-    func landWorkspace(_ id: WorkspaceRow.ID, message: String?, createTrunk: String? = nil) async -> Bool {
-        guard let workspace = workspaces.first(where: { $0.id == id }) else { return false }
-
-        let result: LandResult
-        do {
-            result = try await engine.landWorkspace(workspace, message: message, createTrunk: createTrunk)
-        } catch EngineError.noTrunk {
-            // Not surfaced via lastError: the UI offers to create the trunk
-            // bookmark and retry, so this isn't a dead-end the user just
-            // dismisses.
-            pendingTrunkBootstrap = (workspaceID: id, message: message)
-            return false
-        } catch let error as EngineError {
-            lastError = error.message
-            return false
-        } catch {
-            lastError = "\(error)"
-            return false
-        }
-
+    private func tearDownWorkspaceSessions(_ workspace: WorkspaceRow) {
         let target = TargetRef.workspace(projectPath: workspace.projectPath, name: workspace.name)
         let removedIDs = sessions.filter { $0.target == target }.map(\.id)
         for sessionID in removedIDs {
@@ -252,106 +456,8 @@ final class AppStore: ObservableObject {
         }
         sessions.removeAll { $0.target == target }
         pruneLiveSessionState()
-        workspaces.removeAll { $0.id == id }
         if let selection, removedIDs.contains(selection) {
             self.selection = nil
-        }
-        save()
-
-        // The land itself already succeeded by this point (sessions/rows
-        // torn down above) — a cleanupWarning is a non-fatal notice about
-        // the leftover directory, not a failure of the land, but it still
-        // needs to reach the user. Deliberately rides the existing
-        // lastError alert UI (RootView.swift's "Workspace Error" alert is
-        // already bound to store.lastError) rather than adding new UI for
-        // what's a rare, low-stakes cosmetic case.
-        if let cleanupWarning = result.cleanupWarning {
-            lastError = cleanupWarning
-        }
-        return true
-    }
-
-    /// The async front half of "Keep Changes…": fetches a preview of what
-    /// landing would actually do, shows it to the user, lands iff they
-    /// confirm, and — only when landing left the default workspace's own
-    /// commits forked off trunk — offers to rebase them back on. This is
-    /// what replaced the old flow, where `AppActions` called
-    /// `dialogs.promptLandMessage` synchronously before ever touching the
-    /// engine (see `LandDecision`'s doc comment in DialogPresenting.swift
-    /// for why that prompt's message was mostly discarded work).
-    ///
-    /// `landWorkspace` above still does the actual land + teardown, called
-    /// from here as one step — kept separate so it stays a small, direct
-    /// "just land it" operation callable on its own, which matters because
-    /// RootView's trunk-bootstrap retry (bound to `pendingTrunkBootstrap`)
-    /// calls it directly, bypassing this function and its preview entirely
-    /// (see the `.noTrunk` catch below for why that bypass is correct, not
-    /// just expedient).
-    ///
-    /// `dialogs` is a parameter rather than a stored property, like every
-    /// other AppStore dependency that isn't state/persistence: AppStore's
-    /// whole reason for existing separately from AppActions is to stay
-    /// AppKit-free and unit-testable without a running NSAlert modal loop
-    /// (see DialogPresenting.swift's doc comment) — a stored `dialogs`
-    /// here would undo that for the entire type, not just this method.
-    func reviewAndLandWorkspace(_ id: WorkspaceRow.ID, dialogs: any DialogPresenting) async {
-        guard let workspace = workspaces.first(where: { $0.id == id }) else { return }
-
-        let preview: LandPreview
-        do {
-            preview = try await engine.previewLand(workspace)
-        } catch EngineError.noTrunk {
-            // Same recoverable path as landWorkspace's own `.noTrunk` catch
-            // below — the UI offers to create the trunk bookmark and retry
-            // rather than a dead-end error (see RootView.swift's alert bound
-            // to `pendingTrunkBootstrap`). The one thing that's genuinely
-            // different here: landWorkspace's catch reuses the message ITS
-            // caller already collected, because the OLD flow always
-            // prompted for a message before ever attempting to land. This
-            // preview fails BEFORE `dialogs.confirmLand` ever runs — there
-            // is nothing to preview without a trunk to land onto, so the
-            // one dialog that could source a message never gets the chance
-            // to. Recording nil here is safe in practice, not just
-            // convenient: `needsMessage` is only ever true for the rare
-            // non-empty-and-undescribed working-copy case, and the retry
-            // this sets up (RootView's "Create" button) calls
-            // `landWorkspace` directly rather than back through this
-            // function — the exact same bootstrap path that already existed
-            // before this change, just now also reachable from a preview
-            // failure instead of only a land failure.
-            pendingTrunkBootstrap = (workspaceID: id, message: nil)
-            return
-        } catch let error as EngineError {
-            lastError = error.message
-            return
-        } catch {
-            lastError = "\(error)"
-            return
-        }
-
-        let decision = dialogs.confirmLand(workspace: workspace, preview: preview)
-        guard case .land(let message) = decision else { return }
-
-        let landed = await landWorkspace(id, message: message, createTrunk: nil)
-        guard landed, !preview.diverging.isEmpty else { return }
-
-        guard dialogs.confirmRebaseOntoTrunk(count: preview.diverging.count, bookmark: preview.bookmark) else { return }
-
-        do {
-            _ = try await engine.rebaseOntoTrunk(projectPath: workspace.projectPath)
-        } catch let error as EngineError {
-            // landWorkspace's teardown (sessions/rows/selection) already
-            // ran, unconditionally, before this point — this rebase is
-            // something the user opted into only AFTER the land already
-            // succeeded, so its failure must never retroactively make a
-            // successful land look failed. Same asymmetry landWorkspace's
-            // own `cleanupWarning` handling documents for the leftover-
-            // directory case; this rides the same non-fatal `lastError`
-            // alert rather than anything that could be mistaken for the
-            // land itself having failed.
-            lastError = error.message
-        } catch {
-            lastError = "\(error)"
         }
     }
 
@@ -597,13 +703,7 @@ final class AppStore: ObservableObject {
         save()
     }
 
-    /// Drops any per-live-session state (`attention`) whose session no
-    /// longer exists. Called from every site that removes rows from
-    /// `sessions` (`closeSession`, `removeProject`, `deleteWorkspace`,
-    /// `landWorkspace`) so it can never outlive the session it describes. One
-    /// shared helper instead of duplicating this removal logic at each call
-    /// site. (The agent title needs no pruning here — it lives on the
-    /// `SessionRow` itself, so removing the row removes it.)
+    /// Drops live-only attention after session rows are removed.
     private func pruneLiveSessionState() {
         let liveIDs = Set(sessions.map(\.id))
         attention = attention.filter { liveIDs.contains($0.key) }

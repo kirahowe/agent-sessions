@@ -68,10 +68,9 @@ struct RootView: View {
             // `initial: true` and AgentsApp's appearanceMode `.onChange`.
             store.setAppActive(NSApp.isActive)
 
-            // Runs once at launch: a non-blocking, informational check for
-            // bb/jj. Terminals work fine without either — only workspace
-            // operations need them — so a miss here only queues an alert,
-            // never anything that gates app usage.
+            // Runs once at launch: a non-blocking informational check for
+            // babashka. Project-specific tools are resolved when a workspace
+            // operation runs, so a miss here only queues guidance.
             let missing = ToolPreflight.missingTools()
             if !missing.isEmpty {
                 uiState.missingToolsNotice = ToolPreflight.guidance(for: missing)
@@ -95,6 +94,16 @@ struct RootView: View {
         }
         .sheet(isPresented: $uiState.showShortcutHelp) {
             ShortcutHelpView()
+        }
+        .sheet(
+            isPresented: Binding(
+                get: { store.closeWorkspace != nil },
+                set: { isPresented in
+                    if !isPresented { store.cancelCloseWorkspace() }
+                }
+            )
+        ) {
+            CloseWorkspaceView(store: store)
         }
         // A blocked session is exactly the case where the user has stepped
         // away from the app entirely (why else would an agent still be
@@ -130,25 +139,6 @@ struct RootView: View {
             Text(store.lastError ?? "")
         }
         .alert(
-            "No main bookmark exists in this repo. Create \u{201C}main\u{201D} at this landed commit?",
-            isPresented: Binding(
-                get: { store.pendingTrunkBootstrap != nil },
-                set: { isPresented in
-                    if !isPresented { store.pendingTrunkBootstrap = nil }
-                }
-            )
-        ) {
-            Button("Create") {
-                if let pending = store.pendingTrunkBootstrap {
-                    Task { await store.landWorkspace(pending.workspaceID, message: pending.message, createTrunk: "main") }
-                }
-                store.pendingTrunkBootstrap = nil
-            }
-            Button("Cancel", role: .cancel) {
-                store.pendingTrunkBootstrap = nil
-            }
-        }
-        .alert(
             "Some features need extra tools",
             isPresented: Binding(
                 get: { uiState.missingToolsNotice != nil },
@@ -162,6 +152,255 @@ struct RootView: View {
             }
         } message: {
             Text(uiState.missingToolsNotice ?? "")
+        }
+    }
+}
+
+private struct CloseWorkspaceView: View {
+    @ObservedObject var store: AppStore
+
+    private var presentation: CloseWorkspacePresentation? {
+        store.closeWorkspace
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 20) {
+            if let presentation {
+                Text("Close Workspace")
+                    .font(.title2.weight(.semibold))
+
+                Text("\u{201C}\(presentation.workspaceName)\u{201D} in \(presentation.projectName)")
+                    .foregroundStyle(.secondary)
+
+                content(for: presentation)
+            }
+        }
+        .padding(24)
+        .frame(width: 520)
+        .interactiveDismissDisabled(presentation?.isBusy == true)
+    }
+
+    @ViewBuilder
+    private func content(for presentation: CloseWorkspacePresentation) -> some View {
+        switch presentation.phase {
+        case .preparing:
+            progress("Preparing workspace changes…")
+
+        case .ready(let changes):
+            changeReview(changes)
+            actionButtons(addEnabled: true)
+
+        case .summaryRequired(let changes):
+            changeReview(changes)
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Add a summary for the undescribed changes:")
+                    .font(.callout)
+                TextField(
+                    "Change summary",
+                    text: Binding(
+                        get: { store.closeWorkspace?.summary ?? "" },
+                        set: { store.setCloseWorkspaceSummary($0) }
+                    )
+                )
+                .textFieldStyle(.roundedBorder)
+            }
+            actionButtons(
+                addEnabled: !presentation.summary
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .isEmpty
+            )
+
+        case .noChanges:
+            Text("This workspace has no changes to add.")
+            HStack {
+                Spacer()
+                Button("Cancel") {
+                    store.cancelCloseWorkspace()
+                }
+                Button("Close Workspace") {
+                    Task { await store.closeWithoutAddingWorkspace() }
+                }
+                .keyboardShortcut(.defaultAction)
+            }
+
+        case .confirmCloseWithoutAdding:
+            Label("Close without adding these changes?", systemImage: "exclamationmark.triangle.fill")
+                .font(.headline)
+                .foregroundStyle(.orange)
+            Text("The workspace will be closed without adding these changes to the project.")
+            HStack {
+                Spacer()
+                Button("Cancel") {
+                    store.cancelCloseWithoutAdding()
+                }
+                .keyboardShortcut(.cancelAction)
+                Button("Close Without Adding", role: .destructive) {
+                    Task { await store.closeWithoutAddingWorkspace() }
+                }
+            }
+
+        case .applying(let progressState):
+            progress(
+                progressState == .addingChanges
+                    ? "Adding changes and closing workspace…"
+                    : "Closing workspace…"
+            )
+
+        case .conflictAttention(let message, let details):
+            Label("Changes Need Attention", systemImage: "exclamationmark.triangle.fill")
+                .font(.headline)
+                .foregroundStyle(.orange)
+            Text(message)
+            if !details.isEmpty {
+                changeList(details)
+            }
+            HStack {
+                Button("Close Without Adding…", role: .destructive) {
+                    store.requestCloseWithoutAdding()
+                }
+                Spacer()
+                Button("Return to Workspace") {
+                    store.cancelCloseWorkspace()
+                }
+                .keyboardShortcut(.defaultAction)
+            }
+
+        case .projectSetupRequired:
+            Text("This project does not have shared progress yet. Set it up with these changes as the starting point?")
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Add a summary for the starting changes:")
+                    .font(.callout)
+                TextField(
+                    "Change summary",
+                    text: Binding(
+                        get: { store.closeWorkspace?.summary ?? "" },
+                        set: { store.setCloseWorkspaceSummary($0) }
+                    )
+                )
+                .textFieldStyle(.roundedBorder)
+            }
+            HStack {
+                Spacer()
+                Button("Cancel") {
+                    store.cancelCloseWorkspace()
+                }
+                Button("Set Up Project & Close") {
+                    Task { await store.setUpProjectAndCloseWorkspace() }
+                }
+                .disabled(
+                    presentation.summary
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                        .isEmpty
+                )
+                .keyboardShortcut(.defaultAction)
+            }
+
+        case .success(let addedChanges, let notice):
+            successSummary(addedChanges: addedChanges)
+            if let notice {
+                Label(notice, systemImage: "exclamationmark.triangle")
+                    .foregroundStyle(.secondary)
+            }
+            doneButton()
+
+        case .projectAttention(let addedChanges, let notice):
+            successSummary(addedChanges: addedChanges)
+            Label(
+                "The project workspace needs attention before it can follow the latest project progress.",
+                systemImage: "exclamationmark.triangle.fill"
+            )
+            .foregroundStyle(.orange)
+            if let notice {
+                Text(notice)
+                    .foregroundStyle(.secondary)
+            }
+            doneButton()
+
+        case .failure(let message):
+            Label("Workspace Couldn’t Close", systemImage: "xmark.circle.fill")
+                .font(.headline)
+                .foregroundStyle(.red)
+            Text(message)
+            HStack {
+                Spacer()
+                Button("Close") {
+                    store.cancelCloseWorkspace()
+                }
+                .keyboardShortcut(.defaultAction)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func changeReview(_ changes: [String]) -> some View {
+        Text(changes.count == 1 ? "1 change will be added to the project:" : "\(changes.count) changes will be added to the project:")
+            .font(.headline)
+        changeList(changes)
+    }
+
+    private func changeList(_ changes: [String]) -> some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 8) {
+                ForEach(Array(changes.enumerated()), id: \.offset) { _, summary in
+                    Label(summary, systemImage: "circle.fill")
+                        .labelStyle(.titleAndIcon)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .frame(maxHeight: 220)
+    }
+
+    private func actionButtons(addEnabled: Bool) -> some View {
+        HStack {
+            Button("Close Without Adding…", role: .destructive) {
+                store.requestCloseWithoutAdding()
+            }
+            Spacer()
+            Button("Cancel") {
+                store.cancelCloseWorkspace()
+            }
+            .keyboardShortcut(.cancelAction)
+            Button("Add Changes & Close") {
+                Task { await store.addChangesAndCloseWorkspace() }
+            }
+            .disabled(!addEnabled)
+            .keyboardShortcut(.defaultAction)
+        }
+    }
+
+    private func progress(_ label: String) -> some View {
+        HStack(spacing: 12) {
+            ProgressView()
+                .controlSize(.small)
+            Text(label)
+        }
+        .frame(maxWidth: .infinity, minHeight: 72)
+    }
+
+    @ViewBuilder
+    private func successSummary(addedChanges: Int?) -> some View {
+        Label(
+            addedChanges.map {
+                $0 == 0
+                    ? "Workspace closed."
+                    : $0 == 1
+                        ? "1 change added and workspace closed."
+                        : "\($0) changes added and workspace closed."
+            } ?? "Changes added and workspace closed.",
+            systemImage: "checkmark.circle.fill"
+        )
+        .font(.headline)
+        .foregroundStyle(.green)
+    }
+
+    private func doneButton() -> some View {
+        HStack {
+            Spacer()
+            Button("Done") {
+                store.cancelCloseWorkspace()
+            }
+            .keyboardShortcut(.defaultAction)
         }
     }
 }

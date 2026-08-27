@@ -109,10 +109,9 @@ final class AppActions {
             guard let selection = store.selection,
                   let row = store.sessions.first(where: { $0.id == selection })
             else { return false }
-            // Cancel still counts as handled, same reasoning as
-            // .deleteWorkspace/.keepWorkspaceChanges above: once the row is
-            // resolved we scheduled the prompt, so the shortcut/menu item
-            // did its job regardless of the user's choice.
+            // Cancel still counts as handled: once the row is resolved we
+            // scheduled the prompt, so the shortcut/menu item did its job
+            // regardless of the user's choice.
             present {
                 if let name = self.dialogs.promptRename(currentName: row.displayName) {
                     self.store.renameSession(selection, to: name)
@@ -183,45 +182,15 @@ final class AppActions {
             }
             return true
 
-        case .deleteWorkspace:
+        case .closeWorkspace:
             guard let selection = store.selection,
                   let row = store.sessions.first(where: { $0.id == selection }),
                   case .workspace(let projectPath, let name) = row.target,
-                  let workspace = store.workspaces.first(where: { $0.projectPath == projectPath && $0.name == name })
+                  let workspace = store.workspaces.first(where: {
+                      $0.projectPath == projectPath && $0.name == name
+                  })
             else { return false }
-            // Once a workspace is resolved we scheduled the confirm dialog,
-            // so the shortcut/menu-item did its job regardless of the user's
-            // choice (same "cancel still counts as handled" reasoning as addProject/removeProject).
-            present {
-                if self.dialogs.confirmDeleteWorkspace(workspace) {
-                    Task { await self.store.deleteWorkspace(workspace.id) }
-                }
-            }
-            return true
-
-        case .keepWorkspaceChanges:
-            guard let selection = store.selection,
-                  let row = store.sessions.first(where: { $0.id == selection }),
-                  case .workspace(let projectPath, let name) = row.target,
-                  let workspace = store.workspaces.first(where: { $0.projectPath == projectPath && $0.name == name })
-            else { return false }
-            // Cancel still counts as handled, same reasoning as
-            // .deleteWorkspace above — but note there is no `present { ... }`
-            // wrapper here, unlike every other dialog-presenting case in
-            // this function. `present` exists to defer a dialog past the
-            // runloop turn AppKit is still using to dispatch the triggering
-            // keydown (see its doc comment — the risk is a modal loop
-            // running mid-dispatch and leaking that keystroke into the
-            // hosted terminal). This flow starts with an async preview
-            // (a subprocess round-trip via AppStore.reviewAndLandWorkspace)
-            // before any dialog can even be built, so that risk window is
-            // long past by the time a dialog actually shows — deferring
-            // again on top of it would be redundant, not incorrect. Once
-            // the workspace is resolved here the shortcut/menu item has
-            // done its job by starting the Task, regardless of what the
-            // user eventually decides in whichever dialog(s) it goes on to
-            // present.
-            Task { await self.store.reviewAndLandWorkspace(workspace.id, dialogs: self.dialogs) }
+            Task { await store.prepareCloseWorkspace(workspace.id) }
             return true
 
         case .showShortcutHelp:

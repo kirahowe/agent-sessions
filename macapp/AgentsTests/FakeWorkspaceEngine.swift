@@ -32,6 +32,7 @@ final class FakeWorkspaceEngine: WorkspaceEngineProviding {
     private(set) var landCalls: [(workspace: WorkspaceRow, message: String?, createTrunk: String?)] = []
     private(set) var previewLandCalls: [WorkspaceRow] = []
     private(set) var rebaseOntoTrunkCalls: [String] = []   // projectPath args
+    var onRebaseOntoTrunk: (() -> Void)?
 
     func createWorkspace(projectPath: String) async throws -> WorkspaceRow {
         createCalls.append(projectPath)
@@ -54,6 +55,7 @@ final class FakeWorkspaceEngine: WorkspaceEngineProviding {
     }
 
     func rebaseOntoTrunk(projectPath: String) async throws -> Int {
+        onRebaseOntoTrunk?()
         rebaseOntoTrunkCalls.append(projectPath)
         return try nextRebaseResult.get()
     }

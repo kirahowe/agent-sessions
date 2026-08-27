@@ -16,8 +16,7 @@ enum AppAction: Hashable {
     case nextSession
     case selectSession(Int)
     case newWorkspace
-    case deleteWorkspace
-    case keepWorkspaceChanges
+    case closeWorkspace
     case showShortcutHelp
 }
 
@@ -29,7 +28,7 @@ extension AppAction: CaseIterable {
     static var allCases: [AppAction] {
         [
             .newSession, .closeSession, .renameSession, .closeWindow, .addProject, .removeProject,
-            .previousSession, .nextSession, .newWorkspace, .deleteWorkspace, .keepWorkspaceChanges, .showShortcutHelp,
+            .previousSession, .nextSession, .newWorkspace, .closeWorkspace, .showShortcutHelp,
         ]
             + (0..<9).map { AppAction.selectSession($0) }
     }
@@ -53,8 +52,7 @@ extension AppAction {
         case .nextSession: return "Next Session"
         case .selectSession: return "Jump to session"
         case .newWorkspace: return "New Workspace"
-        case .deleteWorkspace: return "Delete Workspace…"
-        case .keepWorkspaceChanges: return "Keep Changes…"
+        case .closeWorkspace: return "Close Workspace…"
         case .showShortcutHelp: return "Keyboard Shortcuts"
         }
     }
@@ -65,7 +63,7 @@ extension AppAction {
         switch self {
         case .newSession, .closeSession, .renameSession, .previousSession, .nextSession, .selectSession:
             return "Sessions"
-        case .newWorkspace, .deleteWorkspace, .keepWorkspaceChanges:
+        case .newWorkspace, .closeWorkspace:
             return "Workspaces"
         case .addProject, .removeProject:
             return "Projects"
@@ -180,7 +178,7 @@ enum Keymap {
             .nextSession: Shortcut(key: .downArrow, modifiers: [.command, .option]),
             .newWorkspace: Shortcut(key: .char("n"), modifiers: [.command]),
             .showShortcutHelp: Shortcut(key: .char("?"), modifiers: [.command, .shift]),
-            // .removeProject, .deleteWorkspace, .keepWorkspaceChanges intentionally have no entry: menu-only, no shortcut.
+            // .removeProject and .closeWorkspace intentionally have no entry: menu-only.
         ]
         for index in 0..<9 {
             let digit = Character("\(index + 1)")

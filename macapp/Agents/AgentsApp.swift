@@ -65,10 +65,8 @@ struct AgentsApp: App {
         )
     }
 
-    /// Whether `store.selection` currently points at a session whose target
-    /// is a workspace (rather than a project root) — drives "Keep Workspace
-    /// Changes…"'s enabled state, resolved the same way
-    /// `AppActions.perform(.keepWorkspaceChanges)` resolves its target.
+    /// Whether the current session belongs to a workspace, used to enable
+    /// the selection-targeted close action.
     private var selectionTargetsWorkspace: Bool {
         guard let selection = store.selection,
               let row = store.sessions.first(where: { $0.id == selection })
@@ -139,16 +137,11 @@ struct AgentsApp: App {
                 }
                 // No .keymapShortcut: removeProject has no Keymap entry (menu-only).
 
-                Button("Delete Workspace…") {
-                    actions.perform(.deleteWorkspace)
-                }
-                // No .keymapShortcut: deleteWorkspace has no Keymap entry (menu-only).
-
-                Button("Keep Workspace Changes…") {
-                    actions.perform(.keepWorkspaceChanges)
+                Button("Close Workspace…") {
+                    actions.perform(.closeWorkspace)
                 }
                 .disabled(!selectionTargetsWorkspace)
-                // No .keymapShortcut: keepWorkspaceChanges has no Keymap entry (menu-only).
+                // No .keymapShortcut: closeWorkspace is menu-only.
             }
 
             CommandGroup(replacing: .saveItem) {

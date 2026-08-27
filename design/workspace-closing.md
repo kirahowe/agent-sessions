@@ -1,0 +1,113 @@
+# Workspace closing
+
+## Mental model
+
+A project has shared, integrated progress. Each workspace is an isolated draft
+containing changes to that project. Closing a workspace either adds its draft
+to the project's current progress and removes the workspace, or closes it
+without adding those changes.
+
+Branches, bookmarks, rebases, forks, divergence, and commit IDs are storage
+implementation details. They do not belong in the normal closing flow.
+
+When two workspaces begin from the same project state, closing one advances the
+project. The other remains a valid draft. It reconciles with the latest project
+state automatically when it is eventually closed. Open agent workspaces must
+not be eagerly rewritten underneath running sessions.
+
+An overlap is the exceptional case. The operation changes nothing, preserves
+the workspace, and explains that its changes need attention.
+
+## Invariants
+
+1. A workspace can add only changes owned by that workspace.
+2. Adding changes is atomic: every change reaches project progress, or nothing
+   changes and the workspace remains open.
+3. Active workspaces retain stable files and history while sibling workspaces
+   close.
+4. Reconciliation with newer project progress is automatic and lazy.
+5. The project working copy follows newly integrated progress silently when it
+   can do so without conflict. An overlap preserves its work and becomes a
+   non-fatal attention state; it never retroactively turns a successful close
+   into a failure.
+6. Concurrent repository activity must not be lost by speculative previews or
+   rollback of unrelated operations.
+
+## Experience
+
+The workspace menu has one primary operation: **Close Workspace…**
+
+For a workspace with changes, the sheet names the workspace and project, lists
+human-readable change summaries, and offers:
+
+- **Add Changes & Close** — add the draft to project progress, then remove the
+  workspace.
+- **Close Without Adding…** — remove the workspace without advancing project
+  progress. This is destructive and visually secondary.
+- **Cancel**.
+
+The sheet says “changes,” not “commits.” It does not show trunk names, bookmark
+hashes, clean-conflict checkmarks, divergence warnings, or instructions to
+rebase. If undescribed working-copy changes need a summary, the sheet asks for
+one only in that case.
+
+A workspace with no changes offers **Close Workspace** and **Cancel**.
+
+If changes overlap newer project progress, the attempted add changes nothing
+and leaves the workspace open. The result explains that the changes need
+attention and offers **Return to Workspace** plus the separately destructive
+**Close Without Adding…** path. It never offers an add action known to fail.
+
+The sheet remains present while preparing, adding, and closing. Success may
+briefly report the number of changes added before the workspace row collapses.
+There is no second rebase dialog.
+
+## Integration design
+
+Use `workstream-manager` as the standalone workspace engine instead of
+maintaining or copying an implementation inside Agents. Until the library is
+published, the thin `agents-cli` wrapper temporarily adds the external
+checkout's `src` directory to Babashka's classpath, resolving the checkout from
+a nonblank `WORKSTREAM_MANAGER_ROOT` or from
+`~/code/projects/workstream-manager` by default. The external checkout remains
+the source of truth; once the library is published, replace only this bootstrap
+with the published library coordinate.
+
+The app and Xcode release builds bundle only the thin wrapper, so they continue
+to compile without the local checkout. In that environment workspace operations
+are unavailable and the wrapper returns its single JSON error envelope rather
+than a stack trace. Repository and copied-script integration tests point
+`WORKSTREAM_MANAGER_ROOT` at a checkout. CI without one skips only real
+workspace-engine integration cases; pure Swift envelope decoding and unrelated
+tests remain active.
+
+The app-facing CLI remains a stable JSON subprocess boundary. It delegates
+workspace creation, listing, forgetting, previewing, and landing to
+`workstream-manager`, adding only app-specific defaults such as the `agents`
+namespace if the library does not already provide them.
+
+Speculative Jujutsu conflict checks must not perform a repository-wide
+`jj op restore` after temporarily integrating a rebase. Use an unintegrated
+operation and inspect it with `--at-operation`, or an equivalent targeted
+transaction supplied by `workstream-manager`. Actual application must recheck
+current state and remain the enforcement point because project progress can
+change after a preview.
+
+Other agent workspaces are not rebased after a successful close; their future
+land operation already reconciles them with current project progress. The
+project working copy is reconciled automatically and silently. A conflict is
+reported as structured, non-fatal follow-up attention while the workspace close
+itself remains successful.
+
+## Delivery sequence
+
+1. Replace the duplicated workspace script with the local
+   `workstream-manager` dependency while preserving the app's JSON contract.
+2. Harden Jujutsu preview/application transactions for concurrent operations.
+3. Unify keep/delete affordances into the close-workspace sheet and remove
+   branch-oriented language and the post-land rebase prompt.
+4. Add contract and behavioral coverage for clean close, close without adding,
+   no changes, automatic reconciliation, overlap rollback, and concurrent
+   repository activity.
+5. Review the complete diff in the main loop, delegate repairs, run focused
+   CLI and macOS verification, then complete interactive RevDiff review.

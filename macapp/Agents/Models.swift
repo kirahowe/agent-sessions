@@ -7,9 +7,8 @@ struct Project: Identifiable, Hashable {
 }
 
 /// A session's terminal attaches to a target: either a project's root
-/// directory, or one of its jj workspaces. `id` is the stable string used
-/// for terminal-view keying (TerminalCenter's cache key) and session-counter
-/// keying, so it must never change shape once persisted.
+/// directory or one of its isolated workspaces. `id` is stable persistence
+/// and terminal-view identity, so it must never change shape.
 enum TargetRef: Hashable, Codable {
     case root(projectPath: String)
     case workspace(projectPath: String, name: String)
@@ -29,10 +28,8 @@ enum TargetRef: Hashable, Codable {
     }
 }
 
-/// A jj workspace of a project. `name`/`path` are immutable identity set at
-/// creation time by the engine (jj workspace name + its directory);
-/// `label` is a purely cosmetic display alias — renaming NEVER touches
-/// `name`, `path`, or the underlying jj workspace.
+/// An isolated workspace of a project. `name`/`path` are immutable identity
+/// set by the engine; `label` is a purely cosmetic display alias.
 struct WorkspaceRow: Identifiable, Codable, Hashable {
     var projectPath: String
     var name: String

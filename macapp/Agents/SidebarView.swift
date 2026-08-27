@@ -38,6 +38,13 @@ struct SidebarView: View {
                         Text(project.name)
                             .font(.subheadline)
                             .fontWeight(.semibold)
+                        if store.projectWorkingCopyAttention.contains(project.path) {
+                            Image(systemName: "exclamationmark.triangle.fill")
+                                .imageScale(.small)
+                                .foregroundStyle(.orange)
+                                .help("Project workspace needs attention before it can follow the latest project progress.")
+                                .accessibilityLabel("Project workspace needs attention to follow the latest project progress")
+                        }
                         Spacer()
                         Menu {
                             projectHeaderMenuItems(project)
@@ -102,6 +109,14 @@ struct SidebarView: View {
     /// button, so the two presentations can never drift apart.
     @ViewBuilder
     private func projectHeaderMenuItems(_ project: Project) -> some View {
+        if store.projectWorkingCopyAttention.contains(project.path) {
+            Button("Refresh Project Workspace") {
+                Task {
+                    await store.refreshProjectWorkspace(project.path)
+                }
+            }
+            Divider()
+        }
         // This project provides the initial selection, while the prompt still
         // offers every open project as a possible workspace location.
         Button("New Workspace") {
@@ -330,22 +345,11 @@ private struct WorkspaceRowView: View {
     /// presentations can never drift apart.
     @ViewBuilder
     private var menuItems: some View {
-        // Row-targeted, not actions.perform: this targets the specific
-        // right-clicked workspace, the same way the rest of this context
-        // menu is. Routes through AppStore.reviewAndLandWorkspace rather
-        // than a direct `Dialogs` call (unlike "Change Label…"/"Delete
-        // Workspace…" below): landing now needs an async preview fetched
-        // before any dialog can even be shown, and that orchestration lives
-        // on AppStore — see DialogPresenting.swift's doc comment on
-        // confirmLand/confirmRebaseOntoTrunk for why. `LiveDialogPresenter()`
-        // is constructed fresh here rather than injected, same as every
-        // other direct `Dialogs`-driven call in this file.
-        Button("Keep Changes…") {
-            Task { await store.reviewAndLandWorkspace(workspace.id, dialogs: LiveDialogPresenter()) }
+        // Row-targeted so a context menu always closes the workspace that was
+        // clicked, regardless of the currently selected session.
+        Button("Close Workspace…") {
+            Task { await store.prepareCloseWorkspace(workspace.id) }
         }
-        // Direct store call, not actions.perform: this targets the
-        // specific right-clicked workspace, row-targeted the same way
-        // the session row's context menu above is.
         Button("New Session") {
             store.newSession(in: .workspace(projectPath: workspace.projectPath, name: workspace.name))
         }
@@ -355,11 +359,6 @@ private struct WorkspaceRowView: View {
         Button("Change Label…") {
             if let label = Dialogs.promptWorkspaceLabel(currentLabel: workspace.label) {
                 store.setWorkspaceLabel(workspace.id, label: label)
-            }
-        }
-        Button("Delete Workspace…") {
-            if Dialogs.confirmDeleteWorkspace(workspace) {
-                Task { await store.deleteWorkspace(workspace.id) }
             }
         }
     }

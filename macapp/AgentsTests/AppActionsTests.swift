@@ -2,12 +2,8 @@ import AppKit
 import XCTest
 @testable import Agents
 
-/// Polls a synchronous condition via bounded `Task.yield()`s rather than a
-/// fixed sleep. `AppActions.perform`'s `.newWorkspace`/`.deleteWorkspace`/
-/// `.keepWorkspaceChanges` cases each fire a `Task { await store.xxx(...) }`
-/// internally and return `true` synchronously before that Task necessarily
-/// runs, so asserting on a fake engine's recorded calls needs to wait for it
-/// deterministically rather than assuming it already ran.
+/// Polls a synchronous condition via bounded `Task.yield()`s. Actions that
+/// start async workspace work return before their Task necessarily runs.
 private func waitUntil(_ condition: () -> Bool, iterations: Int = 50) async {
     for _ in 0..<iterations {
         if condition() { return }
@@ -312,143 +308,58 @@ final class AppActionsTests: XCTestCase {
         XCTAssertEqual(store.workspaces.first?.label, "my label")
     }
 
-    // MARK: - 6: .deleteWorkspace
+    // MARK: - 6: .closeWorkspace
 
-    func test06a_deleteWorkspaceFalseWhenSelectionIsNotAWorkspaceSession() {
+    func test06a_closeWorkspaceFalseWhenSelectionIsNotAWorkspaceSession() {
         let (store, _, _) = TestSupport.makeStore()
         let actions = makeActions(store: store)
 
         store.selection = nil
-        XCTAssertFalse(actions.perform(.deleteWorkspace))
+        XCTAssertFalse(actions.perform(.closeWorkspace))
 
-        store.addProject(path: "/tmp/proj-A") // selects a root-targeted session, not a workspace
-        XCTAssertFalse(actions.perform(.deleteWorkspace))
+        store.addProject(path: "/tmp/proj-A")
+        XCTAssertFalse(actions.perform(.closeWorkspace))
     }
 
-    func test06b_deleteWorkspaceCancelReturnsTrueWithoutCallingEngine() async {
+    func test06b_closeWorkspaceStartsStoreOwnedPreparation() async {
         let fake = FakeWorkspaceEngine()
         let (store, _, _) = TestSupport.makeStore(engine: fake)
-        let dialogs = FakeDialogs()
-        dialogs.nextConfirmDeleteWorkspace = false
-        let actions = makeActions(store: store, dialogs: dialogs)
-        store.addProject(path: "/tmp/proj-A")
-        let wsRow = WorkspaceRow(projectPath: "/tmp/proj-A", name: "ws-a", path: "/tmp/workspaces/ws-a", label: nil)
-        fake.nextCreateResult = .success(wsRow)
-        await store.createWorkspace(in: "/tmp/proj-A") // also selects the new workspace session
-
-        XCTAssertTrue(actions.perform(.deleteWorkspace), "cancel still counts as handled")
-
-        // A cancelled dialog never even schedules the Task, so this is safe
-        // to assert synchronously without the polling helper.
-        XCTAssertTrue(fake.deleteCalls.isEmpty)
-        XCTAssertEqual(dialogs.confirmDeleteWorkspaceCalls, [wsRow])
-    }
-
-    func test06c_deleteWorkspaceConfirmCallsEngineDelete() async {
-        let fake = FakeWorkspaceEngine()
-        let (store, _, _) = TestSupport.makeStore(engine: fake)
-        let dialogs = FakeDialogs()
-        dialogs.nextConfirmDeleteWorkspace = true
-        let actions = makeActions(store: store, dialogs: dialogs)
-        store.addProject(path: "/tmp/proj-A")
-        let wsRow = WorkspaceRow(projectPath: "/tmp/proj-A", name: "ws-a", path: "/tmp/workspaces/ws-a", label: nil)
-        fake.nextCreateResult = .success(wsRow)
-        await store.createWorkspace(in: "/tmp/proj-A")
-
-        XCTAssertTrue(actions.perform(.deleteWorkspace))
-
-        await waitUntil { !fake.deleteCalls.isEmpty }
-        XCTAssertEqual(fake.deleteCalls, [wsRow])
-    }
-
-    // MARK: - 7: .keepWorkspaceChanges
-
-    func test07a_keepWorkspaceChangesFalseWhenSelectionIsNotAWorkspaceSession() {
-        let (store, _, _) = TestSupport.makeStore()
         let actions = makeActions(store: store)
-
-        store.selection = nil
-        XCTAssertFalse(actions.perform(.keepWorkspaceChanges))
-
-        store.addProject(path: "/tmp/proj-A") // selects a root-targeted session, not a workspace
-        XCTAssertFalse(actions.perform(.keepWorkspaceChanges))
-    }
-
-    // `.keepWorkspaceChanges` no longer presents a dialog synchronously at
-    // all — it resolves the workspace, starts a Task running
-    // AppStore.reviewAndLandWorkspace (preview -> confirmLand -> land), and
-    // returns true immediately regardless of what that Task eventually
-    // decides. So "cancel still counts as handled" now means something
-    // slightly different than it does for the other cases above: `perform`
-    // returns true before the preview has even started, not just before the
-    // user has answered a dialog. These tests poll for the eventual dialog/
-    // engine call instead of asserting on it synchronously.
-    func test07b_keepWorkspaceChangesCancelReturnsTrueWithoutCallingEngine() async {
-        let fake = FakeWorkspaceEngine()
-        let (store, _, _) = TestSupport.makeStore(engine: fake)
-        let dialogs = FakeDialogs()
-        dialogs.nextLandDecision = .cancel
-        let actions = makeActions(store: store, dialogs: dialogs)
         store.addProject(path: "/tmp/proj-A")
-        let wsRow = WorkspaceRow(projectPath: "/tmp/proj-A", name: "ws-a", path: "/tmp/workspaces/ws-a", label: nil)
+        let wsRow = WorkspaceRow(
+            projectPath: "/tmp/proj-A",
+            name: "ws-a",
+            path: "/tmp/workspaces/ws-a",
+            label: "Draft"
+        )
         fake.nextCreateResult = .success(wsRow)
-        await store.createWorkspace(in: "/tmp/proj-A")
+        fake.nextPreviewResult = .success(
+            LandPreview(
+                bookmark: "main",
+                bookmarkCommit: "abc",
+                commits: [LandCommit(id: "def", subject: "Ship it")],
+                conflicts: [],
+                needsMessage: false,
+                diverging: []
+            )
+        )
+        await store.createWorkspace(in: "/tmp/proj-A", label: "Draft")
 
-        XCTAssertTrue(actions.perform(.keepWorkspaceChanges), "cancel still counts as handled")
+        XCTAssertTrue(actions.perform(.closeWorkspace))
 
-        await waitUntil { !dialogs.confirmLandCalls.isEmpty }
+        await waitUntil { store.closeWorkspace != nil }
+        XCTAssertEqual(fake.previewLandCalls, [wsRow])
+        XCTAssertEqual(
+            store.closeWorkspace,
+            CloseWorkspacePresentation(
+                workspaceID: wsRow.id,
+                workspaceName: "Draft",
+                projectName: "proj-A",
+                phase: .ready(changes: ["Ship it"])
+            )
+        )
         XCTAssertTrue(fake.landCalls.isEmpty)
-        XCTAssertEqual(dialogs.confirmLandCalls.first?.workspace, wsRow)
-    }
-
-    func test07c_keepWorkspaceChangesConfirmCallsEngineLand() async {
-        let fake = FakeWorkspaceEngine()
-        let (store, _, _) = TestSupport.makeStore(engine: fake)
-        let dialogs = FakeDialogs()
-        dialogs.nextLandDecision = .land(message: "Ship it")
-        let actions = makeActions(store: store, dialogs: dialogs)
-        store.addProject(path: "/tmp/proj-A")
-        let wsRow = WorkspaceRow(projectPath: "/tmp/proj-A", name: "ws-a", path: "/tmp/workspaces/ws-a", label: nil)
-        fake.nextCreateResult = .success(wsRow)
-        await store.createWorkspace(in: "/tmp/proj-A")
-        fake.nextLandResult = .success(LandResult(commitID: "abc123", bookmark: "main"))
-
-        XCTAssertTrue(actions.perform(.keepWorkspaceChanges))
-
-        await waitUntil { !fake.landCalls.isEmpty }
-        XCTAssertEqual(fake.landCalls.first?.workspace, wsRow)
-        XCTAssertEqual(fake.landCalls.first?.message, "Ship it")
-    }
-
-    // The bug that motivated replacing `promptLandMessage`'s `String?` with
-    // `LandDecision`: confirming with a blank/absent message must still
-    // land, not silently no-op. `.land(message: nil)` is exactly what
-    // `Dialogs.confirmLand` now returns for "confirmed, field left blank"
-    // (see LandDecision's doc comment in DialogPresenting.swift) — this
-    // pins that AppStore actually calls through to the engine for it,
-    // passing an empty string rather than treating nil as cancel.
-    func test07d_keepWorkspaceChangesConfirmWithNilMessageStillLands() async {
-        let fake = FakeWorkspaceEngine()
-        let (store, _, _) = TestSupport.makeStore(engine: fake)
-        let dialogs = FakeDialogs()
-        dialogs.nextLandDecision = .land(message: nil)
-        let actions = makeActions(store: store, dialogs: dialogs)
-        store.addProject(path: "/tmp/proj-A")
-        let wsRow = WorkspaceRow(projectPath: "/tmp/proj-A", name: "ws-a", path: "/tmp/workspaces/ws-a", label: nil)
-        fake.nextCreateResult = .success(wsRow)
-        await store.createWorkspace(in: "/tmp/proj-A")
-        fake.nextLandResult = .success(LandResult(commitID: "abc123", bookmark: "main"))
-
-        XCTAssertTrue(actions.perform(.keepWorkspaceChanges))
-
-        await waitUntil { !fake.landCalls.isEmpty }
-        XCTAssertEqual(fake.landCalls.first?.workspace, wsRow, "the land must actually go through the engine, not silently no-op")
-        // "No message" must reach the engine AS nil, so the CLI invocation
-        // omits --message entirely. Asserting "" here would be asserting the
-        // very bug this rewrite fixed: agents-cli rejects a blank flag value
-        // as a missing required flag, so an empty string would fail the land
-        // outright against the real CLI while passing against this fake.
-        XCTAssertNil(fake.landCalls.first?.message, "a nil LandDecision message stays nil — never coerced to a blank flag value")
+        XCTAssertTrue(fake.deleteCalls.isEmpty)
     }
 
     // MARK: - 8: .selectSession
