@@ -1,7 +1,7 @@
 import Foundation
 
 enum EngineError: Error, Equatable {
-    case notAJJRepo(String)
+    case notARepo(String)
     case nameConflict(String)
     case destExists(String)
     case failed(String)
@@ -9,17 +9,14 @@ enum EngineError: Error, Equatable {
     case landConflict(String)
     case nothingToLand(String)
     case sharedHistory(String)
-    // Thrown by rebase-onto-trunk when rebasing the default workspace's
-    // diverging commits onto the (just-moved) trunk bookmark hits a
-    // conflict. Distinct from .landConflict: that one is reported by (and
-    // guards) workspace-land itself, before trunk ever moves; this one can
-    // only happen AFTER a successful land, as a side effect of the optional
-    // rebase-offer the user opted into — see AppStore.reviewAndLandWorkspace.
+    // Thrown by rebase-onto-trunk when reconciling the project working copy
+    // after a successful close. This is follow-up attention, not a failure
+    // of the close that already completed.
     case rebaseConflict(String)
 
     var message: String {
         switch self {
-        case .notAJJRepo(let m), .nameConflict(let m), .destExists(let m), .failed(let m),
+        case .notARepo(let m), .nameConflict(let m), .destExists(let m), .failed(let m),
              .noTrunk(let m), .landConflict(let m), .nothingToLand(let m), .sharedHistory(let m),
              .rebaseConflict(let m):
             return m
@@ -27,9 +24,9 @@ enum EngineError: Error, Equatable {
     }
 }
 
-/// The result of successfully landing a workspace's changes onto its
-/// project's trunk bookmark: the squashed commit id, and the bookmark it
-/// now lives on.
+/// The result of successfully adding a workspace's changes to its project.
+/// The identifiers are retained for the subprocess contract but are not
+/// presented in the close-workspace experience.
 struct LandResult: Equatable {
     let commitID: String
     let bookmark: String
@@ -42,52 +39,26 @@ struct LandResult: Equatable {
     var cleanupWarning: String? = nil
 }
 
-/// One commit as shown in the land-review confirmation — just enough to
-/// render a human-readable line (`LandPreview.commits`/`.conflicts`/
-/// `.diverging` are all this shape). `id` is a short commit id, already
-/// truncated by the CLI; it's carried through for potential future use
-/// (e.g. a "show diff" affordance) but today only `subject` is rendered.
+/// One human-readable change summary returned by a close preview. `id` is
+/// retained for the subprocess contract; presentation uses only `subject`.
 struct LandCommit: Equatable {
     let id: String
     let subject: String
 }
 
-/// A dry-run report of exactly what `landWorkspace` would do, fetched by
-/// `previewLand` and shown to the user before they commit to landing. This
-/// is what replaces the old free-text `promptLandMessage` prompt: that
-/// prompt asked the user to type a description on every land, but the CLI
-/// only ever reads it back (via `--message`) when `needsMessage` here is
-/// true — a rare case — so the prompt was almost always silently discarded
-/// work. Showing the user what will ACTUALLY happen is strictly more
-/// useful than asking them to (usually pointlessly) describe it themselves.
+/// A preview of the changes a workspace can add to its project. Storage
+/// details remain in the subprocess contract for compatibility, but the
+/// close-workspace UI intentionally presents only summaries and conflicts.
 struct LandPreview: Equatable {
-    /// The trunk bookmark's name (e.g. "main").
     let bookmark: String
-    /// Trunk's current short commit id, BEFORE landing — lets the
-    /// confirmation dialog show exactly what's about to move, not just its
-    /// name.
     let bookmarkCommit: String
-    /// What will land on `bookmark`, oldest first.
     let commits: [LandCommit]
-    /// Non-empty means landing would conflict. Still delivered inside an
-    /// otherwise-successful (`ok:true`) preview envelope, because a
-    /// preview's whole job is to REPORT, not to enforce — `workspace-land`
-    /// itself independently refuses a conflicting land with its own
-    /// `land-conflict` error. This field exists so the confirmation dialog
-    /// can warn the user before they even try, not to replace that
-    /// enforcement.
+    /// Human-readable conflict details. For Git previews the subject is the
+    /// conflicted file path; for Jujutsu previews it is the change summary.
     let conflicts: [LandCommit]
-    /// True iff the workspace's working-copy commit is non-empty AND
-    /// undescribed — the one situation where `workspace-land`'s
-    /// `--message` actually reaches the landed commit. Drives whether
-    /// `Dialogs.confirmLand` shows a free-text field at all: false means
-    /// there is nothing for a message to describe, so no field is shown.
     let needsMessage: Bool
-    /// The user's OWN default-workspace commits that are not part of this
-    /// land at all and will be left on a fork once `bookmark` moves out
-    /// from under them. Empty means landing won't fork the default
-    /// workspace. Non-empty drives the post-land rebase offer — see
-    /// `AppStore.reviewAndLandWorkspace`.
+    /// Advisory compatibility data. The close UI ignores it and project-root
+    /// reconciliation is requested automatically after every successful add.
     let diverging: [LandCommit]
 }
 
@@ -97,11 +68,9 @@ protocol WorkspaceEngineProviding: AnyObject {
     func deleteWorkspace(_ workspace: WorkspaceRow) async throws
     func landWorkspace(_ workspace: WorkspaceRow, message: String?, createTrunk: String?) async throws -> LandResult
     func previewLand(_ workspace: WorkspaceRow) async throws -> LandPreview
-    /// Rebases the default workspace's diverging commits (see
-    /// `LandPreview.diverging`) onto the project's trunk bookmark. Returns
-    /// how many commits were rebased. Only ever called after the user
-    /// explicitly opts in via `Dialogs.confirmRebaseOntoTrunk`, immediately
-    /// following a successful land — never automatically.
+    /// Reconciles the project working copy after a successful close. This is
+    /// always requested automatically; a conflict is non-fatal follow-up
+    /// attention because the workspace close has already succeeded.
     func rebaseOntoTrunk(projectPath: String) async throws -> Int
 }
 
@@ -143,7 +112,6 @@ final class WorkspaceEngineCLI: WorkspaceEngineProviding {
 
     private struct WorkspacePayload: Decodable {
         let name: String
-        let jj_name: String
         let path: String
         let project: String
     }
@@ -154,11 +122,13 @@ final class WorkspaceEngineCLI: WorkspaceEngineProviding {
         let workspace: String
     }
 
-    /// One entry of `LandPreviewPayload.commits`/`.conflicts`/`.diverging`
-    /// — same shape reused for all three, matching the CLI's own contract.
+    /// Change entries use `id`/`subject`. Git conflict entries instead use
+    /// `file`; keeping all fields optional lets one stable envelope represent
+    /// both without leaking the VCS distinction into presentation.
     private struct LandCommitPayload: Decodable {
-        let id: String
-        let subject: String
+        let id: String?
+        let subject: String?
+        let file: String?
     }
 
     private struct LandPreviewPayload: Decodable {
@@ -182,7 +152,7 @@ final class WorkspaceEngineCLI: WorkspaceEngineProviding {
 
     private static func engineError(for payload: ErrorPayload) -> EngineError {
         switch payload.code {
-        case "not-a-jj-repo": return .notAJJRepo(payload.message)
+        case "not-a-repo", "not-a-jj-repo": return .notARepo(payload.message)
         case "name-conflict": return .nameConflict(payload.message)
         case "dest-exists": return .destExists(payload.message)
         case "no-trunk": return .noTrunk(payload.message)
@@ -190,6 +160,7 @@ final class WorkspaceEngineCLI: WorkspaceEngineProviding {
         case "nothing-to-land": return .nothingToLand(payload.message)
         case "shared-history": return .sharedHistory(payload.message)
         case "rebase-conflict": return .rebaseConflict(payload.message)
+        case "git-failed": return .failed(payload.message)
         default: return .failed(payload.message)
         }
     }
@@ -484,7 +455,12 @@ final class WorkspaceEngineCLI: WorkspaceEngineProviding {
             throw EngineError.failed("agents-cli workspace-land-preview returned ok with no preview payload")
         }
         func commits(_ payloads: [LandCommitPayload]) -> [LandCommit] {
-            payloads.map { LandCommit(id: $0.id, subject: $0.subject) }
+            payloads.map { payload in
+                LandCommit(
+                    id: payload.id ?? payload.file ?? "",
+                    subject: payload.file ?? payload.subject ?? "Conflicting change"
+                )
+            }
         }
         return LandPreview(
             bookmark: payload.bookmark,

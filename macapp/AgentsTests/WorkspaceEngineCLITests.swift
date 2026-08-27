@@ -11,13 +11,14 @@ import XCTest
 /// never touches agents-cli's actual JSON output.
 ///
 /// The test host is the built Agents.app (see macapp/project.yml's
-/// TEST_HOST), which bundles cli/agents-cli as a resource, so a plain
-/// `WorkspaceEngineCLI()` here resolves both the script and `bb` with no
-/// extra setup.
+/// TEST_HOST), which bundles only cli/agents-cli as a resource. Real CLI
+/// cases resolve workstream-manager from WORKSTREAM_MANAGER_ROOT or the
+/// default local checkout, while the stub-envelope cases below need no
+/// manager checkout.
 @MainActor
 final class WorkspaceEngineCLITests: XCTestCase {
 
-    // MARK: - Tool location (skip-soft if bb/jj aren't installed)
+    // MARK: - Integration prerequisites
 
     /// Custom error thrown when a required tool is missing in CI mode.
     /// Skip locally for convenience, but CI must fail hard to catch
@@ -65,9 +66,32 @@ final class WorkspaceEngineCLITests: XCTestCase {
         resolveTool(named: "bb", candidates: ["/opt/homebrew/bin/bb", "/usr/local/bin/bb"])
     }
 
-    /// Throws XCTSkip or MissingToolError depending on environment.
-    /// When AGENTS_REQUIRE_TOOLS="1", throws MissingToolError so CI fails hard.
-    /// Otherwise, throws XCTSkip for developer convenience.
+    private static func resolveWorkstreamManagerRoot() -> String {
+        if let configured = ProcessInfo.processInfo.environment["WORKSTREAM_MANAGER_ROOT"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !configured.isEmpty {
+            return configured
+        }
+
+        return FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("code/projects/workstream-manager")
+            .path
+    }
+
+    /// The manager is intentionally a local dependency until it is published.
+    /// Unlike missing tools, a missing checkout always skips real integration
+    /// cases, including when CI requires its installed tools.
+    private func requireWorkstreamManager() throws {
+        let root = Self.resolveWorkstreamManagerRoot()
+        let entrypoint = URL(fileURLWithPath: root)
+            .appendingPathComponent("src/wsm/cli.clj")
+            .path
+        guard FileManager.default.fileExists(atPath: entrypoint) else {
+            throw XCTSkip("local workstream-manager checkout is unavailable at \(root)")
+        }
+        setenv("WORKSTREAM_MANAGER_ROOT", root, 1)
+    }
+
     private func missingToolThrow(_ toolName: String) throws -> Never {
         if ProcessInfo.processInfo.environment["AGENTS_REQUIRE_TOOLS"] == "1" {
             throw MissingToolError(toolName: toolName)
@@ -76,18 +100,14 @@ final class WorkspaceEngineCLITests: XCTestCase {
         }
     }
 
-    /// Call at the top of every test: fails soft (XCTSkip) rather than hard
-    /// in environments without jj/bb installed, since this suite's whole
-    /// point is exercising the real subprocess seam.
-    ///
-    /// Two modes:
-    /// - **Developer (default)**: Missing tools throw XCTSkip, soft-skipping the test.
-    ///   Convenient for local development without a full environment.
-    /// - **CI (AGENTS_REQUIRE_TOOLS=1)**: Missing tools throw MissingToolError,
-    ///   a hard failure. CI must never silently skip — this suite is the only
-    ///   integration coverage of the Swift↔CLI seam. A missing tool on CI is
-    ///   a configuration problem, not a reason to hide it.
+    /// Call at the top of every real CLI integration test. A missing local
+    /// workstream-manager checkout always soft-skips because release and CI
+    /// builds intentionally contain only the thin script until the library is
+    /// published. Missing jj/bb tools skip for developer convenience but fail
+    /// hard under AGENTS_REQUIRE_TOOLS=1 so CI still catches tool
+    /// misconfiguration whenever the manager checkout is available.
     private func requireTools() throws -> (jj: String, bb: String) {
+        try requireWorkstreamManager()
         guard let jj = Self.resolveJJPath() else { try missingToolThrow("jj") }
         guard let bb = Self.resolveBBPath() else { try missingToolThrow("bb") }
         Self.ensurePathIncludesToolDirectories(jj: jj, bb: bb)
@@ -226,7 +246,7 @@ final class WorkspaceEngineCLITests: XCTestCase {
     /// Confirms EngineError mapping still works correctly for an ok:false
     /// envelope now that `run` returns the raw Envelope instead of
     /// unwrapping a workspace payload itself.
-    func test_createWorkspace_onNonRepoDirectory_throwsNotAJJRepo() async throws {
+    func test_createWorkspace_onNonRepoDirectory_throwsNotARepo() async throws {
         _ = try requireTools()
 
         let nonRepoDir = FileManager.default.temporaryDirectory
@@ -238,10 +258,10 @@ final class WorkspaceEngineCLITests: XCTestCase {
 
         do {
             _ = try await engine.createWorkspace(projectPath: nonRepoDir.path)
-            XCTFail("expected createWorkspace to throw for a non-jj-repo directory")
+            XCTFail("expected createWorkspace to throw for a non-repository directory")
         } catch let error as EngineError {
-            guard case .notAJJRepo = error else {
-                XCTFail("expected .notAJJRepo, got \(error)")
+            guard case .notARepo = error else {
+                XCTFail("expected .notARepo, got \(error)")
                 return
             }
         } catch {
@@ -339,6 +359,22 @@ final class WorkspaceEngineCLITests: XCTestCase {
         }
     }
 
+    func test_previewLand_decodesGitConflictFilePaths() async throws {
+        let json = """
+        {"ok":true,"preview":{"bookmark":"main","bookmark_commit":"efdd547b","commits":[{"id":"5178cc25","subject":"Update close flow"}],"conflicts":[{"file":"Sources/CloseWorkspace.swift"},{"file":"Tests/CloseWorkspaceTests.swift"}],"needs_message":false,"diverging":[]}}
+        """
+        try await withStubBB(json: json) {
+            let preview = try await WorkspaceEngineCLI().previewLand(self.makeWorkspace())
+            XCTAssertEqual(
+                preview.conflicts,
+                [
+                    LandCommit(id: "Sources/CloseWorkspace.swift", subject: "Sources/CloseWorkspace.swift"),
+                    LandCommit(id: "Tests/CloseWorkspaceTests.swift", subject: "Tests/CloseWorkspaceTests.swift"),
+                ]
+            )
+        }
+    }
+
     func test_previewLand_missingPreviewPayloadOnOkTrueThrowsContractViolation() async throws {
         try await withStubBB(json: #"{"ok":true}"#) {
             do {
@@ -359,7 +395,9 @@ final class WorkspaceEngineCLITests: XCTestCase {
     /// decoding.
     func test_previewLand_errorEnvelopeCodesMapToTheirEngineErrors() async throws {
         let cases: [(code: String, expect: (EngineError) -> Bool)] = [
-            ("not-a-jj-repo", { if case .notAJJRepo = $0 { return true }; return false }),
+            ("not-a-repo", { if case .notARepo = $0 { return true }; return false }),
+            ("not-a-jj-repo", { if case .notARepo = $0 { return true }; return false }),
+            ("git-failed", { if case .failed = $0 { return true }; return false }),
             ("no-trunk", { if case .noTrunk = $0 { return true }; return false }),
             ("nothing-to-land", { if case .nothingToLand = $0 { return true }; return false }),
             ("shared-history", { if case .sharedHistory = $0 { return true }; return false }),
