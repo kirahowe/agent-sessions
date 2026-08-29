@@ -20,14 +20,14 @@ final class WorkspaceEngineCLITests: XCTestCase {
 
     // MARK: - Integration prerequisites
 
-    /// Custom error thrown when a required tool is missing in CI mode.
+    /// Custom error thrown when a required integration dependency is missing.
     /// Skip locally for convenience, but CI must fail hard to catch
     /// misconfigured environments before they mask integration failures.
-    private struct MissingToolError: Error, CustomStringConvertible {
-        let toolName: String
+    private struct MissingRequiredDependencyError: Error, CustomStringConvertible {
+        let dependency: String
 
         var description: String {
-            "\(toolName) not installed, but AGENTS_REQUIRE_TOOLS=1 — install it on CI instead of silently skipping the Swift↔CLI integration coverage"
+            "\(dependency) is unavailable, but AGENTS_REQUIRE_TOOLS=1 — provision it on CI instead of silently skipping the Swift↔CLI integration coverage"
         }
     }
 
@@ -79,37 +79,32 @@ final class WorkspaceEngineCLITests: XCTestCase {
     }
 
     /// The manager is intentionally a local dependency until it is published.
-    /// Unlike missing tools, a missing checkout always skips real integration
-    /// cases, including when CI requires its installed tools.
     private func requireWorkstreamManager() throws {
         let root = Self.resolveWorkstreamManagerRoot()
         let entrypoint = URL(fileURLWithPath: root)
             .appendingPathComponent("src/wsm/cli.clj")
             .path
         guard FileManager.default.fileExists(atPath: entrypoint) else {
-            throw XCTSkip("local workstream-manager checkout is unavailable at \(root)")
+            try missingRequiredDependency("local workstream-manager checkout at \(root)")
         }
         setenv("WORKSTREAM_MANAGER_ROOT", root, 1)
     }
 
-    private func missingToolThrow(_ toolName: String) throws -> Never {
+    private func missingRequiredDependency(_ dependency: String) throws -> Never {
         if ProcessInfo.processInfo.environment["AGENTS_REQUIRE_TOOLS"] == "1" {
-            throw MissingToolError(toolName: toolName)
+            throw MissingRequiredDependencyError(dependency: dependency)
         } else {
-            throw XCTSkip("\(toolName) not installed")
+            throw XCTSkip("\(dependency) is unavailable")
         }
     }
 
-    /// Call at the top of every real CLI integration test. A missing local
-    /// workstream-manager checkout always soft-skips because release and CI
-    /// builds intentionally contain only the thin script until the library is
-    /// published. Missing jj/bb tools skip for developer convenience but fail
-    /// hard under AGENTS_REQUIRE_TOOLS=1 so CI still catches tool
-    /// misconfiguration whenever the manager checkout is available.
+    /// Call at the top of every real CLI integration test. Tools and the
+    /// manager checkout skip for local convenience, but are hard failures when
+    /// AGENTS_REQUIRE_TOOLS is set for CI.
     private func requireTools() throws -> (jj: String, bb: String) {
+        guard let jj = Self.resolveJJPath() else { try missingRequiredDependency("jj") }
+        guard let bb = Self.resolveBBPath() else { try missingRequiredDependency("bb") }
         try requireWorkstreamManager()
-        guard let jj = Self.resolveJJPath() else { try missingToolThrow("jj") }
-        guard let bb = Self.resolveBBPath() else { try missingToolThrow("bb") }
         Self.ensurePathIncludesToolDirectories(jj: jj, bb: bb)
         return (jj, bb)
     }
@@ -226,7 +221,7 @@ final class WorkspaceEngineCLITests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: row.path), "workspace directory should exist on disk after creation")
 
         do {
-            try await engine.deleteWorkspace(row)
+            _ = try await engine.deleteWorkspace(row, onlyIfUnchanged: false)
         } catch {
             XCTFail(
                 "deleteWorkspace must not throw — workspace-forget returns a bare {\"ok\":true} envelope "
@@ -290,39 +285,42 @@ final class WorkspaceEngineCLITests: XCTestCase {
         XCTAssertEqual(result.exitCode, 0)
     }
 
-    // MARK: - Envelope decoding for workspace-land-preview / rebase-onto-trunk
+    // MARK: - Envelope decoding for external wsm.cli workspace commands
 
     /// Every test above this point drives the REAL agents-cli against a
     /// REAL jj repo, because their whole point is proving the Swift<->CLI
     /// process seam works end to end. These tests want something narrower:
     /// does `WorkspaceEngineCLI` decode a given JSON envelope correctly?
-    /// That question doesn't need a real jj repo, or even the real
-    /// workspace-land-preview/rebase-onto-trunk subcommands to exist yet —
-    /// it needs a `bb` that prints a chosen envelope and exits.
+    /// That focused decoding question uses a `bb` stub for the external
+    /// `wsm.cli` envelope; end-to-end behavior is covered above.
     ///
     /// `AGENTS_BB` is `resolveBBPath`'s dev-override env var, checked
     /// BEFORE any Homebrew candidate (see WorkspaceEngine.swift) — pointing
-    /// it at a throwaway shell script that ignores its arguments and just
-    /// cats a canned envelope makes `WorkspaceEngineCLI` run its real
-    /// decode/error-mapping logic against exactly the bytes each test
-    /// wants, with no dependency on jj/bb being installed or on the CLI
+    /// it at a throwaway shell script that records its arguments and cats a
+    /// canned envelope makes WorkspaceEngineCLI run its real argument and
+    /// decode/error-mapping logic against exactly what each test wants, with
+    /// no dependency on jj/bb being installed or on the CLI
     /// side of this feature having landed. `resolveScriptURL` still needs
     /// SOME agents-cli to exist, but the test host already bundles the
     /// real one as a resource (see this file's own header comment) — our
     /// stub `bb` never actually interprets it, so which one that is
     /// doesn't matter.
-    private func withStubBB(json: String, _ body: () async throws -> Void) async throws {
+    @discardableResult
+    private func withStubBB(
+        json: String,
+        _ body: () async throws -> Void
+    ) async throws -> [String] {
         let dir = FileManager.default.temporaryDirectory
             .appendingPathComponent("WorkspaceEngineCLITests-stub-bb-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }
 
         let scriptURL = dir.appendingPathComponent("bb")
-        // Ignores $1 (the real agents-cli script path) and $2... (the
-        // subcommand + its own flags) entirely — this stub answers every
-        // invocation the same way, because each test only ever makes one
-        // call through it.
-        let script = "#!/bin/sh\ncat <<'STUB_BB_EOF'\n\(json)\nSTUB_BB_EOF\n"
+        let argumentsURL = dir.appendingPathComponent("arguments")
+        // Capture the real invocation while returning one canned envelope.
+        // This exercises both decoding and argument construction without
+        // needing the external CLI implementation under test.
+        let script = "#!/bin/sh\nprintf '%s\\n' \"$@\" > '\(argumentsURL.path)'\ncat <<'STUB_BB_EOF'\n\(json)\nSTUB_BB_EOF\n"
         try script.write(to: scriptURL, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: scriptURL.path)
 
@@ -337,15 +335,266 @@ final class WorkspaceEngineCLITests: XCTestCase {
         }
 
         try await body()
+        return try String(contentsOf: argumentsURL, encoding: .utf8)
+            .split(separator: "\n")
+            .map(String.init)
     }
 
     private func makeWorkspace() -> WorkspaceRow {
         WorkspaceRow(projectPath: "/tmp/proj-stub", name: "ws-stub", path: "/tmp/workspaces/ws-stub", label: nil)
     }
 
+    func test_deleteWorkspace_forgetFailureDoesNotAttemptLocalCleanup() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("WorkspaceEngineCLITests-delete-failure-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let workspace = WorkspaceRow(
+            projectPath: "/tmp/project",
+            name: "ws",
+            path: directory.path,
+            label: nil
+        )
+        let json = #"{"ok":false,"error":{"code":"failed","message":"forget failed"}}"#
+
+        try await withStubBB(json: json) {
+            let engine = WorkspaceEngineCLI(trashWorkspaceDirectory: { _ in
+                XCTFail("local cleanup must not run before workspace-forget succeeds")
+            })
+            do {
+                _ = try await engine.deleteWorkspace(workspace, onlyIfUnchanged: false)
+                XCTFail("expected forget failure")
+            } catch EngineError.failed(let message) {
+                XCTAssertEqual(message, "forget failed")
+            } catch {
+                XCTFail("expected EngineError.failed, got \(error)")
+            }
+        }
+
+        XCTAssertTrue(FileManager.default.fileExists(atPath: directory.path))
+    }
+
+    func test_deleteWorkspace_trashFailureAfterForgetReturnsCleanupWarning() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("WorkspaceEngineCLITests-delete-warning-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let workspace = WorkspaceRow(
+            projectPath: "/tmp/project",
+            name: "ws",
+            path: directory.path,
+            label: nil
+        )
+
+        try await withStubBB(json: #"{"ok":true}"#) {
+            let engine = WorkspaceEngineCLI(trashWorkspaceDirectory: { _ in
+                throw CocoaError(.fileWriteNoPermission)
+            })
+            let result = try await engine.deleteWorkspace(workspace, onlyIfUnchanged: false)
+
+            XCTAssertEqual(
+                result.cleanupWarning,
+                "The workspace was closed, but its folder couldn't be moved to the Bin — it's still at \(directory.path)"
+            )
+        }
+
+        XCTAssertTrue(FileManager.default.fileExists(atPath: directory.path))
+    }
+
+    func test_landWorkspace_retainedIdentitySkipsTrashForExistingPath() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("WorkspaceEngineCLITests-retained-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let workspace = WorkspaceRow(
+            projectPath: "/tmp/project",
+            name: "ws",
+            path: directory.path,
+            label: nil
+        )
+        let json = #"{"ok":true,"landed":{"commit_id":"abc","bookmark":"main","workspace":"ws","workspace_retained":true},"warning":"Workspace remains registered."}"#
+        var trashCalls = 0
+
+        try await withStubBB(json: json) {
+            let engine = WorkspaceEngineCLI(trashWorkspaceDirectory: { _ in
+                trashCalls += 1
+            })
+            let result = try await engine.landWorkspace(
+                workspace,
+                message: nil,
+                createTrunk: nil,
+                expectedSnapshot: "test-snapshot"
+            )
+
+            XCTAssertTrue(result.workspaceRetained)
+            XCTAssertEqual(result.cleanupWarning, "Workspace remains registered.")
+        }
+
+        XCTAssertEqual(trashCalls, 0)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: directory.path))
+    }
+
+    func test_landWorkspace_nonRetainedWarningStillTrashesExistingPath() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("WorkspaceEngineCLITests-not-retained-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let workspace = WorkspaceRow(
+            projectPath: "/tmp/project",
+            name: "ws",
+            path: directory.path,
+            label: nil
+        )
+        let warning = "The obsolete workspace branch remains."
+        let json = #"{"ok":true,"landed":{"commit_id":"abc","bookmark":"main","workspace":"ws","workspace_retained":false},"warning":"The obsolete workspace branch remains."}"#
+        var trashCalls = 0
+
+        try await withStubBB(json: json) {
+            let engine = WorkspaceEngineCLI(trashWorkspaceDirectory: { url in
+                trashCalls += 1
+                try FileManager.default.removeItem(at: url)
+            })
+            let result = try await engine.landWorkspace(
+                workspace,
+                message: nil,
+                createTrunk: nil,
+                expectedSnapshot: "test-snapshot"
+            )
+
+            XCTAssertFalse(result.workspaceRetained)
+            XCTAssertEqual(result.cleanupWarning, warning)
+        }
+
+        XCTAssertEqual(trashCalls, 1)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: directory.path))
+    }
+
+    func test_landWorkspace_missingRetainedIdentityFailsClosed() async throws {
+        let json = #"{"ok":true,"landed":{"commit_id":"abc","bookmark":"main","workspace":"ws-stub"}}"#
+        try await withStubBB(json: json) {
+            do {
+                _ = try await WorkspaceEngineCLI().landWorkspace(
+                    self.makeWorkspace(),
+                    message: nil,
+                    createTrunk: nil,
+                    expectedSnapshot: "test-snapshot"
+                )
+                XCTFail("missing workspace_retained must fail rather than imply teardown")
+            } catch EngineError.failed(let message) {
+                XCTAssertTrue(message.contains("unparseable output"))
+            } catch {
+                XCTFail("expected EngineError.failed, got \(error)")
+            }
+        }
+    }
+
+    func test_deleteWorkspace_guardedForgetUsesManagerSideRecheckAndCreatesMainTrunk() async throws {
+        let arguments = try await withStubBB(json: #"{"ok":true}"#) {
+            _ = try await WorkspaceEngineCLI().deleteWorkspace(
+                self.makeWorkspace(),
+                onlyIfUnchanged: true
+            )
+        }
+
+        XCTAssertEqual(
+            Array(arguments.dropFirst()),
+            [
+                "workspace-forget",
+                "--project", "/tmp/proj-stub",
+                "--name", "ws-stub",
+                "--if-unchanged",
+                "--create-trunk", "main",
+            ]
+        )
+    }
+
+    func test_deleteWorkspace_destructiveForgetOmitsUnchangedGuard() async throws {
+        let arguments = try await withStubBB(json: #"{"ok":true}"#) {
+            _ = try await WorkspaceEngineCLI().deleteWorkspace(
+                self.makeWorkspace(),
+                onlyIfUnchanged: false
+            )
+        }
+
+        XCTAssertEqual(
+            Array(arguments.dropFirst()),
+            ["workspace-forget", "--project", "/tmp/proj-stub", "--name", "ws-stub"]
+        )
+    }
+
+    func test_landWorkspace_roundTripsExpectedSnapshotAndFinalizesQuiescedWorkspace() async throws {
+        let json = #"{"ok":true,"landed":{"commit_id":"abc","bookmark":"main","workspace":"ws-stub","workspace_retained":true}}"#
+        let arguments = try await withStubBB(json: json) {
+            _ = try await WorkspaceEngineCLI().landWorkspace(
+                self.makeWorkspace(),
+                message: nil,
+                createTrunk: nil,
+                expectedSnapshot: "opaque-preview-token"
+            )
+        }
+
+        XCTAssertEqual(
+            Array(arguments.dropFirst()),
+            [
+                "workspace-land",
+                "--project", "/tmp/proj-stub",
+                "--name", "ws-stub",
+                "--finalize-quiesced",
+                "--expected-snapshot", "opaque-preview-token",
+            ]
+        )
+    }
+
+    func test_deleteWorkspace_workspaceChangedMapsToTypedEngineError() async throws {
+        let json = #"{"ok":false,"error":{"code":"workspace-changed","message":"workspace changed"}}"#
+        try await withStubBB(json: json) {
+            do {
+                _ = try await WorkspaceEngineCLI().deleteWorkspace(
+                    self.makeWorkspace(),
+                    onlyIfUnchanged: true
+                )
+                XCTFail("expected guarded forget refusal")
+            } catch EngineError.workspaceChanged(let message) {
+                XCTAssertEqual(message, "workspace changed")
+            } catch {
+                XCTFail("expected EngineError.workspaceChanged, got \(error)")
+            }
+        }
+    }
+
+    func test_previewLand_appendsCreateTrunkOnlyWhenProvided() async throws {
+        let json = """
+        {"ok":true,"preview":{"bookmark":"main","bookmark_commit":"","commits":[],"conflicts":[],"needs_message":false,"diverging":[],"target_snapshot":"test-snapshot"}}
+        """
+
+        let ordinaryArguments = try await withStubBB(json: json) {
+            _ = try await WorkspaceEngineCLI().previewLand(self.makeWorkspace())
+        }
+        XCTAssertEqual(
+            Array(ordinaryArguments.dropFirst()),
+            ["workspace-land-preview", "--project", "/tmp/proj-stub", "--name", "ws-stub"]
+        )
+
+        let setupArguments = try await withStubBB(json: json) {
+            _ = try await WorkspaceEngineCLI().previewLand(
+                self.makeWorkspace(),
+                createTrunk: "main"
+            )
+        }
+        XCTAssertEqual(
+            Array(setupArguments.dropFirst()),
+            [
+                "workspace-land-preview",
+                "--project", "/tmp/proj-stub",
+                "--name", "ws-stub",
+                "--create-trunk", "main"
+            ]
+        )
+    }
+
     func test_previewLand_decodesFullPreviewPayload() async throws {
         let json = """
-        {"ok":true,"preview":{"bookmark":"main","bookmark_commit":"efdd547b","commits":[{"id":"5178cc25","subject":"Name the dev bundle Agents Dev.app on disk"}],"conflicts":[],"needs_message":false,"diverging":[{"id":"0071bbf4","subject":"Badge the Dock with blocked session count"}]}}
+        {"ok":true,"preview":{"bookmark":"main","bookmark_commit":"efdd547b","commits":[{"id":"5178cc25","subject":"Name the dev bundle Agents Dev.app on disk"}],"conflicts":[],"needs_message":false,"diverging":[{"id":"0071bbf4","subject":"Badge the Dock with blocked session count"}],"target_snapshot":"opaque-preview-token"}}
         """
         try await withStubBB(json: json) {
             let preview = try await WorkspaceEngineCLI().previewLand(self.makeWorkspace())
@@ -356,12 +605,33 @@ final class WorkspaceEngineCLITests: XCTestCase {
             XCTAssertEqual(preview.conflicts, [])
             XCTAssertFalse(preview.needsMessage)
             XCTAssertEqual(preview.diverging, [LandCommit(id: "0071bbf4", subject: "Badge the Dock with blocked session count")])
+            XCTAssertEqual(preview.targetSnapshot, "opaque-preview-token")
+        }
+    }
+
+    func test_previewLand_missingOrBlankTargetSnapshotFailsClosed() async throws {
+        let previews = [
+            #"{"bookmark":"main","bookmark_commit":"abc","commits":[],"conflicts":[],"needs_message":false,"diverging":[]}"#,
+            #"{"bookmark":"main","bookmark_commit":"abc","commits":[],"conflicts":[],"needs_message":false,"diverging":[],"target_snapshot":"   \n "}"#,
+        ]
+
+        for previewJSON in previews {
+            try await withStubBB(json: #"{"ok":true,"preview":\#(previewJSON)}"#) {
+                do {
+                    _ = try await WorkspaceEngineCLI().previewLand(self.makeWorkspace())
+                    XCTFail("missing or blank target_snapshot must fail closed")
+                } catch EngineError.failed {
+                    // The missing field fails decoding; blank is rejected explicitly.
+                } catch {
+                    XCTFail("expected EngineError.failed, got \(error)")
+                }
+            }
         }
     }
 
     func test_previewLand_decodesGitConflictFilePaths() async throws {
         let json = """
-        {"ok":true,"preview":{"bookmark":"main","bookmark_commit":"efdd547b","commits":[{"id":"5178cc25","subject":"Update close flow"}],"conflicts":[{"file":"Sources/CloseWorkspace.swift"},{"file":"Tests/CloseWorkspaceTests.swift"}],"needs_message":false,"diverging":[]}}
+        {"ok":true,"preview":{"bookmark":"main","bookmark_commit":"efdd547b","commits":[{"id":"5178cc25","subject":"Update close flow"}],"conflicts":[{"file":"Sources/CloseWorkspace.swift"},{"file":"Tests/CloseWorkspaceTests.swift"}],"needs_message":false,"diverging":[],"target_snapshot":"test-snapshot"}}
         """
         try await withStubBB(json: json) {
             let preview = try await WorkspaceEngineCLI().previewLand(self.makeWorkspace())
@@ -396,8 +666,6 @@ final class WorkspaceEngineCLITests: XCTestCase {
     func test_previewLand_errorEnvelopeCodesMapToTheirEngineErrors() async throws {
         let cases: [(code: String, expect: (EngineError) -> Bool)] = [
             ("not-a-repo", { if case .notARepo = $0 { return true }; return false }),
-            ("not-a-jj-repo", { if case .notARepo = $0 { return true }; return false }),
-            ("git-failed", { if case .failed = $0 { return true }; return false }),
             ("no-trunk", { if case .noTrunk = $0 { return true }; return false }),
             ("nothing-to-land", { if case .nothingToLand = $0 { return true }; return false }),
             ("shared-history", { if case .sharedHistory = $0 { return true }; return false }),

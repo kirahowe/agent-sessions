@@ -340,7 +340,8 @@ final class AppActionsTests: XCTestCase {
                 commits: [LandCommit(id: "def", subject: "Ship it")],
                 conflicts: [],
                 needsMessage: false,
-                diverging: []
+                diverging: [],
+                targetSnapshot: "test-snapshot"
             )
         )
         await store.createWorkspace(in: "/tmp/proj-A", label: "Draft")
@@ -348,13 +349,15 @@ final class AppActionsTests: XCTestCase {
         XCTAssertTrue(actions.perform(.closeWorkspace))
 
         await waitUntil { store.closeWorkspace != nil }
-        XCTAssertEqual(fake.previewLandCalls, [wsRow])
+        XCTAssertEqual(fake.previewLandCalls.map(\.workspace), [wsRow])
         XCTAssertEqual(
             store.closeWorkspace,
             CloseWorkspacePresentation(
                 workspaceID: wsRow.id,
                 workspaceName: "Draft",
+                projectPath: "/tmp/proj-A",
                 projectName: "proj-A",
+                targetSnapshot: "test-snapshot",
                 phase: .ready(changes: ["Ship it"])
             )
         )

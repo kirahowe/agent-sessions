@@ -14,8 +14,9 @@ indirect enum CloseWorkspacePhase: Equatable {
     case confirmCloseWithoutAdding(returnTo: CloseWorkspacePhase)
     case applying(CloseWorkspaceProgress)
     case conflictAttention(message: String, details: [String])
-    case projectSetupRequired
+    case projectSetupRequired(changes: [String], needsMessage: Bool)
     case success(addedChanges: Int?, notice: String?)
+    case workspaceRetained(addedChanges: Int?, notice: String?)
     case projectAttention(addedChanges: Int?, notice: String?)
     case failure(message: String)
 }
@@ -23,11 +24,15 @@ indirect enum CloseWorkspacePhase: Equatable {
 struct CloseWorkspacePresentation: Identifiable, Equatable {
     let workspaceID: WorkspaceRow.ID
     let workspaceName: String
+    let projectPath: String
     let projectName: String
+    /// Distinguishes a replacement sheet for the same workspace across awaits.
+    let presentationID = UUID()
     var summary = ""
+    /// Opaque manager state from the currently displayed preview.
+    var targetSnapshot: String? = nil
     var phase: CloseWorkspacePhase
-
-    var id: WorkspaceRow.ID { workspaceID }
+    var id: UUID { presentationID }
 
     var isBusy: Bool {
         switch phase {
@@ -36,6 +41,16 @@ struct CloseWorkspacePresentation: Identifiable, Equatable {
         default:
             return false
         }
+    }
+
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.workspaceID == rhs.workspaceID
+            && lhs.workspaceName == rhs.workspaceName
+            && lhs.projectPath == rhs.projectPath
+            && lhs.projectName == rhs.projectName
+            && lhs.summary == rhs.summary
+            && lhs.targetSnapshot == rhs.targetSnapshot
+            && lhs.phase == rhs.phase
     }
 }
 
@@ -94,6 +109,10 @@ final class AppStore: ObservableObject {
     /// restored session names on launch; on relaunch max+1 is fine, no need
     /// to persist the counter itself. Keyed by `TargetRef.id`.
     private var sessionCounters: [String: Int] = [:]
+    /// In-memory identity for each current project-path lifecycle. Every
+    /// project-scoped engine operation captures this identity before awaiting;
+    /// only a matching token may mutate state after removal or remove-then-readd.
+    private var projectLifecycleTokens: [String: UUID] = [:]
 
     private let stateURL: URL
 
@@ -158,6 +177,9 @@ final class AppStore: ObservableObject {
             self?.handleAgentSessionEvent(event, for: id)
         }
         load()
+        projectLifecycleTokens = projects.reduce(into: [:]) { tokens, project in
+            tokens[project.path] = UUID()
+        }
         seedSessionCounters()
     }
 
@@ -170,6 +192,7 @@ final class AppStore: ObservableObject {
         } else {
             project = Project(path: path)
             projects.append(project)
+            projectLifecycleTokens[path] = UUID()
         }
 
         newSession(in: project)
@@ -184,6 +207,11 @@ final class AppStore: ObservableObject {
         sessions.removeAll { $0.projectPath == project.path }
         pruneLiveSessionState()
         projects.removeAll { $0.path == project.path }
+        projectLifecycleTokens.removeValue(forKey: project.path)
+        projectWorkingCopyAttention.remove(project.path)
+        if closeWorkspace?.projectPath == project.path {
+            closeWorkspace = nil
+        }
         // Removing a project is local bookkeeping only: never destroy its
         // on-disk workspaces.
         workspaces.removeAll { $0.projectPath == project.path }
@@ -199,8 +227,10 @@ final class AppStore: ObservableObject {
     /// label. A nil/blank `label` (the default) leaves `label` nil, so
     /// `displayName` falls through to the engine-generated name.
     func createWorkspace(in projectPath: String, label: String? = nil) async {
+        guard let lifecycleToken = projectLifecycleTokens[projectPath] else { return }
         do {
             var row = try await engine.createWorkspace(projectPath: projectPath)
+            guard projectLifecycleTokens[projectPath] == lifecycleToken else { return }
             let trimmedLabel = label?.trimmingCharacters(in: .whitespacesAndNewlines)
             if let trimmedLabel, !trimmedLabel.isEmpty {
                 row.label = trimmedLabel
@@ -208,19 +238,40 @@ final class AppStore: ObservableObject {
             workspaces.append(row)
             newSession(in: .workspace(projectPath: row.projectPath, name: row.name))
         } catch let error as EngineError {
+            guard projectLifecycleTokens[projectPath] == lifecycleToken else { return }
             lastError = error.message
         } catch {
+            guard projectLifecycleTokens[projectPath] == lifecycleToken else { return }
             lastError = "\(error)"
         }
+    }
+
+    private func isCurrentWorkspaceLifecycle(
+        _ workspace: WorkspaceRow,
+        token: UUID
+    ) -> Bool {
+        projectLifecycleTokens[workspace.projectPath] == token
+            && workspaces.contains { $0.id == workspace.id && $0.path == workspace.path }
+    }
+
+    private func isCurrentClosePresentation(
+        _ workspace: WorkspaceRow,
+        presentationID: UUID
+    ) -> Bool {
+        closeWorkspace?.presentationID == presentationID
+            && closeWorkspace?.workspaceID == workspace.id
+            && closeWorkspace?.projectPath == workspace.projectPath
     }
 
     /// Starts the single close-workspace experience. The state is installed
     /// before awaiting the preview so RootView can present a stable sheet for
     /// the complete asynchronous operation. A second request is ignored until
     /// the current sheet is dismissed.
+
     func prepareCloseWorkspace(_ id: WorkspaceRow.ID) async {
         guard closeWorkspace == nil,
-              let workspace = workspaces.first(where: { $0.id == id })
+              let workspace = workspaces.first(where: { $0.id == id }),
+              let lifecycleToken = projectLifecycleTokens[workspace.projectPath]
         else { return }
 
         let projectName = projects.first(where: { $0.path == workspace.projectPath })?.name
@@ -228,43 +279,125 @@ final class AppStore: ObservableObject {
         closeWorkspace = CloseWorkspacePresentation(
             workspaceID: id,
             workspaceName: workspace.displayName,
+            projectPath: workspace.projectPath,
             projectName: projectName,
             phase: .preparing
         )
+        guard let presentationID = closeWorkspace?.presentationID else { return }
+
+        await refreshCloseWorkspacePreview(
+            workspace,
+            lifecycleToken: lifecycleToken,
+            presentationID: presentationID
+        )
+    }
+
+    private func refreshCloseWorkspacePreview(
+        _ workspace: WorkspaceRow,
+        lifecycleToken: UUID,
+        presentationID: UUID
+    ) async {
+        guard isCurrentWorkspaceLifecycle(workspace, token: lifecycleToken),
+              isCurrentClosePresentation(workspace, presentationID: presentationID)
+        else { return }
+        closeWorkspace?.targetSnapshot = nil
 
         do {
-            let preview = try await engine.previewLand(workspace)
-            guard closeWorkspace?.workspaceID == id else { return }
-            let changes = preview.commits.map { change in
-                change.subject.isEmpty ? "Undescribed change" : change.subject
+            let preview: LandPreview
+            var isProjectSetup = false
+            do {
+                preview = try await engine.previewLand(workspace)
+            } catch EngineError.noTrunk {
+                guard isCurrentWorkspaceLifecycle(workspace, token: lifecycleToken),
+                      isCurrentClosePresentation(workspace, presentationID: presentationID)
+                else { return }
+                do {
+                    preview = try await engine.previewLand(workspace, createTrunk: "main")
+                } catch {
+                    guard isCurrentWorkspaceLifecycle(workspace, token: lifecycleToken),
+                          isCurrentClosePresentation(workspace, presentationID: presentationID)
+                    else { return }
+                    throw error
+                }
+                isProjectSetup = true
             }
-            if !preview.conflicts.isEmpty {
-                closeWorkspace?.phase = .conflictAttention(
-                    message: "These changes overlap newer project progress and need attention.",
-                    details: preview.conflicts.map { conflict in
-                        conflict.subject.isEmpty ? "Conflicting change" : conflict.subject
-                    }
-                )
-            } else if changes.isEmpty {
-                closeWorkspace?.phase = .noChanges
-            } else if preview.needsMessage {
-                closeWorkspace?.phase = .summaryRequired(changes: changes)
-            } else {
-                closeWorkspace?.phase = .ready(changes: changes)
-            }
+
+            guard isCurrentWorkspaceLifecycle(workspace, token: lifecycleToken),
+                  isCurrentClosePresentation(workspace, presentationID: presentationID)
+            else { return }
+            closeWorkspace?.targetSnapshot = preview.targetSnapshot
+            closeWorkspace?.phase = closeWorkspacePhase(
+                for: preview,
+                isProjectSetup: isProjectSetup
+            )
         } catch EngineError.nothingToLand {
-            guard closeWorkspace?.workspaceID == id else { return }
+            guard isCurrentWorkspaceLifecycle(workspace, token: lifecycleToken),
+                  isCurrentClosePresentation(workspace, presentationID: presentationID)
+            else { return }
             closeWorkspace?.phase = .noChanges
         } catch EngineError.noTrunk {
-            guard closeWorkspace?.workspaceID == id else { return }
-            closeWorkspace?.phase = .projectSetupRequired
-        } catch let error as EngineError {
-            guard closeWorkspace?.workspaceID == id else { return }
-            closeWorkspace?.phase = .failure(message: error.message)
+            guard isCurrentWorkspaceLifecycle(workspace, token: lifecycleToken),
+                  isCurrentClosePresentation(workspace, presentationID: presentationID)
+            else { return }
+            closeWorkspace?.phase = .failure(
+                message: "The project's starting changes couldn't be prepared. Return to the workspace and try again."
+            )
+        } catch EngineError.landConflict, EngineError.sharedHistory {
+            guard isCurrentWorkspaceLifecycle(workspace, token: lifecycleToken),
+                  isCurrentClosePresentation(workspace, presentationID: presentationID)
+            else { return }
+            closeWorkspace?.phase = .conflictAttention(
+                message: "These changes overlap newer project progress and need attention.",
+                details: []
+            )
         } catch {
-            guard closeWorkspace?.workspaceID == id else { return }
-            closeWorkspace?.phase = .failure(message: "\(error)")
+            guard isCurrentWorkspaceLifecycle(workspace, token: lifecycleToken),
+                  isCurrentClosePresentation(workspace, presentationID: presentationID)
+            else { return }
+            closeWorkspace?.phase = .failure(
+                message: "The workspace's changes couldn't be compared with the project. The workspace remains open. Return to it and try again."
+            )
         }
+    }
+
+    private func closeWorkspacePhase(
+        for preview: LandPreview,
+        isProjectSetup: Bool
+    ) -> CloseWorkspacePhase {
+        var changes = preview.commits.map { change in
+            change.subject.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                ? "Undescribed change"
+                : change.subject
+        }
+        if preview.needsMessage && !preview.commits.contains(where: {
+            $0.subject.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }) {
+            changes.append("Undescribed change")
+        }
+
+        if !preview.conflicts.isEmpty {
+            return .conflictAttention(
+                message: "These changes overlap newer project progress and need attention.",
+                details: preview.conflicts.map { conflict in
+                    conflict.subject.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                        ? "Conflicting change"
+                        : conflict.subject
+                }
+            )
+        }
+        if changes.isEmpty && !preview.needsMessage {
+            return .noChanges
+        }
+        if isProjectSetup {
+            return .projectSetupRequired(
+                changes: changes,
+                needsMessage: preview.needsMessage
+            )
+        }
+        if preview.needsMessage {
+            return .summaryRequired(changes: changes)
+        }
+        return .ready(changes: changes)
     }
 
     func setCloseWorkspaceSummary(_ summary: String) {
@@ -280,7 +413,7 @@ final class AppStore: ObservableObject {
     func requestCloseWithoutAdding() {
         guard let phase = closeWorkspace?.phase else { return }
         switch phase {
-        case .ready, .summaryRequired, .conflictAttention:
+        case .ready, .summaryRequired, .conflictAttention, .projectSetupRequired:
             closeWorkspace?.phase = .confirmCloseWithoutAdding(returnTo: phase)
         default:
             break
@@ -293,32 +426,48 @@ final class AppStore: ObservableObject {
         else { return }
         closeWorkspace?.phase = returnTo
     }
+
     /// Adds the prepared changes, closes the workspace only after the engine
     /// confirms success, then silently reconciles the project working copy.
     /// A race-time overlap changes the sheet to attention without touching the
     /// workspace or any of its sessions.
     func addChangesAndCloseWorkspace() async {
         guard let presentation = closeWorkspace,
+              let expectedSnapshot = presentation.targetSnapshot,
               let workspace = workspaces.first(where: { $0.id == presentation.workspaceID })
         else { return }
 
-        let changeCount: Int
+        let changes: [String]
+        let needsMessage: Bool
+        let message: String?
         switch presentation.phase {
-        case .ready(let changes):
-            changeCount = changes.count
-        case .summaryRequired(let changes):
+        case .ready(let preparedChanges):
+            changes = preparedChanges
+            needsMessage = false
+            message = nil
+        case .summaryRequired(let preparedChanges):
             guard !presentation.summary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
-            changeCount = changes.count
+            changes = preparedChanges
+            needsMessage = true
+            message = presentation.summary
         default:
             return
         }
 
+        let setupPhase = CloseWorkspacePhase.projectSetupRequired(
+            changes: changes,
+            needsMessage: needsMessage
+        )
         closeWorkspace?.phase = .applying(.addingChanges)
         await applyWorkspaceChanges(
             workspace,
-            message: presentation.summary,
+            message: message,
             createTrunk: nil,
-            changeCount: changeCount
+            expectedSnapshot: expectedSnapshot,
+            presentationID: presentation.presentationID,
+            changeCount: changes.count,
+            noTrunkFallback: setupPhase,
+            clearSummaryOnStale: needsMessage
         )
     }
 
@@ -327,68 +476,144 @@ final class AppStore: ObservableObject {
     /// about establishing the project's starting progress.
     func setUpProjectAndCloseWorkspace() async {
         guard let presentation = closeWorkspace,
-              case .projectSetupRequired = presentation.phase,
+              let expectedSnapshot = presentation.targetSnapshot,
+              case .projectSetupRequired(let changes, let needsMessage) = presentation.phase,
               let workspace = workspaces.first(where: { $0.id == presentation.workspaceID })
         else { return }
 
         let summary = presentation.summary.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !summary.isEmpty else { return }
+        if needsMessage && summary.isEmpty { return }
 
+        let setupPhase = CloseWorkspacePhase.projectSetupRequired(
+            changes: changes,
+            needsMessage: needsMessage
+        )
         closeWorkspace?.phase = .applying(.addingChanges)
         await applyWorkspaceChanges(
             workspace,
-            message: summary,
+            message: needsMessage ? summary : nil,
             createTrunk: "main",
-            changeCount: nil
+            expectedSnapshot: expectedSnapshot,
+            presentationID: presentation.presentationID,
+            changeCount: changes.count,
+            noTrunkFallback: setupPhase,
+            clearSummaryOnStale: needsMessage
         )
     }
 
     private func applyWorkspaceChanges(
         _ workspace: WorkspaceRow,
-        message: String,
+        message: String?,
         createTrunk: String?,
-        changeCount: Int?
+        expectedSnapshot: String,
+        presentationID: UUID,
+        changeCount: Int?,
+        noTrunkFallback: CloseWorkspacePhase,
+        clearSummaryOnStale: Bool
     ) async {
+        guard let lifecycleToken = projectLifecycleTokens[workspace.projectPath] else {
+            return
+        }
+        let sessionIDs = workspaceSessionIDs(for: workspace)
+        await terminals.quiesceSessions(sessionIDs)
+        guard isCurrentWorkspaceLifecycle(workspace, token: lifecycleToken),
+              isCurrentClosePresentation(workspace, presentationID: presentationID)
+        else {
+            terminals.resumeSessions(sessionIDs)
+            return
+        }
+
         let result: LandResult
         do {
-            let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
+            let trimmed = message?.trimmingCharacters(in: .whitespacesAndNewlines)
             result = try await engine.landWorkspace(
                 workspace,
-                message: trimmed.isEmpty ? nil : trimmed,
-                createTrunk: createTrunk
+                message: trimmed?.isEmpty == false ? trimmed : nil,
+                createTrunk: createTrunk,
+                expectedSnapshot: expectedSnapshot
             )
-        } catch EngineError.noTrunk {
-            closeWorkspace?.phase = .projectSetupRequired
+        } catch EngineError.workspaceChanged {
+            terminals.resumeSessions(sessionIDs)
+            guard isCurrentWorkspaceLifecycle(workspace, token: lifecycleToken),
+                  isCurrentClosePresentation(workspace, presentationID: presentationID)
+            else { return }
+            if clearSummaryOnStale {
+                closeWorkspace?.summary = ""
+            }
+            closeWorkspace?.targetSnapshot = nil
+            closeWorkspace?.phase = .preparing
+            await refreshCloseWorkspacePreview(
+                workspace,
+                lifecycleToken: lifecycleToken,
+                presentationID: presentationID
+            )
             return
-        } catch EngineError.landConflict {
+        } catch EngineError.noTrunk {
+            terminals.resumeSessions(sessionIDs)
+            guard isCurrentWorkspaceLifecycle(workspace, token: lifecycleToken),
+                  isCurrentClosePresentation(workspace, presentationID: presentationID)
+            else { return }
+            closeWorkspace?.phase = noTrunkFallback
+            return
+        } catch EngineError.landConflict, EngineError.sharedHistory {
+            terminals.resumeSessions(sessionIDs)
+            guard isCurrentWorkspaceLifecycle(workspace, token: lifecycleToken),
+                  isCurrentClosePresentation(workspace, presentationID: presentationID)
+            else { return }
             closeWorkspace?.phase = .conflictAttention(
-                message: "Project progress changed while these changes were being added. The workspace is unchanged and needs attention.",
+                message: "These changes overlap newer project progress and need attention.",
                 details: []
             )
             return
         } catch EngineError.nothingToLand {
+            terminals.resumeSessions(sessionIDs)
+            guard isCurrentWorkspaceLifecycle(workspace, token: lifecycleToken),
+                  isCurrentClosePresentation(workspace, presentationID: presentationID)
+            else { return }
             closeWorkspace?.phase = .noChanges
             return
-        } catch let error as EngineError {
-            closeWorkspace?.phase = .failure(message: error.message)
-            return
         } catch {
-            closeWorkspace?.phase = .failure(message: "\(error)")
+            terminals.resumeSessions(sessionIDs)
+            guard isCurrentWorkspaceLifecycle(workspace, token: lifecycleToken),
+                  isCurrentClosePresentation(workspace, presentationID: presentationID)
+            else { return }
+            closeWorkspace?.phase = .failure(
+                message: "The changes couldn't be added to the project. The workspace remains open. Return to it and try again."
+            )
+            return
+        }
+        guard isCurrentWorkspaceLifecycle(workspace, token: lifecycleToken) else {
+            terminals.resumeSessions(sessionIDs)
             return
         }
 
-        tearDownClosedWorkspace(workspace)
+        if result.workspaceRetained {
+            terminals.resumeSessions(sessionIDs)
+        } else {
+            tearDownClosedWorkspace(workspace)
+        }
 
         let reconciled = await reconcileProjectWorkspace(workspace.projectPath)
-        closeWorkspace?.phase = reconciled
-            ? .success(
+        guard projectLifecycleTokens[workspace.projectPath] == lifecycleToken,
+              isCurrentClosePresentation(workspace, presentationID: presentationID)
+        else { return }
+        if result.workspaceRetained {
+            guard isCurrentWorkspaceLifecycle(workspace, token: lifecycleToken) else { return }
+            closeWorkspace?.phase = .workspaceRetained(
                 addedChanges: changeCount,
                 notice: result.cleanupWarning
             )
-            : .projectAttention(
-                addedChanges: changeCount,
-                notice: result.cleanupWarning
-            )
+        } else {
+            closeWorkspace?.phase = reconciled
+                ? .success(
+                    addedChanges: changeCount,
+                    notice: result.cleanupWarning
+                )
+                : .projectAttention(
+                    addedChanges: changeCount,
+                    notice: result.cleanupWarning
+                )
+        }
     }
 
     /// Retries reconciliation for a project whose working copy needs attention.
@@ -399,11 +624,21 @@ final class AppStore: ObservableObject {
 
     @discardableResult
     private func reconcileProjectWorkspace(_ projectPath: String) async -> Bool {
+        guard let lifecycleToken = projectLifecycleTokens[projectPath] else {
+            return true
+        }
+
         do {
             _ = try await engine.rebaseOntoTrunk(projectPath: projectPath)
+            guard projectLifecycleTokens[projectPath] == lifecycleToken else {
+                return true
+            }
             projectWorkingCopyAttention.remove(projectPath)
             return true
         } catch {
+            guard projectLifecycleTokens[projectPath] == lifecycleToken else {
+                return true
+            }
             projectWorkingCopyAttention.insert(projectPath)
             return false
         }
@@ -412,34 +647,84 @@ final class AppStore: ObservableObject {
     /// Closes without adding. A workspace known to have changes reaches this
     /// operation only through the in-sheet destructive confirmation; the
     /// no-changes state closes directly without an unnecessary second prompt.
-    /// Session teardown intentionally precedes the engine call, preserving the
-    /// existing forget-operation ordering.
+    /// Every live and persisted row remains intact until the engine confirms
+    /// the irreversible forget. Directory cleanup after that boundary is a
+    /// non-fatal notice, not a reason to leave a false retry marker.
     func closeWithoutAddingWorkspace() async {
         guard let presentation = closeWorkspace,
               let workspace = workspaces.first(where: { $0.id == presentation.workspaceID })
         else { return }
+        guard let lifecycleToken = projectLifecycleTokens[workspace.projectPath] else {
+            return
+        }
+        let presentationID = presentation.presentationID
+
+        let onlyIfUnchanged: Bool
         switch presentation.phase {
-        case .noChanges, .confirmCloseWithoutAdding:
-            break
+        case .noChanges:
+            onlyIfUnchanged = true
+        case .confirmCloseWithoutAdding:
+            onlyIfUnchanged = false
         default:
             return
         }
 
         closeWorkspace?.phase = .applying(.closing)
-        tearDownWorkspaceSessions(workspace)
+        let sessionIDs = workspaceSessionIDs(for: workspace)
+        await terminals.quiesceSessions(sessionIDs)
+        guard isCurrentWorkspaceLifecycle(workspace, token: lifecycleToken),
+              isCurrentClosePresentation(workspace, presentationID: presentationID)
+        else {
+            terminals.resumeSessions(sessionIDs)
+            return
+        }
 
         do {
-            try await engine.deleteWorkspace(workspace)
-            workspaces.removeAll { $0.id == workspace.id }
-            save()
-            closeWorkspace?.phase = .success(addedChanges: 0, notice: nil)
-        } catch let error as EngineError {
-            closeWorkspace?.phase = .failure(message: error.message)
-            save()
+            let result = try await engine.deleteWorkspace(
+                workspace,
+                onlyIfUnchanged: onlyIfUnchanged
+            )
+            guard isCurrentWorkspaceLifecycle(workspace, token: lifecycleToken) else {
+                terminals.resumeSessions(sessionIDs)
+                return
+            }
+            tearDownClosedWorkspace(workspace)
+            guard projectLifecycleTokens[workspace.projectPath] == lifecycleToken,
+                  isCurrentClosePresentation(workspace, presentationID: presentationID)
+            else { return }
+            closeWorkspace?.phase = .success(
+                addedChanges: 0,
+                notice: result.cleanupWarning
+            )
+        } catch EngineError.workspaceChanged {
+            terminals.resumeSessions(sessionIDs)
+            guard isCurrentWorkspaceLifecycle(workspace, token: lifecycleToken),
+                  isCurrentClosePresentation(workspace, presentationID: presentationID)
+            else { return }
+            closeWorkspace?.targetSnapshot = nil
+            closeWorkspace?.phase = .preparing
+            await refreshCloseWorkspacePreview(
+                workspace,
+                lifecycleToken: lifecycleToken,
+                presentationID: presentationID
+            )
         } catch {
-            closeWorkspace?.phase = .failure(message: "\(error)")
-            save()
+            terminals.resumeSessions(sessionIDs)
+            guard isCurrentWorkspaceLifecycle(workspace, token: lifecycleToken),
+                  isCurrentClosePresentation(workspace, presentationID: presentationID)
+            else { return }
+            closeWorkspace?.phase = .failure(
+                message: "The workspace couldn't be closed. The workspace remains open. Return to it and try again."
+            )
         }
+    }
+
+    private func workspaceSessionIDs(for workspace: WorkspaceRow) -> Set<String> {
+        let target = TargetRef.workspace(
+            projectPath: workspace.projectPath,
+            name: workspace.name
+        )
+        return Set(sessions.lazy.filter { $0.target == target }.map(\.id))
     }
 
     private func tearDownClosedWorkspace(_ workspace: WorkspaceRow) {

@@ -223,9 +223,7 @@ final class AppActions {
 
 // MARK: - Environment injection
 
-/// Lets SidebarView (and any other view) reach the single AppActions
-/// instance without RootView needing to thread it through its own init —
-/// RootView.swift is intentionally left untouched by this change.
+/// Lets SidebarView (and any other view) reach the single AppActions instance.
 private struct AppActionsKey: EnvironmentKey {
     static let defaultValue: AppActions? = nil
 }

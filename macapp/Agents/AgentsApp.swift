@@ -4,7 +4,7 @@ import SwiftUI
 
 /// Tiny UI-only state that doesn't belong in AppStore's persisted model —
 /// currently whether the ⌘? shortcut-help sheet is showing, and whether
-/// there's a launch-time missing-tools notice to display. Owned by
+/// there's a launch-time prerequisite notice to display. Owned by
 /// AgentsApp alongside AppActions: AppActions.perform(.showShortcutHelp)
 /// toggles showShortcutHelp, RootView observes both to drive its `.sheet`
 /// and `.alert`.
@@ -12,13 +12,11 @@ import SwiftUI
 final class UIState: ObservableObject {
     @Published var showShortcutHelp = false
 
-    /// Guidance text from `ToolPreflight` when a launch-time check finds bb
-    /// and/or jj missing — nil means there's nothing to show, either because
-    /// both tools were found or because the notice has already been
-    /// dismissed. Purely informational: workspace operations will still
-    /// fail their own way if attempted, this just gives the user an earlier,
-    /// readable heads-up instead of a low-level subprocess error.
-    @Published var missingToolsNotice: String?
+    /// Guidance from `ToolPreflight` when bb or the temporary manager checkout
+    /// is missing. Nil means every global prerequisite was found or the notice
+    /// was dismissed. Project-specific version-control tools are not checked
+    /// here; workspace operations resolve those when needed.
+    @Published var prerequisiteNotice: String?
 }
 
 @main

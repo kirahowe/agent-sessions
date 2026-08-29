@@ -773,9 +773,9 @@ final class AppStoreTests: XCTestCase {
         return workspace
     }
 
-    func test26_closeWithoutAddingTearsDownBeforeForgetAndKeepsFailureRetryMarker() async {
+    func test26_closeWithoutAddingForgetFailurePreservesAllLiveAndPersistedState() async {
         let fake = FakeWorkspaceEngine()
-        let (store, spy, _) = TestSupport.makeStore(engine: fake)
+        let (store, spy, stateURL) = TestSupport.makeStore(engine: fake)
         let workspace = await makeClosableWorkspace(store: store, fake: fake)
         let sessionID = store.sessions.first {
             $0.target == .workspace(projectPath: workspace.projectPath, name: workspace.name)
@@ -784,13 +784,127 @@ final class AppStoreTests: XCTestCase {
         await store.prepareCloseWorkspace(workspace.id)
         fake.nextDeleteResult = .failure(.failed("forget failed"))
 
+        let sessionsBefore = store.sessions
+        let workspacesBefore = store.workspaces
+        let selectionBefore = store.selection
+        let persistedBefore = try! Data(contentsOf: stateURL)
+        fake.onDeleteWorkspace = {
+            XCTAssertTrue(spy.closedIDs.isEmpty)
+            XCTAssertEqual(store.sessions, sessionsBefore)
+            XCTAssertEqual(store.workspaces, workspacesBefore)
+            XCTAssertEqual(store.selection, selectionBefore)
+            XCTAssertEqual(try! Data(contentsOf: stateURL), persistedBefore)
+        }
+
         await store.closeWithoutAddingWorkspace()
 
-        XCTAssertTrue(spy.closedIDs.contains(sessionID))
-        XCTAssertFalse(store.sessions.contains { $0.id == sessionID })
-        XCTAssertTrue(store.workspaces.contains { $0.id == workspace.id })
+        XCTAssertTrue(spy.closedIDs.isEmpty)
+        XCTAssertEqual(spy.resumeCalls, [Set([sessionID])])
+        XCTAssertEqual(store.sessions, sessionsBefore)
+        XCTAssertEqual(store.workspaces, workspacesBefore)
+        XCTAssertEqual(store.selection, selectionBefore)
+        XCTAssertEqual(try! Data(contentsOf: stateURL), persistedBefore)
+        XCTAssertTrue(store.sessions.contains { $0.id == sessionID })
         XCTAssertEqual(fake.deleteCalls, [workspace])
-        XCTAssertEqual(store.closeWorkspace?.phase, .failure(message: "forget failed"))
+        XCTAssertEqual(fake.deleteOnlyIfUnchangedCalls, [true])
+        XCTAssertEqual(
+            store.closeWorkspace?.phase,
+            .failure(
+                message: "The workspace couldn't be closed. The workspace remains open. Return to it and try again."
+            )
+        )
+
+        let restored = AppStore(
+            terminals: SpyTerminals(),
+            stateURL: stateURL,
+            engine: FakeWorkspaceEngine()
+        )
+        XCTAssertEqual(restored.sessions, sessionsBefore)
+        XCTAssertEqual(restored.workspaces, workspacesBefore)
+        XCTAssertEqual(restored.selection, selectionBefore)
+    }
+
+    func test26b_closeWithoutAddingTearsDownOnlyAfterForgetThenPersists() async {
+        let fake = FakeWorkspaceEngine()
+        let (store, spy, stateURL) = TestSupport.makeStore(engine: fake)
+        let workspace = await makeClosableWorkspace(store: store, fake: fake)
+        let sessionID = store.sessions.first {
+            $0.target == .workspace(projectPath: workspace.projectPath, name: workspace.name)
+        }!.id
+        fake.nextPreviewResult = .failure(.nothingToLand("nothing to add"))
+        await store.prepareCloseWorkspace(workspace.id)
+
+        let sessionsBefore = store.sessions
+        let workspacesBefore = store.workspaces
+        let selectionBefore = store.selection
+        let persistedBefore = try! Data(contentsOf: stateURL)
+        var events: [String] = []
+        spy.quiesceSessionsHandler = { ids in
+            events.append("terminal-quiesce")
+            XCTAssertEqual(ids, Set([sessionID]))
+        }
+        fake.onDeleteWorkspace = {
+            events.append("engine-forget")
+            XCTAssertEqual(spy.quiesceCalls, [Set([sessionID])])
+            XCTAssertTrue(spy.closedIDs.isEmpty)
+            XCTAssertEqual(store.sessions, sessionsBefore)
+            XCTAssertEqual(store.workspaces, workspacesBefore)
+            XCTAssertEqual(store.selection, selectionBefore)
+            XCTAssertEqual(try! Data(contentsOf: stateURL), persistedBefore)
+        }
+        spy.onCloseSession = { closedID in
+            events.append("terminal-close")
+            XCTAssertEqual(closedID, sessionID)
+            XCTAssertTrue(store.sessions.contains { $0.id == sessionID })
+            XCTAssertTrue(store.workspaces.contains { $0.id == workspace.id })
+            XCTAssertEqual(store.selection, selectionBefore)
+            XCTAssertEqual(try! Data(contentsOf: stateURL), persistedBefore)
+        }
+
+        await store.closeWithoutAddingWorkspace()
+
+        XCTAssertEqual(events, ["terminal-quiesce", "engine-forget", "terminal-close"])
+        XCTAssertEqual(spy.closedIDs, [sessionID])
+        XCTAssertFalse(store.sessions.contains { $0.id == sessionID })
+        XCTAssertFalse(store.workspaces.contains { $0.id == workspace.id })
+        XCTAssertNil(store.selection)
+        XCTAssertEqual(store.closeWorkspace?.phase, .success(addedChanges: 0, notice: nil))
+
+        let restored = AppStore(
+            terminals: SpyTerminals(),
+            stateURL: stateURL,
+            engine: FakeWorkspaceEngine()
+        )
+        XCTAssertFalse(restored.sessions.contains { $0.id == sessionID })
+        XCTAssertFalse(restored.workspaces.contains { $0.id == workspace.id })
+        XCTAssertNil(restored.selection)
+    }
+
+    func test26c_closeWithoutAddingCleanupWarningIsSuccessfulAndNotRetryable() async {
+        let fake = FakeWorkspaceEngine()
+        let (store, spy, _) = TestSupport.makeStore(engine: fake)
+        let workspace = await makeClosableWorkspace(store: store, fake: fake)
+        let sessionID = store.sessions.first {
+            $0.target == .workspace(projectPath: workspace.projectPath, name: workspace.name)
+        }!.id
+        fake.nextPreviewResult = .failure(.nothingToLand("nothing to add"))
+        await store.prepareCloseWorkspace(workspace.id)
+        fake.nextDeleteResult = .success(
+            DeleteResult(cleanupWarning: "The closed workspace folder remains on disk.")
+        )
+
+        await store.closeWithoutAddingWorkspace()
+
+        XCTAssertEqual(spy.closedIDs, [sessionID])
+        XCTAssertFalse(store.sessions.contains { $0.id == sessionID })
+        XCTAssertFalse(store.workspaces.contains { $0.id == workspace.id })
+        XCTAssertEqual(
+            store.closeWorkspace?.phase,
+            .success(
+                addedChanges: 0,
+                notice: "The closed workspace folder remains on disk."
+            )
+        )
     }
 
     func test27_changedWorkspaceRequiresInSheetConfirmationBeforeClosingWithoutAdding() async {
@@ -804,7 +918,8 @@ final class AppStoreTests: XCTestCase {
                 commits: [LandCommit(id: "1", subject: "A useful change")],
                 conflicts: [],
                 needsMessage: false,
-                diverging: []
+                diverging: [],
+                targetSnapshot: "test-snapshot"
             )
         )
         await store.prepareCloseWorkspace(workspace.id)
@@ -1008,7 +1123,8 @@ final class AppStoreTests: XCTestCase {
                 ],
                 conflicts: [],
                 needsMessage: false,
-                diverging: []
+                diverging: [],
+                targetSnapshot: "test-snapshot"
             )
         )
         var workspaceWasRemovedBeforeReconciliation = false
@@ -1033,7 +1149,44 @@ final class AppStoreTests: XCTestCase {
         )
     }
 
-    func test34_landConflictRaceLeavesWorkspaceAndSessionsAndShowsAttention() async {
+    func test34_staleLandTaskTearsDownOldWorkspaceButPreservesNewerSheet() async {
+        let fake = FakeWorkspaceEngine()
+        let (store, spy, _) = TestSupport.makeStore(engine: fake)
+        let workspace = await makeClosableWorkspace(store: store, fake: fake)
+        let oldSessionIDs = store.sessions.filter {
+            $0.target == .workspace(projectPath: workspace.projectPath, name: workspace.name)
+        }.map(\.id)
+        fake.nextPreviewResult = .success(
+            LandPreview(
+                bookmark: "ignored",
+                bookmarkCommit: "ignored",
+                commits: [LandCommit(id: "1", subject: "Change")],
+                conflicts: [],
+                needsMessage: false,
+                diverging: [],
+                targetSnapshot: "test-snapshot"
+            )
+        )
+        await store.prepareCloseWorkspace(workspace.id)
+        let newerSheet = CloseWorkspacePresentation(
+            workspaceID: UUID().uuidString,
+            workspaceName: "newer",
+            projectPath: workspace.projectPath,
+            projectName: "project",
+            phase: .ready(changes: ["Newer change"])
+        )
+        fake.onLandWorkspace = { store.closeWorkspace = newerSheet }
+
+        await store.addChangesAndCloseWorkspace()
+
+        XCTAssertFalse(store.workspaces.contains { $0.id == workspace.id })
+        XCTAssertTrue(oldSessionIDs.allSatisfy { id in !store.sessions.contains { $0.id == id } })
+        XCTAssertEqual(Set(spy.closedIDs), Set(oldSessionIDs))
+        XCTAssertEqual(fake.rebaseOntoTrunkCalls, [workspace.projectPath])
+        XCTAssertEqual(store.closeWorkspace, newerSheet)
+    }
+
+    func test34a_landConflictRaceLeavesWorkspaceAndSessionsAndShowsAttention() async {
         let fake = FakeWorkspaceEngine()
         let (store, spy, _) = TestSupport.makeStore(engine: fake)
         let workspace = await makeClosableWorkspace(store: store, fake: fake)
@@ -1044,7 +1197,8 @@ final class AppStoreTests: XCTestCase {
                 commits: [LandCommit(id: "1", subject: "Change")],
                 conflicts: [],
                 needsMessage: false,
-                diverging: []
+                diverging: [],
+                targetSnapshot: "test-snapshot"
             )
         )
         await store.prepareCloseWorkspace(workspace.id)
@@ -1062,6 +1216,39 @@ final class AppStoreTests: XCTestCase {
         }
     }
 
+    func test34b_sharedHistoryDuringLandShowsAttentionWithoutTearingDown() async {
+        let fake = FakeWorkspaceEngine()
+        let (store, _, _) = TestSupport.makeStore(engine: fake)
+        let workspace = await makeClosableWorkspace(store: store, fake: fake)
+        fake.nextPreviewResult = .success(
+            LandPreview(
+                bookmark: "ignored",
+                bookmarkCommit: "ignored",
+                commits: [LandCommit(id: "1", subject: "Change")],
+                conflicts: [],
+                needsMessage: false,
+                diverging: [],
+                targetSnapshot: "test-snapshot"
+            )
+        )
+        fake.nextLandResult = .failure(.sharedHistory("raw engine advice"))
+
+        await store.prepareCloseWorkspace(workspace.id)
+        let sessionsBefore = store.sessions
+        await store.addChangesAndCloseWorkspace()
+
+        XCTAssertEqual(
+            store.closeWorkspace?.phase,
+            .conflictAttention(
+                message: "These changes overlap newer project progress and need attention.",
+                details: []
+            )
+        )
+        XCTAssertEqual(store.sessions, sessionsBefore)
+        XCTAssertTrue(store.workspaces.contains { $0.id == workspace.id })
+        XCTAssertTrue(fake.rebaseOntoTrunkCalls.isEmpty)
+    }
+
     func test35_requiredSummaryMustBeNonemptyBeforeLand() async {
         let fake = FakeWorkspaceEngine()
         let (store, _, _) = TestSupport.makeStore(engine: fake)
@@ -1073,7 +1260,8 @@ final class AppStoreTests: XCTestCase {
                 commits: [LandCommit(id: "1", subject: "")],
                 conflicts: [],
                 needsMessage: true,
-                diverging: []
+                diverging: [],
+                targetSnapshot: "test-snapshot"
             )
         )
         await store.prepareCloseWorkspace(workspace.id)
@@ -1091,32 +1279,309 @@ final class AppStoreTests: XCTestCase {
         XCTAssertEqual(fake.landCalls.first?.message, "Describe the change")
     }
 
-    func test36_projectSetupRequiresSummaryForwardsItAndReportsUnknownCount() async {
+    func test36_projectSetupWithDescribedChangesNeedsNoSummaryAndLandsWithCreateTrunk() async {
         let fake = FakeWorkspaceEngine()
         let (store, _, _) = TestSupport.makeStore(engine: fake)
         let workspace = await makeClosableWorkspace(store: store, fake: fake)
-        fake.nextPreviewResult = .failure(.noTrunk("storage-specific message"))
+        fake.previewResults = [
+            .failure(.noTrunk("storage-specific message")),
+            .success(
+                LandPreview(
+                    bookmark: "main",
+                    bookmarkCommit: "",
+                    commits: [LandCommit(id: "abc", subject: "Establish project progress")],
+                    conflicts: [],
+                    needsMessage: false,
+                    diverging: [],
+                    targetSnapshot: "test-snapshot"
+                )
+            )
+        ]
 
         await store.prepareCloseWorkspace(workspace.id)
-        XCTAssertEqual(store.closeWorkspace?.phase, .projectSetupRequired)
+        XCTAssertEqual(
+            store.closeWorkspace?.phase,
+            .projectSetupRequired(changes: ["Establish project progress"], needsMessage: false)
+        )
+        XCTAssertEqual(fake.previewLandCalls.map(\.createTrunk), [nil, "main"])
 
-        store.setCloseWorkspaceSummary(" \n ")
-        await store.setUpProjectAndCloseWorkspace()
-        XCTAssertTrue(fake.landCalls.isEmpty)
-        XCTAssertEqual(store.closeWorkspace?.phase, .projectSetupRequired)
-
-        store.setCloseWorkspaceSummary("  Establish project progress  ")
         fake.nextLandResult = .success(LandResult(commitID: "abc", bookmark: "main"))
         await store.setUpProjectAndCloseWorkspace()
 
-        XCTAssertEqual(fake.landCalls.last?.message, "Establish project progress")
+        XCTAssertNil(fake.landCalls.last?.message)
         XCTAssertEqual(fake.landCalls.last?.createTrunk, "main")
         XCTAssertEqual(fake.rebaseOntoTrunkCalls, [workspace.projectPath])
         XCTAssertEqual(
             store.closeWorkspace?.phase,
-            .success(addedChanges: nil, notice: nil)
+            .success(addedChanges: 1, notice: nil)
         )
         XCTAssertFalse(store.workspaces.contains { $0.id == workspace.id })
+    }
+
+    func test36b_projectSetupWithUndescribedChangesRequiresAndForwardsSummary() async {
+        let fake = FakeWorkspaceEngine()
+        let (store, _, _) = TestSupport.makeStore(engine: fake)
+        let workspace = await makeClosableWorkspace(store: store, fake: fake)
+        fake.previewResults = [
+            .failure(.noTrunk("storage-specific message")),
+            .success(
+                LandPreview(
+                    bookmark: "main",
+                    bookmarkCommit: "",
+                    commits: [LandCommit(id: "dirty", subject: "")],
+                    conflicts: [],
+                    needsMessage: true,
+                    diverging: [],
+                    targetSnapshot: "test-snapshot"
+                )
+            )
+        ]
+
+        await store.prepareCloseWorkspace(workspace.id)
+        let setupPhase = CloseWorkspacePhase.projectSetupRequired(
+            changes: ["Undescribed change"],
+            needsMessage: true
+        )
+        XCTAssertEqual(store.closeWorkspace?.phase, setupPhase)
+
+        store.setCloseWorkspaceSummary(" \n ")
+        await store.setUpProjectAndCloseWorkspace()
+        XCTAssertTrue(fake.landCalls.isEmpty)
+        XCTAssertEqual(store.closeWorkspace?.phase, setupPhase)
+
+        store.setCloseWorkspaceSummary("  Establish project progress  ")
+        await store.setUpProjectAndCloseWorkspace()
+        XCTAssertEqual(fake.landCalls.last?.message, "Establish project progress")
+        XCTAssertEqual(fake.landCalls.last?.createTrunk, "main")
+    }
+
+    func test36c_emptyProjectSetupPreviewBecomesNoChanges() async {
+        let fake = FakeWorkspaceEngine()
+        let (store, _, _) = TestSupport.makeStore(engine: fake)
+        let workspace = await makeClosableWorkspace(store: store, fake: fake)
+        fake.previewResults = [
+            .failure(.noTrunk("storage-specific message")),
+            .success(
+                LandPreview(
+                    bookmark: "main",
+                    bookmarkCommit: "",
+                    commits: [],
+                    conflicts: [],
+                    needsMessage: false,
+                    diverging: [],
+                    targetSnapshot: "test-snapshot"
+                )
+            )
+        ]
+
+        await store.prepareCloseWorkspace(workspace.id)
+
+        XCTAssertEqual(store.closeWorkspace?.phase, .noChanges)
+        XCTAssertTrue(fake.landCalls.isEmpty)
+    }
+
+    func test36d_projectSetupPreviewOverlapIsFriendlyAndNonmutating() async {
+        let fake = FakeWorkspaceEngine()
+        let (store, _, _) = TestSupport.makeStore(engine: fake)
+        let workspace = await makeClosableWorkspace(store: store, fake: fake)
+        let workspacesBefore = store.workspaces
+        let sessionsBefore = store.sessions
+        fake.previewResults = [
+            .failure(.noTrunk("storage-specific message")),
+            .failure(.landConflict("raw storage overlap"))
+        ]
+
+        await store.prepareCloseWorkspace(workspace.id)
+
+        XCTAssertEqual(
+            store.closeWorkspace?.phase,
+            .conflictAttention(
+                message: "These changes overlap newer project progress and need attention.",
+                details: []
+            )
+        )
+        XCTAssertEqual(store.workspaces, workspacesBefore)
+        XCTAssertEqual(store.sessions, sessionsBefore)
+        XCTAssertTrue(fake.landCalls.isEmpty)
+        XCTAssertTrue(fake.deleteCalls.isEmpty)
+    }
+
+    func test36e_noTrunkRacePreservesPreparedSummariesAndSummaryRequirement() async {
+        let fake = FakeWorkspaceEngine()
+        let (store, _, _) = TestSupport.makeStore(engine: fake)
+        let workspace = await makeClosableWorkspace(store: store, fake: fake)
+        fake.nextPreviewResult = .success(
+            LandPreview(
+                bookmark: "main",
+                bookmarkCommit: "head",
+                commits: [LandCommit(id: "1", subject: "Reviewed change")],
+                conflicts: [],
+                needsMessage: false,
+                diverging: [],
+                targetSnapshot: "test-snapshot"
+            )
+        )
+        await store.prepareCloseWorkspace(workspace.id)
+        fake.nextLandResult = .failure(.noTrunk("trunk disappeared"))
+
+        await store.addChangesAndCloseWorkspace()
+
+        XCTAssertEqual(
+            store.closeWorkspace?.phase,
+            .projectSetupRequired(changes: ["Reviewed change"], needsMessage: false)
+        )
+        XCTAssertTrue(store.workspaces.contains { $0.id == workspace.id })
+    }
+
+    func test36e2_noTrunkRacePreservesUndescribedSummaryRequirement() async {
+        let fake = FakeWorkspaceEngine()
+        let (store, _, _) = TestSupport.makeStore(engine: fake)
+        let workspace = await makeClosableWorkspace(store: store, fake: fake)
+        fake.nextPreviewResult = .success(
+            LandPreview(
+                bookmark: "main",
+                bookmarkCommit: "head",
+                commits: [LandCommit(id: "dirty", subject: "")],
+                conflicts: [],
+                needsMessage: true,
+                diverging: [],
+                targetSnapshot: "test-snapshot"
+            )
+        )
+        await store.prepareCloseWorkspace(workspace.id)
+        store.setCloseWorkspaceSummary("Describe dirty work")
+        fake.nextLandResult = .failure(.noTrunk("trunk disappeared"))
+
+        await store.addChangesAndCloseWorkspace()
+
+        XCTAssertEqual(
+            store.closeWorkspace?.phase,
+            .projectSetupRequired(changes: ["Undescribed change"], needsMessage: true)
+        )
+        XCTAssertEqual(store.closeWorkspace?.summary, "Describe dirty work")
+        XCTAssertTrue(store.workspaces.contains { $0.id == workspace.id })
+    }
+
+    func test36e3_repeatedNoTrunkPreviewFailsFriendlyWithoutMutation() async {
+        let fake = FakeWorkspaceEngine()
+        let (store, _, _) = TestSupport.makeStore(engine: fake)
+        let workspace = await makeClosableWorkspace(store: store, fake: fake)
+        let workspacesBefore = store.workspaces
+        let sessionsBefore = store.sessions
+        fake.previewResults = [
+            .failure(.noTrunk("first raw detail")),
+            .failure(.noTrunk("second raw detail"))
+        ]
+
+        await store.prepareCloseWorkspace(workspace.id)
+
+        XCTAssertEqual(
+            store.closeWorkspace?.phase,
+            .failure(
+                message: "The project's starting changes couldn't be prepared. Return to the workspace and try again."
+            )
+        )
+        XCTAssertEqual(store.workspaces, workspacesBefore)
+        XCTAssertEqual(store.sessions, sessionsBefore)
+        XCTAssertTrue(fake.landCalls.isEmpty)
+        XCTAssertTrue(fake.deleteCalls.isEmpty)
+    }
+
+    func test36e4_setupRetryChecksPresentationIdentityAtBothAwaitBoundaries() async {
+        do {
+            let fake = FakeWorkspaceEngine()
+            let (store, _, _) = TestSupport.makeStore(engine: fake)
+            let workspace = await makeClosableWorkspace(store: store, fake: fake)
+            fake.previewResults = [
+                .failure(.noTrunk("no trunk")),
+                .success(
+                    LandPreview(
+                        bookmark: "main",
+                        bookmarkCommit: "",
+                        commits: [LandCommit(id: "1", subject: "Starting change")],
+                        conflicts: [],
+                        needsMessage: false,
+                        diverging: [],
+                        targetSnapshot: "test-snapshot"
+                    )
+                )
+            ]
+            fake.onPreviewLand = { callCount in
+                if callCount == 1 { store.closeWorkspace = nil }
+            }
+
+            await store.prepareCloseWorkspace(workspace.id)
+
+            XCTAssertNil(store.closeWorkspace)
+            XCTAssertEqual(fake.previewLandCalls.count, 1)
+        }
+
+        do {
+            let fake = FakeWorkspaceEngine()
+            let (store, _, _) = TestSupport.makeStore(engine: fake)
+            let workspace = await makeClosableWorkspace(store: store, fake: fake)
+            fake.previewResults = [
+                .failure(.noTrunk("no trunk")),
+                .failure(.failed("retry failed"))
+            ]
+            fake.onPreviewLand = { callCount in
+                if callCount == 2 { store.closeWorkspace = nil }
+            }
+
+            await store.prepareCloseWorkspace(workspace.id)
+
+            XCTAssertNil(store.closeWorkspace)
+            XCTAssertEqual(fake.previewLandCalls.count, 2)
+        }
+    }
+
+    func test36f_projectSetupCanConfirmCancelAndCloseWithoutAdding() async {
+        let fake = FakeWorkspaceEngine()
+        let (store, spy, _) = TestSupport.makeStore(engine: fake)
+        let workspace = await makeClosableWorkspace(store: store, fake: fake)
+        let sessionID = store.sessions.first {
+            $0.target == .workspace(projectPath: workspace.projectPath, name: workspace.name)
+        }!.id
+        fake.previewResults = [
+            .failure(.noTrunk("storage-specific message")),
+            .success(
+                LandPreview(
+                    bookmark: "main",
+                    bookmarkCommit: "",
+                    commits: [LandCommit(id: "1", subject: "Starting change")],
+                    conflicts: [],
+                    needsMessage: false,
+                    diverging: [],
+                    targetSnapshot: "test-snapshot"
+                )
+            )
+        ]
+
+        await store.prepareCloseWorkspace(workspace.id)
+        let setupPhase = CloseWorkspacePhase.projectSetupRequired(
+            changes: ["Starting change"],
+            needsMessage: false
+        )
+        XCTAssertEqual(store.closeWorkspace?.phase, setupPhase)
+
+        store.requestCloseWithoutAdding()
+        guard case .confirmCloseWithoutAdding(let returnTo)? = store.closeWorkspace?.phase else {
+            return XCTFail("expected destructive confirmation state")
+        }
+        XCTAssertEqual(returnTo, setupPhase)
+
+        store.cancelCloseWithoutAdding()
+        XCTAssertEqual(store.closeWorkspace?.phase, setupPhase)
+
+        store.requestCloseWithoutAdding()
+        await store.closeWithoutAddingWorkspace()
+
+        XCTAssertTrue(fake.landCalls.isEmpty)
+        XCTAssertEqual(fake.deleteCalls, [workspace])
+        XCTAssertTrue(spy.closedIDs.contains(sessionID))
+        XCTAssertFalse(store.sessions.contains { $0.id == sessionID })
+        XCTAssertFalse(store.workspaces.contains { $0.id == workspace.id })
+        XCTAssertEqual(store.closeWorkspace?.phase, .success(addedChanges: 0, notice: nil))
     }
 
     func test37_nothingToLandBecomesCloseOnlyAndClosesWithoutAnotherConfirmation() async {
@@ -1649,7 +2114,8 @@ final class AppStoreTests: XCTestCase {
                 commits: [LandCommit(id: "1", subject: "Change")],
                 conflicts: [LandCommit(id: "Sources/App.swift", subject: "Sources/App.swift")],
                 needsMessage: false,
-                diverging: []
+                diverging: [],
+                targetSnapshot: "test-snapshot"
             )
         )
 
@@ -1684,7 +2150,7 @@ final class AppStoreTests: XCTestCase {
         await store.prepareCloseWorkspace(second.id)
 
         XCTAssertEqual(store.closeWorkspace?.workspaceID, first.id)
-        XCTAssertEqual(fake.previewLandCalls, [first])
+        XCTAssertEqual(fake.previewLandCalls.map(\.workspace), [first])
 
         store.cancelCloseWorkspace()
         XCTAssertNil(store.closeWorkspace)
@@ -1706,7 +2172,8 @@ final class AppStoreTests: XCTestCase {
                 commits: [LandCommit(id: "1", subject: "Change")],
                 conflicts: [],
                 needsMessage: false,
-                diverging: [LandCommit(id: "advisory", subject: "Ignored")]
+                diverging: [LandCommit(id: "advisory", subject: "Ignored")],
+                targetSnapshot: "test-snapshot"
             )
         )
         fake.nextRebaseResult = .failure(.rebaseConflict("root overlap"))
@@ -1744,7 +2211,8 @@ final class AppStoreTests: XCTestCase {
                 commits: [LandCommit(id: "1", subject: "Change")],
                 conflicts: [],
                 needsMessage: false,
-                diverging: []
+                diverging: [],
+                targetSnapshot: "test-snapshot"
             )
         )
         fake.nextRebaseResult = .failure(.rebaseConflict("root overlap"))
@@ -1789,7 +2257,8 @@ final class AppStoreTests: XCTestCase {
                 commits: [LandCommit(id: "1", subject: "Change")],
                 conflicts: [],
                 needsMessage: false,
-                diverging: []
+                diverging: [],
+                targetSnapshot: "test-snapshot"
             )
         )
         fake.nextLandResult = .success(
@@ -1814,6 +2283,59 @@ final class AppStoreTests: XCTestCase {
         XCTAssertNil(store.lastError)
     }
 
+    func test70b_engineRetainedWorkspaceKeepsRowsSessionsSelectionAndPersistence() async {
+        let fake = FakeWorkspaceEngine()
+        let (store, spy, stateURL) = TestSupport.makeStore(engine: fake)
+        let workspace = await makeClosableWorkspace(store: store, fake: fake)
+        let sessionID = store.sessions.first {
+            $0.target == .workspace(projectPath: workspace.projectPath, name: workspace.name)
+        }!.id
+        fake.nextPreviewResult = .success(
+            LandPreview(
+                bookmark: "ignored",
+                bookmarkCommit: "ignored",
+                commits: [LandCommit(id: "1", subject: "Change")],
+                conflicts: [],
+                needsMessage: false,
+                diverging: [],
+                targetSnapshot: "test-snapshot"
+            )
+        )
+        fake.nextLandResult = .success(
+            LandResult(
+                commitID: "abc",
+                bookmark: "ignored",
+                cleanupWarning: "New workspace writes arrived while project progress was added.",
+                workspaceRetained: true
+            )
+        )
+
+        await store.prepareCloseWorkspace(workspace.id)
+        let selectionBefore = store.selection
+        await store.addChangesAndCloseWorkspace()
+
+        XCTAssertTrue(spy.closedIDs.isEmpty)
+        XCTAssertTrue(store.sessions.contains { $0.id == sessionID })
+        XCTAssertTrue(store.workspaces.contains { $0.id == workspace.id })
+        XCTAssertEqual(store.selection, selectionBefore)
+        XCTAssertEqual(
+            store.closeWorkspace?.phase,
+            .workspaceRetained(
+                addedChanges: 1,
+                notice: "New workspace writes arrived while project progress was added."
+            )
+        )
+
+        let restored = AppStore(
+            terminals: SpyTerminals(),
+            stateURL: stateURL,
+            engine: FakeWorkspaceEngine()
+        )
+        XCTAssertTrue(restored.sessions.contains { $0.id == sessionID })
+        XCTAssertTrue(restored.workspaces.contains { $0.id == workspace.id })
+        XCTAssertEqual(restored.selection, selectionBefore)
+    }
+
     func test71_prepareFailureStaysInSheetWithoutTearingDownWorkspace() async {
         let fake = FakeWorkspaceEngine()
         let (store, spy, _) = TestSupport.makeStore(engine: fake)
@@ -1825,11 +2347,37 @@ final class AppStoreTests: XCTestCase {
 
         XCTAssertEqual(
             store.closeWorkspace?.phase,
-            .failure(message: "Changes cannot be isolated")
+            .conflictAttention(
+                message: "These changes overlap newer project progress and need attention.",
+                details: []
+            )
         )
         XCTAssertTrue(spy.closedIDs.isEmpty)
         XCTAssertEqual(store.sessions, sessionsBefore)
         XCTAssertTrue(store.workspaces.contains { $0.id == workspace.id })
+    }
+
+    func test71b_landConflictDuringPrepareShowsFriendlyAttentionWithoutMutation() async {
+        let fake = FakeWorkspaceEngine()
+        let (store, spy, _) = TestSupport.makeStore(engine: fake)
+        let workspace = await makeClosableWorkspace(store: store, fake: fake)
+        fake.nextPreviewResult = .failure(.landConflict("conflicted preferred Jujutsu trunk"))
+        let sessionsBefore = store.sessions
+        let workspacesBefore = store.workspaces
+
+        await store.prepareCloseWorkspace(workspace.id)
+
+        XCTAssertEqual(
+            store.closeWorkspace?.phase,
+            .conflictAttention(
+                message: "These changes overlap newer project progress and need attention.",
+                details: []
+            )
+        )
+        XCTAssertNil(store.lastError)
+        XCTAssertTrue(spy.closedIDs.isEmpty)
+        XCTAssertEqual(store.sessions, sessionsBefore)
+        XCTAssertEqual(store.workspaces, workspacesBefore)
     }
 
     // MARK: - 76
@@ -2230,5 +2778,957 @@ final class AppStoreTests: XCTestCase {
             store.sessions.first?.resume?.prompt,
             "codex's own event carried no query, and the prior snapshot belonged to a different agent entirely, so nothing should have carried over"
         )
+    }
+
+    func test27a_dirtyOnlyPreviewRequiresDestructiveConfirmation() async {
+        let fake = FakeWorkspaceEngine()
+        let (store, _, _) = TestSupport.makeStore(engine: fake)
+        let workspace = await makeClosableWorkspace(store: store, fake: fake)
+        fake.nextPreviewResult = .success(LandPreview(bookmark: "main", bookmarkCommit: "head", commits: [], conflicts: [], needsMessage: true, diverging: [], targetSnapshot: "test-snapshot"))
+        await store.prepareCloseWorkspace(workspace.id)
+        XCTAssertEqual(store.closeWorkspace?.phase, .summaryRequired(changes: ["Undescribed change"]))
+        await store.closeWithoutAddingWorkspace()
+        XCTAssertTrue(fake.deleteCalls.isEmpty)
+        store.requestCloseWithoutAdding()
+        await store.closeWithoutAddingWorkspace()
+        XCTAssertEqual(fake.deleteCalls, [workspace])
+    }
+
+    func test27aa_describedCommitsAndDirtyWorkingTreeIncludeTrailingUndescribedChange() async {
+        let fake = FakeWorkspaceEngine()
+        let (store, _, _) = TestSupport.makeStore(engine: fake)
+        let workspace = await makeClosableWorkspace(store: store, fake: fake)
+        fake.nextPreviewResult = .success(
+            LandPreview(
+                bookmark: "main",
+                bookmarkCommit: "head",
+                commits: [
+                    LandCommit(id: "1", subject: "First committed change"),
+                    LandCommit(id: "2", subject: "Second committed change")
+                ],
+                conflicts: [],
+                needsMessage: true,
+                diverging: [],
+                targetSnapshot: "test-snapshot"
+            )
+        )
+
+        await store.prepareCloseWorkspace(workspace.id)
+
+        XCTAssertEqual(
+            store.closeWorkspace?.phase,
+            .summaryRequired(
+                changes: [
+                    "First committed change",
+                    "Second committed change",
+                    "Undescribed change"
+                ]
+            )
+        )
+    }
+
+    func test27ab_undescribedCommitAndNeedsMessageDoNotDuplicatePlaceholder() async {
+        for subject in ["", "  \n "] {
+            let fake = FakeWorkspaceEngine()
+            let (store, _, _) = TestSupport.makeStore(engine: fake)
+            let workspace = await makeClosableWorkspace(store: store, fake: fake)
+            fake.nextPreviewResult = .success(
+                LandPreview(
+                    bookmark: "main",
+                    bookmarkCommit: "head",
+                    commits: [LandCommit(id: "1", subject: subject)],
+                    conflicts: [],
+                    needsMessage: true,
+                    diverging: [],
+                    targetSnapshot: "test-snapshot"
+                )
+            )
+
+            await store.prepareCloseWorkspace(workspace.id)
+
+            XCTAssertEqual(
+                store.closeWorkspace?.phase,
+                .summaryRequired(changes: ["Undescribed change"])
+            )
+        }
+    }
+
+    func test27c_conflictAttentionCanCancelConfirmationThenDelete() async {
+        let fake = FakeWorkspaceEngine()
+        let (store, _, _) = TestSupport.makeStore(engine: fake)
+        let workspace = await makeClosableWorkspace(store: store, fake: fake)
+        fake.nextPreviewResult = .success(LandPreview(bookmark: "main", bookmarkCommit: "head", commits: [], conflicts: [LandCommit(id: "1", subject: " \n ")], needsMessage: false, diverging: [], targetSnapshot: "test-snapshot"))
+        await store.prepareCloseWorkspace(workspace.id)
+        XCTAssertEqual(
+            store.closeWorkspace?.phase,
+            .conflictAttention(
+                message: "These changes overlap newer project progress and need attention.",
+                details: ["Conflicting change"]
+            )
+        )
+        store.requestCloseWithoutAdding()
+        store.cancelCloseWithoutAdding()
+        guard case .conflictAttention = store.closeWorkspace?.phase else { return XCTFail("expected conflict attention restored") }
+        store.requestCloseWithoutAdding()
+        await store.closeWithoutAddingWorkspace()
+        XCTAssertEqual(fake.deleteCalls, [workspace])
+        XCTAssertFalse(store.workspaces.contains { $0.id == workspace.id })
+    }
+
+    func test27b_closeWithoutAddingStaleSheetStillRemovesDeletedWorkspace() async {
+        let fake = FakeWorkspaceEngine()
+        let (store, _, _) = TestSupport.makeStore(engine: fake)
+        let workspace = await makeClosableWorkspace(store: store, fake: fake)
+        fake.nextPreviewResult = .failure(.nothingToLand("clean"))
+        await store.prepareCloseWorkspace(workspace.id)
+        let newer = CloseWorkspacePresentation(workspaceID: UUID().uuidString, workspaceName: "new", projectPath: workspace.projectPath, projectName: "p", phase: .ready(changes: []))
+        fake.onDeleteWorkspace = { store.closeWorkspace = newer }
+        await store.closeWithoutAddingWorkspace()
+        XCTAssertFalse(store.workspaces.contains { $0.id == workspace.id })
+        XCTAssertEqual(store.closeWorkspace, newer)
+    }
+
+    func test33a_cancelDuringLandDoesNotDismissBusySheet() async {
+        let fake = FakeWorkspaceEngine()
+        let (store, _, _) = TestSupport.makeStore(engine: fake)
+        let workspace = await makeClosableWorkspace(store: store, fake: fake)
+        fake.nextPreviewResult = .success(LandPreview(bookmark: "main", bookmarkCommit: "head", commits: [LandCommit(id: "1", subject: "change")], conflicts: [], needsMessage: false, diverging: [], targetSnapshot: "test-snapshot"))
+        var remainedBusy = false
+        fake.onLandWorkspace = {
+            store.cancelCloseWorkspace()
+            remainedBusy = store.closeWorkspace?.isBusy == true
+        }
+        await store.prepareCloseWorkspace(workspace.id)
+        await store.addChangesAndCloseWorkspace()
+        XCTAssertTrue(remainedBusy)
+        XCTAssertEqual(store.closeWorkspace?.phase, .success(addedChanges: 1, notice: nil))
+    }
+
+    func test33b_genericPreviewFailureUsesStableProjectRecoveryCopy() async {
+        let fake = FakeWorkspaceEngine()
+        let (store, _, _) = TestSupport.makeStore(engine: fake)
+        let workspace = await makeClosableWorkspace(store: store, fake: fake)
+        fake.nextPreviewResult = .failure(.failed("preview failed"))
+        await store.prepareCloseWorkspace(workspace.id)
+        XCTAssertEqual(
+            store.closeWorkspace?.phase,
+            .failure(
+                message: "The workspace's changes couldn't be compared with the project. The workspace remains open. Return to it and try again."
+            )
+        )
+    }
+
+    func test33c_unknownPreviewFailureUsesStableProjectRecoveryCopy() async {
+        let fake = FakeWorkspaceEngine()
+        let (store, _, _) = TestSupport.makeStore(engine: fake)
+        let workspace = await makeClosableWorkspace(store: store, fake: fake)
+        fake.previewLandHandler = { _, _ in
+            throw NSError(domain: "raw manager/VCS/storage/token diagnostic", code: 17)
+        }
+
+        await store.prepareCloseWorkspace(workspace.id)
+
+        XCTAssertEqual(
+            store.closeWorkspace?.phase,
+            .failure(
+                message: "The workspace's changes couldn't be compared with the project. The workspace remains open. Return to it and try again."
+            )
+        )
+    }
+
+    func test49a_removeProjectClearsWorkingCopyAttentionForRemoveAndReAdd() async {
+        let fake = FakeWorkspaceEngine()
+        let (store, _, _) = TestSupport.makeStore(engine: fake)
+        let path = "/tmp/project-attention"
+        store.addProject(path: path)
+        fake.nextRebaseResult = .failure(.rebaseConflict("conflict"))
+        await store.refreshProjectWorkspace(path)
+        XCTAssertTrue(store.projectWorkingCopyAttention.contains(path))
+        let project = store.projects.first { $0.path == path }!
+        store.removeProject(project)
+        XCTAssertFalse(store.projectWorkingCopyAttention.contains(path))
+        store.addProject(path: path)
+        XCTAssertFalse(store.projectWorkingCopyAttention.contains(path))
+    }
+
+    func test49b_landCompletionAfterRemoveAndReaddCannotMutateNewLifecycle() async {
+        let fake = FakeWorkspaceEngine()
+        let (store, spy, _) = TestSupport.makeStore(engine: fake)
+        let workspace = await makeClosableWorkspace(store: store, fake: fake)
+        fake.nextPreviewResult = .success(
+            LandPreview(
+                bookmark: "main",
+                bookmarkCommit: "head",
+                commits: [LandCommit(id: "1", subject: "Change")],
+                conflicts: [],
+                needsMessage: false,
+                diverging: [],
+                targetSnapshot: "test-snapshot"
+            )
+        )
+        await store.prepareCloseWorkspace(workspace.id)
+
+        let landStarted = expectation(description: "land reached suspension")
+        var landContinuation: CheckedContinuation<LandResult, Error>?
+        fake.landWorkspaceHandler = { _, _, _, _ in
+            try await withCheckedThrowingContinuation { continuation in
+                landContinuation = continuation
+                landStarted.fulfill()
+            }
+        }
+
+        let closeTask = Task { await store.addChangesAndCloseWorkspace() }
+        await fulfillment(of: [landStarted], timeout: 2)
+
+        let oldProject = store.projects.first { $0.path == workspace.projectPath }!
+        store.removeProject(oldProject)
+        store.addProject(path: workspace.projectPath)
+        let newSessionID = store.selection
+        let closedBeforeLandCompletion = spy.closedIDs
+
+        landContinuation!.resume(
+            returning: LandResult(commitID: "landed", bookmark: "main")
+        )
+        await closeTask.value
+
+        XCTAssertEqual(spy.closedIDs, closedBeforeLandCompletion)
+        XCTAssertTrue(store.sessions.contains { $0.id == newSessionID })
+        XCTAssertTrue(store.projectWorkingCopyAttention.isEmpty)
+        XCTAssertTrue(fake.rebaseOntoTrunkCalls.isEmpty)
+        XCTAssertNil(store.closeWorkspace)
+    }
+
+    func test49c_staleReconciliationFailureAfterRemoveIsNeutralForOldClose() async {
+        let fake = FakeWorkspaceEngine()
+        let (store, _, _) = TestSupport.makeStore(engine: fake)
+        let workspace = await makeClosableWorkspace(store: store, fake: fake)
+        fake.nextPreviewResult = .success(
+            LandPreview(
+                bookmark: "main",
+                bookmarkCommit: "head",
+                commits: [LandCommit(id: "1", subject: "Change")],
+                conflicts: [],
+                needsMessage: false,
+                diverging: [],
+                targetSnapshot: "test-snapshot"
+            )
+        )
+        await store.prepareCloseWorkspace(workspace.id)
+
+        let rebaseStarted = expectation(description: "rebase reached suspension")
+        var rebaseContinuation: CheckedContinuation<Int, Error>?
+        fake.rebaseOntoTrunkHandler = { _ in
+            try await withCheckedThrowingContinuation { continuation in
+                rebaseContinuation = continuation
+                rebaseStarted.fulfill()
+            }
+        }
+
+        let closeTask = Task { await store.addChangesAndCloseWorkspace() }
+        await fulfillment(of: [rebaseStarted], timeout: 2)
+        let project = store.projects.first { $0.path == workspace.projectPath }!
+        store.removeProject(project)
+        rebaseContinuation!.resume(
+            throwing: EngineError.rebaseConflict("stale failure")
+        )
+        await closeTask.value
+
+        XCTAssertFalse(store.projectWorkingCopyAttention.contains(workspace.projectPath))
+        XCTAssertNil(store.closeWorkspace)
+    }
+
+    func test49d_oldReconciliationSuccessCannotClearNewLifecycleAttention() async {
+        let fake = FakeWorkspaceEngine()
+        let (store, _, _) = TestSupport.makeStore(engine: fake)
+        let path = "/tmp/readded-project-success"
+        store.addProject(path: path)
+
+        let firstStarted = expectation(description: "old rebase reached suspension")
+        var firstContinuation: CheckedContinuation<Int, Error>?
+        var callCount = 0
+        fake.rebaseOntoTrunkHandler = { _ in
+            callCount += 1
+            if callCount == 1 {
+                return try await withCheckedThrowingContinuation { continuation in
+                    firstContinuation = continuation
+                    firstStarted.fulfill()
+                }
+            }
+            throw EngineError.rebaseConflict("new lifecycle attention")
+        }
+
+        let oldRefresh = Task { await store.refreshProjectWorkspace(path) }
+        await fulfillment(of: [firstStarted], timeout: 2)
+        let oldProject = store.projects.first { $0.path == path }!
+        store.removeProject(oldProject)
+        store.addProject(path: path)
+        await store.refreshProjectWorkspace(path)
+        XCTAssertTrue(store.projectWorkingCopyAttention.contains(path))
+
+        firstContinuation!.resume(returning: 0)
+        await oldRefresh.value
+
+        XCTAssertTrue(store.projectWorkingCopyAttention.contains(path))
+    }
+
+    func test49e_oldReconciliationFailureCannotRaiseNewLifecycleAttention() async {
+        let fake = FakeWorkspaceEngine()
+        let (store, _, _) = TestSupport.makeStore(engine: fake)
+        let path = "/tmp/readded-project-failure"
+        store.addProject(path: path)
+
+        let rebaseStarted = expectation(description: "old rebase reached suspension")
+        var continuation: CheckedContinuation<Int, Error>?
+        fake.rebaseOntoTrunkHandler = { _ in
+            try await withCheckedThrowingContinuation { suspended in
+                continuation = suspended
+                rebaseStarted.fulfill()
+            }
+        }
+
+        let oldRefresh = Task { await store.refreshProjectWorkspace(path) }
+        await fulfillment(of: [rebaseStarted], timeout: 2)
+        let oldProject = store.projects.first { $0.path == path }!
+        store.removeProject(oldProject)
+        store.addProject(path: path)
+        continuation!.resume(
+            throwing: EngineError.rebaseConflict("old lifecycle failure")
+        )
+        await oldRefresh.value
+
+        XCTAssertFalse(store.projectWorkingCopyAttention.contains(path))
+    }
+
+    func test49f_addingExistingProjectPathDoesNotRenewLifecycle() async {
+        let fake = FakeWorkspaceEngine()
+        let (store, _, _) = TestSupport.makeStore(engine: fake)
+        let path = "/tmp/existing-project"
+        store.addProject(path: path)
+
+        let rebaseStarted = expectation(description: "rebase reached suspension")
+        var continuation: CheckedContinuation<Int, Error>?
+        fake.rebaseOntoTrunkHandler = { _ in
+            try await withCheckedThrowingContinuation { suspended in
+                continuation = suspended
+                rebaseStarted.fulfill()
+            }
+        }
+
+        let refresh = Task { await store.refreshProjectWorkspace(path) }
+        await fulfillment(of: [rebaseStarted], timeout: 2)
+        store.addProject(path: path)
+        continuation!.resume(
+            throwing: EngineError.rebaseConflict("same lifecycle failure")
+        )
+        await refresh.value
+
+        XCTAssertTrue(store.projectWorkingCopyAttention.contains(path))
+    }
+
+    func test49g_deleteCompletionAfterRemoveAndReaddCannotTearDownNewLifecycle() async {
+        let fake = FakeWorkspaceEngine()
+        let (store, spy, _) = TestSupport.makeStore(engine: fake)
+        let workspace = await makeClosableWorkspace(store: store, fake: fake)
+        fake.nextPreviewResult = .failure(.nothingToLand("nothing to add"))
+        await store.prepareCloseWorkspace(workspace.id)
+
+        let deleteStarted = expectation(description: "delete reached suspension")
+        var continuation: CheckedContinuation<DeleteResult, Error>?
+        fake.deleteWorkspaceHandler = { _, _ in
+            try await withCheckedThrowingContinuation { suspended in
+                continuation = suspended
+                deleteStarted.fulfill()
+            }
+        }
+
+        let closeTask = Task { await store.closeWithoutAddingWorkspace() }
+        await fulfillment(of: [deleteStarted], timeout: 2)
+        let oldProject = store.projects.first { $0.path == workspace.projectPath }!
+        store.removeProject(oldProject)
+        store.addProject(path: workspace.projectPath)
+        let newSessionID = store.selection
+        let closedBeforeDeleteCompletion = spy.closedIDs
+
+        continuation!.resume(returning: DeleteResult())
+        await closeTask.value
+
+        XCTAssertEqual(spy.closedIDs, closedBeforeDeleteCompletion)
+        XCTAssertTrue(store.sessions.contains { $0.id == newSessionID })
+        XCTAssertNil(store.closeWorkspace)
+    }
+
+    func test49h_oldLandFailureCannotOverwriteReaddedSameWorkspaceSheet() async {
+        let fake = FakeWorkspaceEngine()
+        let (store, _, _) = TestSupport.makeStore(engine: fake)
+        let workspace = await makeClosableWorkspace(store: store, fake: fake)
+        let preview = LandPreview(
+            bookmark: "main",
+            bookmarkCommit: "head",
+            commits: [LandCommit(id: "1", subject: "New lifecycle change")],
+            conflicts: [],
+            needsMessage: false,
+            diverging: [],
+            targetSnapshot: "test-snapshot"
+        )
+        fake.nextPreviewResult = .success(preview)
+        await store.prepareCloseWorkspace(workspace.id)
+
+        let landStarted = expectation(description: "old land reached suspension")
+        var continuation: CheckedContinuation<LandResult, Error>?
+        fake.landWorkspaceHandler = { _, _, _, _ in
+            try await withCheckedThrowingContinuation { suspended in
+                continuation = suspended
+                landStarted.fulfill()
+            }
+        }
+        let oldClose = Task { await store.addChangesAndCloseWorkspace() }
+        await fulfillment(of: [landStarted], timeout: 2)
+
+        let oldProject = store.projects.first { $0.path == workspace.projectPath }!
+        store.removeProject(oldProject)
+        store.addProject(path: workspace.projectPath)
+        fake.nextCreateResult = .success(workspace)
+        await store.createWorkspace(in: workspace.projectPath)
+        fake.nextPreviewResult = .success(preview)
+        await store.prepareCloseWorkspace(workspace.id)
+        let newSessionID = store.selection
+
+        continuation!.resume(throwing: EngineError.failed("old land failure"))
+        await oldClose.value
+
+        XCTAssertEqual(store.closeWorkspace?.phase, .ready(changes: ["New lifecycle change"]))
+        XCTAssertTrue(store.workspaces.contains { $0.id == workspace.id })
+        XCTAssertTrue(store.sessions.contains { $0.id == newSessionID })
+    }
+
+    func test49i_oldDeleteFailureCannotOverwriteReaddedSameWorkspaceSheet() async {
+        let fake = FakeWorkspaceEngine()
+        let (store, _, _) = TestSupport.makeStore(engine: fake)
+        let workspace = await makeClosableWorkspace(store: store, fake: fake)
+        fake.nextPreviewResult = .failure(.nothingToLand("nothing to add"))
+        await store.prepareCloseWorkspace(workspace.id)
+
+        let deleteStarted = expectation(description: "old delete reached suspension")
+        var continuation: CheckedContinuation<DeleteResult, Error>?
+        fake.deleteWorkspaceHandler = { _, _ in
+            try await withCheckedThrowingContinuation { suspended in
+                continuation = suspended
+                deleteStarted.fulfill()
+            }
+        }
+        let oldClose = Task { await store.closeWithoutAddingWorkspace() }
+        await fulfillment(of: [deleteStarted], timeout: 2)
+
+        let oldProject = store.projects.first { $0.path == workspace.projectPath }!
+        store.removeProject(oldProject)
+        store.addProject(path: workspace.projectPath)
+        fake.nextCreateResult = .success(workspace)
+        await store.createWorkspace(in: workspace.projectPath)
+        fake.nextPreviewResult = .failure(.nothingToLand("new lifecycle is clean"))
+        await store.prepareCloseWorkspace(workspace.id)
+        let newSessionID = store.selection
+
+        continuation!.resume(throwing: EngineError.failed("old delete failure"))
+        await oldClose.value
+
+        XCTAssertEqual(store.closeWorkspace?.phase, .noChanges)
+        XCTAssertTrue(store.workspaces.contains { $0.id == workspace.id })
+        XCTAssertTrue(store.sessions.contains { $0.id == newSessionID })
+    }
+
+    func test49j_oldPreviewFailureCannotOverwriteReaddedSameWorkspaceSheet() async {
+        let fake = FakeWorkspaceEngine()
+        let (store, _, _) = TestSupport.makeStore(engine: fake)
+        let workspace = await makeClosableWorkspace(store: store, fake: fake)
+        let preview = LandPreview(
+            bookmark: "main",
+            bookmarkCommit: "head",
+            commits: [LandCommit(id: "1", subject: "New preview")],
+            conflicts: [],
+            needsMessage: false,
+            diverging: [],
+            targetSnapshot: "test-snapshot"
+        )
+        let previewStarted = expectation(description: "old preview reached suspension")
+        var continuation: CheckedContinuation<LandPreview, Error>?
+        var previewCallCount = 0
+        fake.previewLandHandler = { _, _ in
+            previewCallCount += 1
+            if previewCallCount == 1 {
+                return try await withCheckedThrowingContinuation { suspended in
+                    continuation = suspended
+                    previewStarted.fulfill()
+                }
+            }
+            return preview
+        }
+        let oldPreview = Task { await store.prepareCloseWorkspace(workspace.id) }
+        await fulfillment(of: [previewStarted], timeout: 2)
+
+        let oldProject = store.projects.first { $0.path == workspace.projectPath }!
+        store.removeProject(oldProject)
+        store.addProject(path: workspace.projectPath)
+        fake.nextCreateResult = .success(workspace)
+        await store.createWorkspace(in: workspace.projectPath)
+        await store.prepareCloseWorkspace(workspace.id)
+
+        continuation!.resume(throwing: EngineError.failed("old preview failure"))
+        await oldPreview.value
+
+        XCTAssertEqual(store.closeWorkspace?.phase, .ready(changes: ["New preview"]))
+        XCTAssertTrue(store.workspaces.contains { $0.id == workspace.id })
+    }
+
+    func test49k_createCompletionAfterRemoveAndReaddCannotMutateNewLifecycle() async {
+        let fake = FakeWorkspaceEngine()
+        let (store, _, _) = TestSupport.makeStore(engine: fake)
+        let path = "/tmp/stale-create"
+        let workspace = WorkspaceRow(
+            projectPath: path,
+            name: "same-name",
+            path: "\(path)/same-name",
+            label: nil
+        )
+        store.addProject(path: path)
+
+        let createStarted = expectation(description: "old create reached suspension")
+        var continuation: CheckedContinuation<WorkspaceRow, Error>?
+        fake.createWorkspaceHandler = { _ in
+            try await withCheckedThrowingContinuation { suspended in
+                continuation = suspended
+                createStarted.fulfill()
+            }
+        }
+        let oldCreate = Task { await store.createWorkspace(in: path) }
+        await fulfillment(of: [createStarted], timeout: 2)
+
+        let oldProject = store.projects.first { $0.path == path }!
+        store.removeProject(oldProject)
+        store.addProject(path: path)
+        let newSessionID = store.selection
+        continuation!.resume(returning: workspace)
+        await oldCreate.value
+
+        XCTAssertFalse(store.workspaces.contains { $0.id == workspace.id })
+        XCTAssertFalse(store.sessions.contains { $0.target.id == workspace.id })
+        XCTAssertTrue(store.sessions.contains { $0.id == newSessionID })
+    }
+
+    func test49l_createFailureAfterRemoveAndReaddCannotSetNewLifecycleError() async {
+        let fake = FakeWorkspaceEngine()
+        let (store, _, _) = TestSupport.makeStore(engine: fake)
+        let path = "/tmp/stale-create-failure"
+        store.addProject(path: path)
+
+        let createStarted = expectation(description: "old create reached suspension")
+        var continuation: CheckedContinuation<WorkspaceRow, Error>?
+        fake.createWorkspaceHandler = { _ in
+            try await withCheckedThrowingContinuation { suspended in
+                continuation = suspended
+                createStarted.fulfill()
+            }
+        }
+        let oldCreate = Task { await store.createWorkspace(in: path) }
+        await fulfillment(of: [createStarted], timeout: 2)
+
+        let oldProject = store.projects.first { $0.path == path }!
+        store.removeProject(oldProject)
+        store.addProject(path: path)
+        continuation!.resume(throwing: EngineError.failed("old create failure"))
+        await oldCreate.value
+
+        XCTAssertNil(store.lastError)
+    }
+    func test72_noEngineCallBeginsUntilWorkspaceSessionsFinishQuiescing() async {
+        let fake = FakeWorkspaceEngine()
+        let (store, spy, stateURL) = TestSupport.makeStore(engine: fake)
+        let workspace = await makeClosableWorkspace(store: store, fake: fake)
+        fake.nextPreviewResult = .failure(.nothingToLand("nothing to add"))
+        await store.prepareCloseWorkspace(workspace.id)
+
+        let workspaceSessionIDs = Set(store.sessions.filter {
+            $0.target == .workspace(projectPath: workspace.projectPath, name: workspace.name)
+        }.map(\.id))
+        let persistedBefore = try! Data(contentsOf: stateURL)
+        let quiesceStarted = expectation(description: "quiesce reached suspension")
+        var quiesceContinuation: CheckedContinuation<Void, Never>?
+        spy.quiesceSessionsHandler = { _ in
+            await withCheckedContinuation { continuation in
+                quiesceContinuation = continuation
+                quiesceStarted.fulfill()
+            }
+        }
+
+        let closeTask = Task { await store.closeWithoutAddingWorkspace() }
+        await fulfillment(of: [quiesceStarted], timeout: 2)
+
+        XCTAssertEqual(spy.quiesceCalls, [workspaceSessionIDs])
+        XCTAssertTrue(fake.deleteCalls.isEmpty)
+        XCTAssertEqual(try! Data(contentsOf: stateURL), persistedBefore)
+
+        quiesceContinuation!.resume()
+        await closeTask.value
+
+        XCTAssertEqual(fake.deleteCalls, [workspace])
+        XCTAssertEqual(fake.deleteOnlyIfUnchangedCalls, [true])
+        XCTAssertEqual(Set(spy.closedIDs), workspaceSessionIDs)
+        XCTAssertTrue(spy.resumeCalls.isEmpty)
+    }
+
+    func test73_lateChangeAfterNoChangePreviewRefusesForgetAndReturnsToChangeReview() async {
+        let fake = FakeWorkspaceEngine()
+        let (store, spy, stateURL) = TestSupport.makeStore(engine: fake)
+        let workspace = await makeClosableWorkspace(store: store, fake: fake)
+        fake.nextPreviewResult = .failure(.nothingToLand("nothing to add"))
+        await store.prepareCloseWorkspace(workspace.id)
+
+        let sessionsBefore = store.sessions
+        let workspacesBefore = store.workspaces
+        let selectionBefore = store.selection
+        let persistedBefore = try! Data(contentsOf: stateURL)
+        let workspaceSessionIDs = Set(sessionsBefore.filter {
+            $0.target == .workspace(projectPath: workspace.projectPath, name: workspace.name)
+        }.map(\.id))
+        fake.nextDeleteResult = .failure(.workspaceChanged("workspace changed"))
+        fake.nextPreviewResult = .success(
+            LandPreview(
+                bookmark: "main",
+                bookmarkCommit: "abc",
+                commits: [LandCommit(id: "late", subject: "Late terminal change")],
+                conflicts: [],
+                needsMessage: false,
+                diverging: [],
+                targetSnapshot: "test-snapshot"
+            )
+        )
+
+        await store.closeWithoutAddingWorkspace()
+
+        XCTAssertEqual(fake.deleteOnlyIfUnchangedCalls, [true])
+        XCTAssertEqual(spy.quiesceCalls, [workspaceSessionIDs])
+        XCTAssertEqual(spy.resumeCalls, [workspaceSessionIDs])
+        XCTAssertTrue(spy.closedIDs.isEmpty)
+        XCTAssertEqual(store.sessions, sessionsBefore)
+        XCTAssertEqual(store.workspaces, workspacesBefore)
+        XCTAssertEqual(store.selection, selectionBefore)
+        XCTAssertEqual(try! Data(contentsOf: stateURL), persistedBefore)
+        XCTAssertEqual(fake.previewLandCalls.count, 2)
+        XCTAssertEqual(store.closeWorkspace?.phase, .ready(changes: ["Late terminal change"]))
+    }
+
+    func test74_failedLandResumesQuiescedSessionsAndPreservesExactPersistedState() async {
+        let fake = FakeWorkspaceEngine()
+        let (store, spy, stateURL) = TestSupport.makeStore(engine: fake)
+        let workspace = await makeClosableWorkspace(store: store, fake: fake)
+        fake.nextPreviewResult = .success(
+            LandPreview(
+                bookmark: "main",
+                bookmarkCommit: "abc",
+                commits: [LandCommit(id: "1", subject: "Change")],
+                conflicts: [],
+                needsMessage: false,
+                diverging: [],
+                targetSnapshot: "test-snapshot"
+            )
+        )
+        await store.prepareCloseWorkspace(workspace.id)
+
+        let sessionsBefore = store.sessions
+        let workspacesBefore = store.workspaces
+        let selectionBefore = store.selection
+        let persistedBefore = try! Data(contentsOf: stateURL)
+        let workspaceSessionIDs = Set(sessionsBefore.filter {
+            $0.target == .workspace(projectPath: workspace.projectPath, name: workspace.name)
+        }.map(\.id))
+        fake.nextLandResult = .failure(.failed("land failed"))
+
+        await store.addChangesAndCloseWorkspace()
+
+        XCTAssertEqual(spy.quiesceCalls, [workspaceSessionIDs])
+        XCTAssertEqual(spy.resumeCalls, [workspaceSessionIDs])
+        XCTAssertTrue(spy.closedIDs.isEmpty)
+        XCTAssertEqual(store.sessions, sessionsBefore)
+        XCTAssertEqual(store.workspaces, workspacesBefore)
+        XCTAssertEqual(store.selection, selectionBefore)
+        XCTAssertEqual(try! Data(contentsOf: stateURL), persistedBefore)
+        XCTAssertEqual(
+            store.closeWorkspace?.phase,
+            .failure(
+                message: "The changes couldn't be added to the project. The workspace remains open. Return to it and try again."
+            )
+        )
+    }
+
+    func test74b_unknownLandFailureUsesStableProjectRecoveryCopy() async {
+        let fake = FakeWorkspaceEngine()
+        let (store, _, _) = TestSupport.makeStore(engine: fake)
+        let workspace = await makeClosableWorkspace(store: store, fake: fake)
+        fake.nextPreviewResult = .success(
+            LandPreview(
+                bookmark: "main",
+                bookmarkCommit: "abc",
+                commits: [LandCommit(id: "1", subject: "Change")],
+                conflicts: [],
+                needsMessage: false,
+                diverging: [],
+                targetSnapshot: "test-snapshot"
+            )
+        )
+        await store.prepareCloseWorkspace(workspace.id)
+        fake.landWorkspaceHandler = { _, _, _, _ in
+            throw NSError(domain: "raw manager/VCS/storage/token diagnostic", code: 18)
+        }
+
+        await store.addChangesAndCloseWorkspace()
+
+        XCTAssertEqual(
+            store.closeWorkspace?.phase,
+            .failure(
+                message: "The changes couldn't be added to the project. The workspace remains open. Return to it and try again."
+            )
+        )
+    }
+
+    func test74c_unknownForgetFailureUsesStableProjectRecoveryCopy() async {
+        let fake = FakeWorkspaceEngine()
+        let (store, _, _) = TestSupport.makeStore(engine: fake)
+        let workspace = await makeClosableWorkspace(store: store, fake: fake)
+        fake.nextPreviewResult = .failure(.nothingToLand("nothing to add"))
+        await store.prepareCloseWorkspace(workspace.id)
+        fake.deleteWorkspaceHandler = { _, _ in
+            throw NSError(domain: "raw manager/VCS/storage/token diagnostic", code: 19)
+        }
+
+        await store.closeWithoutAddingWorkspace()
+
+        XCTAssertEqual(
+            store.closeWorkspace?.phase,
+            .failure(
+                message: "The workspace couldn't be closed. The workspace remains open. Return to it and try again."
+            )
+        )
+    }
+
+    func test75_confirmedCloseWithoutAddingUsesExplicitlyDestructiveForget() async {
+        let fake = FakeWorkspaceEngine()
+        let (store, spy, _) = TestSupport.makeStore(engine: fake)
+        let workspace = await makeClosableWorkspace(store: store, fake: fake)
+        fake.nextPreviewResult = .success(
+            LandPreview(
+                bookmark: "main",
+                bookmarkCommit: "abc",
+                commits: [LandCommit(id: "1", subject: "Change")],
+                conflicts: [],
+                needsMessage: false,
+                diverging: [],
+                targetSnapshot: "test-snapshot"
+            )
+        )
+        await store.prepareCloseWorkspace(workspace.id)
+        store.requestCloseWithoutAdding()
+
+        await store.closeWithoutAddingWorkspace()
+
+        XCTAssertEqual(fake.deleteOnlyIfUnchangedCalls, [false])
+        XCTAssertEqual(spy.quiesceCalls.count, 1)
+        XCTAssertTrue(spy.resumeCalls.isEmpty)
+    }
+    func test76_landDoesNotBeginUntilWorkspaceSessionsFinishQuiescing() async {
+        let fake = FakeWorkspaceEngine()
+        let (store, spy, _) = TestSupport.makeStore(engine: fake)
+        let workspace = await makeClosableWorkspace(store: store, fake: fake)
+        fake.nextPreviewResult = .success(
+            LandPreview(
+                bookmark: "main",
+                bookmarkCommit: "abc",
+                commits: [LandCommit(id: "1", subject: "Change")],
+                conflicts: [],
+                needsMessage: false,
+                diverging: [],
+                targetSnapshot: "test-snapshot"
+            )
+        )
+        fake.nextLandResult = .success(
+            LandResult(
+                commitID: "abc",
+                bookmark: "main",
+                workspaceRetained: true
+            )
+        )
+        await store.prepareCloseWorkspace(workspace.id)
+
+        let quiesceStarted = expectation(description: "land quiesce reached suspension")
+        var quiesceContinuation: CheckedContinuation<Void, Never>?
+        spy.quiesceSessionsHandler = { _ in
+            await withCheckedContinuation { continuation in
+                quiesceContinuation = continuation
+                quiesceStarted.fulfill()
+            }
+        }
+
+        let closeTask = Task { await store.addChangesAndCloseWorkspace() }
+        await fulfillment(of: [quiesceStarted], timeout: 2)
+
+        XCTAssertTrue(fake.landCalls.isEmpty)
+        quiesceContinuation!.resume()
+        await closeTask.value
+
+        XCTAssertEqual(fake.landCalls.count, 1)
+        XCTAssertEqual(spy.resumeCalls, spy.quiesceCalls)
+        XCTAssertTrue(spy.closedIDs.isEmpty)
+    }
+    func test77_targetChangeAfterPreviewRestartsSessionsAndRefreshesPreparedChanges() async {
+        let fake = FakeWorkspaceEngine()
+        let (store, spy, stateURL) = TestSupport.makeStore(engine: fake)
+        let workspace = await makeClosableWorkspace(store: store, fake: fake)
+        let target = TargetRef.workspace(projectPath: workspace.projectPath, name: workspace.name)
+        let session = store.sessions.first { $0.target == target }!
+        spy.onTitleChange?(session.id, "π > Preserve this session")
+        spy.onAgentSessionEvent?(
+            session.id,
+            AgentSessionEvent(agent: "omp", name: "session_start", sessionID: "omp-stale-recovery", query: nil)
+        )
+        let sessionsBefore = store.sessions
+        let workspacesBefore = store.workspaces
+        let persistedBefore = try! Data(contentsOf: stateURL)
+        let sessionIDs = Set(sessionsBefore.filter { $0.target == target }.map(\.id))
+        fake.previewResults = [
+            .success(LandPreview(
+                bookmark: "main", bookmarkCommit: "old", commits: [LandCommit(id: "old", subject: "Old target change")],
+                conflicts: [], needsMessage: false, diverging: [], targetSnapshot: "target-old"
+            )),
+            .success(LandPreview(
+                bookmark: "main", bookmarkCommit: "new", commits: [LandCommit(id: "new", subject: "Current target change")],
+                conflicts: [], needsMessage: false, diverging: [], targetSnapshot: "target-current"
+            )),
+        ]
+        fake.landWorkspaceHandler = { _, _, _, expectedSnapshot in
+            XCTAssertEqual(expectedSnapshot, "target-old")
+            throw EngineError.workspaceChanged("target changed")
+        }
+
+        await store.prepareCloseWorkspace(workspace.id)
+        XCTAssertEqual(store.closeWorkspace?.targetSnapshot, "target-old")
+        await store.addChangesAndCloseWorkspace()
+
+        XCTAssertEqual(fake.landCalls.map(\.expectedSnapshot), ["target-old"])
+        XCTAssertEqual(spy.quiesceCalls, [sessionIDs])
+        XCTAssertEqual(spy.resumeCalls, [sessionIDs])
+        XCTAssertTrue(spy.closedIDs.isEmpty)
+        XCTAssertEqual(store.sessions, sessionsBefore)
+        XCTAssertEqual(store.workspaces, workspacesBefore)
+        XCTAssertEqual(try! Data(contentsOf: stateURL), persistedBefore)
+        XCTAssertEqual(store.sessions.first { $0.id == session.id }?.resume, sessionsBefore.first { $0.id == session.id }?.resume)
+        XCTAssertEqual(store.closeWorkspace?.phase, .ready(changes: ["Current target change"]))
+        XCTAssertEqual(store.closeWorkspace?.targetSnapshot, "target-current")
+    }
+
+    func test78_projectProgressChangeAfterSummaryPreviewClearsStaleSummaryAndRefreshes() async {
+        let fake = FakeWorkspaceEngine()
+        let (store, spy, _) = TestSupport.makeStore(engine: fake)
+        let workspace = await makeClosableWorkspace(store: store, fake: fake)
+        let sessionIDs = Set(store.sessions.filter {
+            $0.target == .workspace(projectPath: workspace.projectPath, name: workspace.name)
+        }.map(\.id))
+        fake.previewResults = [
+            .success(LandPreview(
+                bookmark: "main", bookmarkCommit: "old-project", commits: [LandCommit(id: "dirty", subject: "")],
+                conflicts: [], needsMessage: true, diverging: [], targetSnapshot: "project-old"
+            )),
+            .success(LandPreview(
+                bookmark: "main", bookmarkCommit: "new-project", commits: [LandCommit(id: "new", subject: "Preferred project progress")],
+                conflicts: [], needsMessage: false, diverging: [], targetSnapshot: "project-current"
+            )),
+        ]
+        fake.landWorkspaceHandler = { _, _, _, expectedSnapshot in
+            XCTAssertEqual(expectedSnapshot, "project-old")
+            throw EngineError.workspaceChanged("preferred progress changed")
+        }
+
+        await store.prepareCloseWorkspace(workspace.id)
+        store.setCloseWorkspaceSummary("Description for old preview")
+        await store.addChangesAndCloseWorkspace()
+
+        XCTAssertEqual(spy.resumeCalls, [sessionIDs])
+        XCTAssertEqual(store.closeWorkspace?.summary, "")
+        XCTAssertEqual(store.closeWorkspace?.phase, .ready(changes: ["Preferred project progress"]))
+        XCTAssertEqual(store.closeWorkspace?.targetSnapshot, "project-current")
+    }
+
+    func test79_projectSetupRoundTripsTokenAndRecoversStaleApplication() async {
+        let fake = FakeWorkspaceEngine()
+        let (store, spy, _) = TestSupport.makeStore(engine: fake)
+        let workspace = await makeClosableWorkspace(store: store, fake: fake)
+        let sessionIDs = Set(store.sessions.filter {
+            $0.target == .workspace(projectPath: workspace.projectPath, name: workspace.name)
+        }.map(\.id))
+        fake.previewResults = [
+            .failure(.noTrunk("no trunk")),
+            .success(LandPreview(
+                bookmark: "main", bookmarkCommit: "", commits: [LandCommit(id: "old", subject: "Initial setup")],
+                conflicts: [], needsMessage: false, diverging: [], targetSnapshot: "setup-old"
+            )),
+            .failure(.noTrunk("still no trunk")),
+            .success(LandPreview(
+                bookmark: "main", bookmarkCommit: "", commits: [LandCommit(id: "new", subject: "Current setup")],
+                conflicts: [], needsMessage: false, diverging: [], targetSnapshot: "setup-current"
+            )),
+        ]
+        fake.landWorkspaceHandler = { _, _, createTrunk, expectedSnapshot in
+            XCTAssertEqual(createTrunk, "main")
+            XCTAssertEqual(expectedSnapshot, "setup-old")
+            throw EngineError.workspaceChanged("setup changed")
+        }
+
+        await store.prepareCloseWorkspace(workspace.id)
+        await store.setUpProjectAndCloseWorkspace()
+
+        XCTAssertEqual(fake.landCalls.map(\.expectedSnapshot), ["setup-old"])
+        XCTAssertEqual(spy.resumeCalls, [sessionIDs])
+        XCTAssertTrue(spy.closedIDs.isEmpty)
+        XCTAssertTrue(store.workspaces.contains { $0.id == workspace.id })
+        XCTAssertEqual(fake.previewLandCalls.map(\.createTrunk), [nil, "main", nil, "main"])
+        XCTAssertEqual(store.closeWorkspace?.phase, .projectSetupRequired(changes: ["Current setup"], needsMessage: false))
+        XCTAssertEqual(store.closeWorkspace?.targetSnapshot, "setup-current")
+    }
+    func test80_staleRefreshCannotOverwriteReplacementSheetForSameWorkspace() async {
+        let fake = FakeWorkspaceEngine()
+        let (store, _, _) = TestSupport.makeStore(engine: fake)
+        let workspace = await makeClosableWorkspace(store: store, fake: fake)
+        fake.nextPreviewResult = .success(LandPreview(
+            bookmark: "main", bookmarkCommit: "old", commits: [LandCommit(id: "old", subject: "Old change")],
+            conflicts: [], needsMessage: false, diverging: [], targetSnapshot: "old-snapshot"
+        ))
+        await store.prepareCloseWorkspace(workspace.id)
+        fake.landWorkspaceHandler = { _, _, _, _ in
+            throw EngineError.workspaceChanged("changed")
+        }
+        let refreshStarted = expectation(description: "stale refresh suspended")
+        var continuation: CheckedContinuation<LandPreview, Error>?
+        fake.previewLandHandler = { _, _ in
+            try await withCheckedThrowingContinuation { suspended in
+                continuation = suspended
+                refreshStarted.fulfill()
+            }
+        }
+
+        let staleClose = Task { await store.addChangesAndCloseWorkspace() }
+        await fulfillment(of: [refreshStarted], timeout: 2)
+        var replacement = CloseWorkspacePresentation(
+            workspaceID: workspace.id,
+            workspaceName: workspace.displayName,
+            projectPath: workspace.projectPath,
+            projectName: "Replacement",
+            phase: .ready(changes: ["Replacement change"])
+        )
+        replacement.targetSnapshot = "replacement-snapshot"
+        store.closeWorkspace = replacement
+        continuation!.resume(returning: LandPreview(
+            bookmark: "main", bookmarkCommit: "stale", commits: [LandCommit(id: "stale", subject: "Stale result")],
+            conflicts: [], needsMessage: false, diverging: [], targetSnapshot: "stale-snapshot"
+        ))
+        await staleClose.value
+
+        XCTAssertEqual(store.closeWorkspace, replacement)
     }
 }

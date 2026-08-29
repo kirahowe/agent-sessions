@@ -9,6 +9,7 @@ enum EngineError: Error, Equatable {
     case landConflict(String)
     case nothingToLand(String)
     case sharedHistory(String)
+    case workspaceChanged(String)
     // Thrown by rebase-onto-trunk when reconciling the project working copy
     // after a successful close. This is follow-up attention, not a failure
     // of the close that already completed.
@@ -18,7 +19,7 @@ enum EngineError: Error, Equatable {
         switch self {
         case .notARepo(let m), .nameConflict(let m), .destExists(let m), .failed(let m),
              .noTrunk(let m), .landConflict(let m), .nothingToLand(let m), .sharedHistory(let m),
-             .rebaseConflict(let m):
+             .workspaceChanged(let m), .rebaseConflict(let m):
             return m
         }
     }
@@ -30,12 +31,18 @@ enum EngineError: Error, Equatable {
 struct LandResult: Equatable {
     let commitID: String
     let bookmark: String
-    /// Non-nil when the land itself succeeded (jj already forgot the
-    /// workspace and advanced the bookmark) but the leftover workspace
-    /// directory couldn't be moved to the Bin. User-readable, meant to be
-    /// surfaced as a non-fatal notice rather than treated as a failed land.
-    /// Defaulted so every existing `LandResult(commitID:bookmark:)` call
-    /// site (including in tests) keeps compiling unchanged.
+    /// Non-nil when project progress was published but final cleanup left a
+    /// follow-up the user should know about.
+    var cleanupWarning: String? = nil
+    /// True only when the engine still has a live workspace registration.
+    /// AppStore must preserve its row, sessions, path, and selection.
+    var workspaceRetained = false
+}
+
+/// Result of an irreversible workspace forget. Once this value is returned,
+/// the engine no longer knows the workspace; local directory cleanup is only
+/// a best-effort follow-up and must not make the operation appear retryable.
+struct DeleteResult: Equatable {
     var cleanupWarning: String? = nil
 }
 
@@ -60,25 +67,40 @@ struct LandPreview: Equatable {
     /// Advisory compatibility data. The close UI ignores it and project-root
     /// reconciliation is requested automatically after every successful add.
     let diverging: [LandCommit]
+    /// Opaque manager state captured with this exact preview.
+    let targetSnapshot: String
 }
 
 @MainActor
 protocol WorkspaceEngineProviding: AnyObject {
     func createWorkspace(projectPath: String) async throws -> WorkspaceRow
-    func deleteWorkspace(_ workspace: WorkspaceRow) async throws
-    func landWorkspace(_ workspace: WorkspaceRow, message: String?, createTrunk: String?) async throws -> LandResult
-    func previewLand(_ workspace: WorkspaceRow) async throws -> LandPreview
+    func deleteWorkspace(
+        _ workspace: WorkspaceRow,
+        onlyIfUnchanged: Bool
+    ) async throws -> DeleteResult
+    func landWorkspace(
+        _ workspace: WorkspaceRow,
+        message: String?,
+        createTrunk: String?,
+        expectedSnapshot: String
+    ) async throws -> LandResult
+    func previewLand(_ workspace: WorkspaceRow, createTrunk: String?) async throws -> LandPreview
     /// Reconciles the project working copy after a successful close. This is
     /// always requested automatically; a conflict is non-fatal follow-up
     /// attention because the workspace close has already succeeded.
     func rebaseOntoTrunk(projectPath: String) async throws -> Int
 }
 
-/// Production conformer: drives the `agents-cli` babashka script as a
-/// subprocess to create/forget jj workspaces. Every invocation prints a
-/// single JSON envelope to stdout (see agents-cli's own header comment for
-/// the exact contract); this type's job is just resolving the script/bb
-/// binary, running the process, and decoding that envelope.
+extension WorkspaceEngineProviding {
+    func previewLand(_ workspace: WorkspaceRow) async throws -> LandPreview {
+        try await previewLand(workspace, createTrunk: nil)
+    }
+}
+
+/// Production conformer: drives the `agents-cli` wrapper as a subprocess to
+/// create/forget workspaces through the external `wsm.cli` dependency. Every
+/// invocation prints a single JSON envelope to stdout; this type resolves the
+/// wrapper and `bb`, runs the process, and decodes that envelope.
 final class WorkspaceEngineCLI: WorkspaceEngineProviding {
     // Explicitly nonisolated: conforming to the @MainActor protocol infers
     // whole-type MainActor isolation, which would otherwise make this
@@ -87,7 +109,15 @@ final class WorkspaceEngineCLI: WorkspaceEngineProviding {
     // synchronous, nonisolated context, so it couldn't call an isolated
     // init. The init itself touches no actor-isolated state, so opting it
     // out here is safe.
-    nonisolated init() {}
+    private let trashWorkspaceDirectory: @Sendable (URL) throws -> Void
+
+    nonisolated init(
+        trashWorkspaceDirectory: @escaping @Sendable (URL) throws -> Void = { url in
+            try FileManager.default.trashItem(at: url, resultingItemURL: nil)
+        }
+    ) {
+        self.trashWorkspaceDirectory = trashWorkspaceDirectory
+    }
 
     // MARK: - Envelope decoding
 
@@ -96,13 +126,9 @@ final class WorkspaceEngineCLI: WorkspaceEngineProviding {
         let workspace: WorkspacePayload?
         let landed: LandedPayload?
         let error: ErrorPayload?
-        // Present only on workspace-land's success envelope, and only when
-        // the land itself irreversibly succeeded (squash done, bookmark
-        // advanced) but the final `jj workspace forget` afterward failed —
-        // most plausibly because the default workspace's own working copy
-        // was stale (see agents-cli's cmd-workspace-land comment block).
-        // landWorkspace below treats its presence as a signal to skip the
-        // usual directory cleanup, not as a failure.
+        // Present only on workspace-land success envelopes when landing
+        // succeeded but final workspace cleanup could not complete.
+        // landWorkspace surfaces it as a non-fatal notice.
         let warning: String?
         // Present only on workspace-land-preview's success envelope.
         let preview: LandPreviewPayload?
@@ -120,6 +146,9 @@ final class WorkspaceEngineCLI: WorkspaceEngineProviding {
         let commit_id: String
         let bookmark: String
         let workspace: String
+        // Required on every success: silently defaulting a missing field to
+        // false could destroy a workspace retained by the engine.
+        let workspace_retained: Bool
     }
 
     /// Change entries use `id`/`subject`. Git conflict entries instead use
@@ -138,6 +167,7 @@ final class WorkspaceEngineCLI: WorkspaceEngineProviding {
         let conflicts: [LandCommitPayload]
         let needs_message: Bool
         let diverging: [LandCommitPayload]
+        let target_snapshot: String
     }
 
     private struct RebasedPayload: Decodable {
@@ -152,22 +182,23 @@ final class WorkspaceEngineCLI: WorkspaceEngineProviding {
 
     private static func engineError(for payload: ErrorPayload) -> EngineError {
         switch payload.code {
-        case "not-a-repo", "not-a-jj-repo": return .notARepo(payload.message)
+        case "not-a-repo": return .notARepo(payload.message)
         case "name-conflict": return .nameConflict(payload.message)
         case "dest-exists": return .destExists(payload.message)
         case "no-trunk": return .noTrunk(payload.message)
         case "land-conflict": return .landConflict(payload.message)
         case "nothing-to-land": return .nothingToLand(payload.message)
         case "shared-history": return .sharedHistory(payload.message)
+        case "workspace-changed": return .workspaceChanged(payload.message)
         case "rebase-conflict": return .rebaseConflict(payload.message)
-        case "git-failed": return .failed(payload.message)
         default: return .failed(payload.message)
         }
     }
 
     // MARK: - Resolution
 
-    /// Locates the bundled (or dev-override) `agents-cli` script.
+    /// Locates the bundled (or dev-override) `agents-cli` wrapper for
+    /// external `wsm.cli`.
     private static func resolveScriptURL() throws -> URL {
         if let bundled = Bundle.main.url(forResource: "agents-cli", withExtension: nil) {
             return bundled
@@ -361,26 +392,47 @@ final class WorkspaceEngineCLI: WorkspaceEngineProviding {
         return WorkspaceRow(projectPath: payload.project, name: payload.name, path: payload.path, label: nil)
     }
 
-    func deleteWorkspace(_ workspace: WorkspaceRow) async throws {
-        // workspace-forget's success envelope is a bare {"ok":true} with no
-        // workspace payload — `run` throwing on ok:false is all the
-        // confirmation needed here, so the envelope itself is discarded.
-        _ = try await run("workspace-forget", args: ["--project", workspace.projectPath, "--name", workspace.name])
-
+    func deleteWorkspace(
+        _ workspace: WorkspaceRow,
+        onlyIfUnchanged: Bool
+    ) async throws -> DeleteResult {
+        var args = ["--project", workspace.projectPath, "--name", workspace.name]
+        if onlyIfUnchanged {
+            args += ["--if-unchanged", "--create-trunk", "main"]
+        }
+        _ = try await run("workspace-forget", args: args)
         let fm = FileManager.default
-        guard fm.fileExists(atPath: workspace.path) else { return }
-        // Deliberately left to throw/propagate here, unlike landWorkspace's
-        // trashItem below: workspace-forget is idempotent and retryable, so
-        // AppStore's catch can safely leave the WorkspaceRow in place as a
-        // visible retry marker without stranding anything. landWorkspace's
-        // land is NOT retryable — the trunk bookmark already moved — so the
-        // same fatal treatment there would leave the app falsely believing
-        // the workspace still needs landing.
-        try fm.trashItem(at: URL(fileURLWithPath: workspace.path), resultingItemURL: nil)
+        guard fm.fileExists(atPath: workspace.path) else { return DeleteResult() }
+
+        // The forget above is the irreversible boundary: another attempt is
+        // not a safe cleanup retry because the workspace registration is
+        // already gone. Report a leftover directory as non-fatal follow-up,
+        // exactly as landWorkspace does after its successful CLI boundary.
+        do {
+            try trashWorkspaceDirectory(URL(fileURLWithPath: workspace.path))
+            return DeleteResult()
+        } catch {
+            return DeleteResult(
+                cleanupWarning: "The workspace was closed, but its folder couldn't be moved to the Bin — it's still at \(workspace.path)"
+            )
+        }
     }
 
-    func landWorkspace(_ workspace: WorkspaceRow, message: String?, createTrunk: String?) async throws -> LandResult {
-        var args = ["--project", workspace.projectPath, "--name", workspace.name]
+    func landWorkspace(
+        _ workspace: WorkspaceRow,
+        message: String?,
+        createTrunk: String?,
+        expectedSnapshot: String
+    ) async throws -> LandResult {
+        var args = [
+            "--project", workspace.projectPath,
+            "--name", workspace.name,
+            "--finalize-quiesced",
+        ]
+        guard !expectedSnapshot.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw EngineError.failed("Expected workspace snapshot cannot be blank")
+        }
+        args += ["--expected-snapshot", expectedSnapshot]
         // `--message` is OMITTED entirely for a nil (or blank) message —
         // never sent as `--message ""`. agents-cli's own flag validation
         // treats a blank flag VALUE as though the flag were never passed at
@@ -409,44 +461,42 @@ final class WorkspaceEngineCLI: WorkspaceEngineProviding {
             throw EngineError.failed("agents-cli workspace-land returned ok with no landed payload")
         }
 
-        // By this point the CLI envelope has already reported success: jj
-        // has advanced the bookmark server-side, irreversibly. A trash
-        // failure here is purely cosmetic (a leftover directory), so it must
-        // never turn a successful land into a thrown error — that would
-        // desync app state from reality (AppStore would treat the land as
-        // failed and keep sessions/rows around for a workspace jj no longer
-        // knows about). This is the deliberate ASYMMETRY with
-        // deleteWorkspace's trashItem above: forgetting a workspace is
-        // idempotent/retryable, so letting that one throw and leave a retry
-        // marker is safe; landing is not retryable, so the same treatment
-        // here would strand the app in a false "still needs landing" state.
-        let fm = FileManager.default
-        var cleanupWarning: String? = nil
-        if let cliWarning = envelope.warning {
-            // The CLI's own :warning means the final `jj workspace forget`
-            // failed, so jj STILL HAS this workspace registered pointing at
-            // workspace.path. Trashing the directory here would leave jj's
-            // registry referencing a path that no longer exists — a state
-            // strictly worse than a merely-undeleted folder, and one the
-            // user's own follow-up `jj workspace forget` (named in the
-            // message) would then be unable to clean up properly either.
-            // So the trash step is skipped entirely, not just its errors
-            // swallowed, and the CLI's own message — which already names the
-            // real workspace/project — is passed straight through.
-            cleanupWarning = cliWarning
-        } else if fm.fileExists(atPath: workspace.path) {
+        // By this point project progress has been published. The required
+        // workspace_retained field distinguishes a live registered workspace
+        // from ordinary cleanup warnings; never infer lifecycle from text.
+        var cleanupWarnings = envelope.warning.map { [$0] } ?? []
+        if payload.workspace_retained {
+            if cleanupWarnings.isEmpty {
+                cleanupWarnings.append(
+                    "Changes were added, but the workspace remains open at \(workspace.path)."
+                )
+            }
+        } else if FileManager.default.fileExists(atPath: workspace.path) {
             do {
-                try fm.trashItem(at: URL(fileURLWithPath: workspace.path), resultingItemURL: nil)
+                try trashWorkspaceDirectory(URL(fileURLWithPath: workspace.path))
             } catch {
-                cleanupWarning = "Changes were kept, but the workspace folder couldn't be moved to the Bin — it's still at \(workspace.path)"
+                cleanupWarnings.append(
+                    "Changes were kept, but the workspace folder couldn't be moved to the Bin — it's still at \(workspace.path)"
+                )
             }
         }
 
-        return LandResult(commitID: payload.commit_id, bookmark: payload.bookmark, cleanupWarning: cleanupWarning)
+        return LandResult(
+            commitID: payload.commit_id,
+            bookmark: payload.bookmark,
+            cleanupWarning: cleanupWarnings.isEmpty
+                ? nil
+                : cleanupWarnings.joined(separator: "\n"),
+            workspaceRetained: payload.workspace_retained
+        )
     }
 
-    func previewLand(_ workspace: WorkspaceRow) async throws -> LandPreview {
-        let envelope = try await run("workspace-land-preview", args: ["--project", workspace.projectPath, "--name", workspace.name])
+    func previewLand(_ workspace: WorkspaceRow, createTrunk: String?) async throws -> LandPreview {
+        var args = ["--project", workspace.projectPath, "--name", workspace.name]
+        if let createTrunk {
+            args += ["--create-trunk", createTrunk]
+        }
+        let envelope = try await run("workspace-land-preview", args: args)
         // workspace-land-preview always includes a preview payload on
         // success; a missing one here would mean the CLI contract was
         // violated (same reasoning as createWorkspace's workspace-payload
@@ -462,13 +512,18 @@ final class WorkspaceEngineCLI: WorkspaceEngineProviding {
                 )
             }
         }
+        let targetSnapshot = payload.target_snapshot
+        guard !targetSnapshot.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw EngineError.failed("agents-cli workspace-land-preview returned a blank target_snapshot")
+        }
         return LandPreview(
             bookmark: payload.bookmark,
             bookmarkCommit: payload.bookmark_commit,
             commits: commits(payload.commits),
             conflicts: commits(payload.conflicts),
             needsMessage: payload.needs_message,
-            diverging: commits(payload.diverging)
+            diverging: commits(payload.diverging),
+            targetSnapshot: targetSnapshot
         )
     }
 

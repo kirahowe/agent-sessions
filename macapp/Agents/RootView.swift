@@ -84,13 +84,10 @@ struct RootView: View {
             // `initial: true` and AgentsApp's appearanceMode `.onChange`.
             store.setAppActive(NSApp.isActive)
 
-            // Runs once at launch: a non-blocking informational check for
-            // babashka. Project-specific tools are resolved when a workspace
-            // operation runs, so a miss here only queues guidance.
-            let missing = ToolPreflight.missingTools()
-            if !missing.isEmpty {
-                uiState.missingToolsNotice = ToolPreflight.guidance(for: missing)
-            }
+            // Runs once at launch: a non-blocking informational check for the
+            // wrapper's global prerequisites. Project-specific version-control
+            // tools are still resolved when a workspace operation runs.
+            uiState.prerequisiteNotice = ToolPreflight.guidance(for: ToolPreflight.check())
         }
         // Feeds NSApplication's real active state into the store, in the
         // view layer for exactly the reason the Dock-badge `.onChange`
@@ -155,19 +152,19 @@ struct RootView: View {
             Text(store.lastError ?? "")
         }
         .alert(
-            "Some features need extra tools",
+            "Workspace prerequisites missing",
             isPresented: Binding(
-                get: { uiState.missingToolsNotice != nil },
+                get: { uiState.prerequisiteNotice != nil },
                 set: { isPresented in
-                    if !isPresented { uiState.missingToolsNotice = nil }
+                    if !isPresented { uiState.prerequisiteNotice = nil }
                 }
             )
         ) {
             Button("OK") {
-                uiState.missingToolsNotice = nil
+                uiState.prerequisiteNotice = nil
             }
         } message: {
-            Text(uiState.missingToolsNotice ?? "")
+            Text(uiState.prerequisiteNotice ?? "")
         }
     }
 }
@@ -281,21 +278,27 @@ private struct CloseWorkspaceView: View {
                 .keyboardShortcut(.defaultAction)
             }
 
-        case .projectSetupRequired:
+        case .projectSetupRequired(let changes, let needsMessage):
             Text("This project does not have shared progress yet. Set it up with these changes as the starting point?")
-            VStack(alignment: .leading, spacing: 8) {
-                Text("Add a summary for the starting changes:")
-                    .font(.callout)
-                TextField(
-                    "Change summary",
-                    text: Binding(
-                        get: { store.closeWorkspace?.summary ?? "" },
-                        set: { store.setCloseWorkspaceSummary($0) }
+            changeReview(changes)
+            if needsMessage {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Add a summary for the starting changes:")
+                        .font(.callout)
+                    TextField(
+                        "Change summary",
+                        text: Binding(
+                            get: { store.closeWorkspace?.summary ?? "" },
+                            set: { store.setCloseWorkspaceSummary($0) }
+                        )
                     )
-                )
-                .textFieldStyle(.roundedBorder)
+                    .textFieldStyle(.roundedBorder)
+                }
             }
             HStack {
+                Button("Close Without Adding…", role: .destructive) {
+                    store.requestCloseWithoutAdding()
+                }
                 Spacer()
                 Button("Cancel") {
                     store.cancelCloseWorkspace()
@@ -304,9 +307,10 @@ private struct CloseWorkspaceView: View {
                     Task { await store.setUpProjectAndCloseWorkspace() }
                 }
                 .disabled(
-                    presentation.summary
-                        .trimmingCharacters(in: .whitespacesAndNewlines)
-                        .isEmpty
+                    needsMessage
+                        && presentation.summary
+                            .trimmingCharacters(in: .whitespacesAndNewlines)
+                            .isEmpty
                 )
                 .keyboardShortcut(.defaultAction)
             }
@@ -318,6 +322,30 @@ private struct CloseWorkspaceView: View {
                     .foregroundStyle(.secondary)
             }
             doneButton()
+
+        case .workspaceRetained(let addedChanges, let notice):
+            Label(
+                addedChanges.map {
+                    $0 == 1
+                        ? "1 change added. Workspace remains open."
+                        : "\($0) changes added. Workspace remains open."
+                } ?? "Changes added. Workspace remains open.",
+                systemImage: "exclamationmark.triangle.fill"
+            )
+            .font(.headline)
+            .foregroundStyle(.orange)
+            Text("This workspace needs attention before it can close.")
+            if let notice {
+                Text(notice)
+                    .foregroundStyle(.secondary)
+            }
+            HStack {
+                Spacer()
+                Button("Return to Workspace") {
+                    store.cancelCloseWorkspace()
+                }
+                .keyboardShortcut(.defaultAction)
+            }
 
         case .projectAttention(let addedChanges, let notice):
             successSummary(addedChanges: addedChanges)

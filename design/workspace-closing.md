@@ -32,6 +32,9 @@ the workspace, and explains that its changes need attention.
    into a failure.
 6. Concurrent repository activity must not be lost by speculative previews or
    rollback of unrelated operations.
+7. Every terminal rooted in the workspace is stopped before the engine begins
+   a land or forget operation. Rows and resume metadata remain intact until the
+   engine confirms whether the workspace was removed.
 
 ## Experience
 
@@ -77,14 +80,38 @@ The app and Xcode release builds bundle only the thin wrapper, so they continue
 to compile without the local checkout. In that environment workspace operations
 are unavailable and the wrapper returns its single JSON error envelope rather
 than a stack trace. Repository and copied-script integration tests point
-`WORKSTREAM_MANAGER_ROOT` at a checkout. CI without one skips only real
-workspace-engine integration cases; pure Swift envelope decoding and unrelated
-tests remain active.
+`WORKSTREAM_MANAGER_ROOT` at a provisioned checkout. CI provisions that
+checkout and runs integration tests in required mode: an unavailable checkout,
+missing dependency, or skipped manager case fails the build rather than reducing
+coverage.
 
 The app-facing CLI remains a stable JSON subprocess boundary. It delegates
 workspace creation, listing, forgetting, previewing, and landing to
 `workstream-manager`, adding only app-specific defaults such as the `agents`
 namespace if the library does not already provide them.
+
+Every successful land payload includes a required workspace_retained boolean.
+The app removes sessions and rows only when it is false; when it is true, the
+workspace remains open and its terminals are recreated with their resume hints.
+Every successful preview also carries an opaque snapshot of the exact target and
+preferred project progress used to compute its change list. The application
+retains that value with the prepared sheet without presenting it to the user.
+Before any land, the app frees the workspace's terminal surfaces, supplies the
+manager's explicit quiesced-finalization flag, and round-trips the preview
+snapshot. The manager rechecks that exact state after quiescence and before its
+first mutation. If either workspace or preferred project progress changed, it
+refuses the stale application; Agents preserves all rows and persistence,
+resumes the sessions with their saved OMP metadata, clears any summary written
+for the stale preview, and immediately prepares the current project-oriented
+change list.
+
+A no-changes preview is advisory rather than deletion authorization. After
+quiescing terminals, the app asks the manager to forget only if the workspace is
+still unchanged; a race-time change preserves the workspace, resumes its
+sessions, and refreshes the sheet with the new changes. Only the separately
+confirmed **Close Without Adding** path uses an explicitly destructive forget.
+Any forget failure leaves all live and persisted app state intact, while local
+folder cleanup after manager success is only a non-fatal notice.
 
 Speculative Jujutsu conflict checks must not perform a repository-wide
 `jj op restore` after temporarily integrating a rebase. Use an unintegrated
