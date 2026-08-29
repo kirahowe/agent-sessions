@@ -22,6 +22,8 @@ final class UIState: ObservableObject {
 @main
 struct AgentsApp: App {
     let center: TerminalCenter
+    let overlays: OverlayCenter
+    let controlServer: ControlServer
     let actions: AppActions
     let router: ShortcutRouter
     let uiState: UIState
@@ -33,6 +35,18 @@ struct AgentsApp: App {
     init() {
         let center = TerminalCenter()
         self.center = center
+
+        // The overlay owner and its control channel are constructed here, and
+        // the socket starts listening immediately: a review can be requested
+        // by any session the moment that session exists, and a session can
+        // exist before the window is on screen (restored rows spawn eagerly).
+        // Binding later — in RootView's .task, say — would leave a window
+        // where the launcher finds no socket and reports the app as absent.
+        let overlays = OverlayCenter()
+        self.overlays = overlays
+        let controlServer = ControlServer(overlays: overlays)
+        self.controlServer = controlServer
+        controlServer.start()
         let store = AppStore(terminals: center, stateURL: AppStore.defaultStateURL)
         _store = StateObject(wrappedValue: store)
 
@@ -84,7 +98,7 @@ struct AgentsApp: App {
         // or show a blank surface. Don't revert this to WindowGroup without
         // first making TerminalCenter's cache window-aware.
         Window("Agents", id: "main") {
-            RootView(store: store, center: center, uiState: uiState)
+            RootView(store: store, center: center, overlays: overlays, uiState: uiState)
                 .environment(\.appActions, actions)
                 // Forced explicitly rather than left to the asset catalog
                 // alone: ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME (set

@@ -1,0 +1,233 @@
+import Darwin
+import Foundation
+
+/// A tiny local control channel: a Unix domain socket that lets a process
+/// running *inside* one of this app's terminals ask the app to do something
+/// that process cannot do for itself.
+///
+/// Exactly one verb today — `overlay-run`, which drives `OverlayCenter` on
+/// behalf of the revdiff launcher. See that type for why a review TUI cannot
+/// simply draw into the terminal that asked for it.
+///
+/// Why a Unix socket rather than the two obvious alternatives:
+///
+/// - **AppleScript** is what stock Ghostty and iTerm2 expose, and what
+///   revdiff's bundled launcher reaches for. It would mean shipping an
+///   `.sdef`, and it drags in TCC: the first call raises an Automation
+///   consent prompt, and Claude Code's own sandbox blocks Apple Events
+///   outright unless the launcher is added to `excludedCommands`. A socket
+///   needs none of that.
+/// - **A URL scheme** (`open agents://…`) is less code here, but LaunchServices
+///   resolves a scheme to *one* bundle, so the Debug and Release builds —
+///   which deliberately differ only by bundle id — would fight over it, and a
+///   review fired from the dev build could surface in the release app. It is
+///   also fire-and-forget, with no way to report completion.
+///
+/// The socket path carries the bundle id, so each build gets its own endpoint,
+/// and the path is stamped into every session's environment as
+/// `AGENTS_CONTROL_SOCK` (see `TerminalCenter.sessionEnvVars`). A client
+/// therefore always reaches the app instance that owns the very terminal it is
+/// running in, with no discovery, no guessing, and no cross-build mixups.
+///
+/// The connection is the completion signal: the server holds it open for the
+/// life of the overlay and writes its reply only once the command has exited.
+/// A caller blocks on a socket read instead of polling for a sentinel file,
+/// and a caller that dies takes nothing with it.
+final class ControlServer: @unchecked Sendable {
+    /// Absolute path of this build's socket.
+    ///
+    /// `sockaddr_un.sun_path` is 104 bytes on Darwin, which is the real
+    /// constraint on where this can live; Application Support keeps it well
+    /// inside that with room for the longest bundle id in use.
+    static let socketPath: String = {
+        let base = FileManager.default.urls(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask
+        ).first ?? URL(fileURLWithPath: NSHomeDirectory())
+        let directory = base.appendingPathComponent("Agents", isDirectory: true)
+        try? FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true
+        )
+        let bundleID = Bundle.main.bundleIdentifier ?? "com.kirahowe.agents"
+        return directory.appendingPathComponent("\(bundleID).control.sock").path
+    }()
+
+    private struct Request: Decodable {
+        let cmd: String
+        let command: String?
+        let cwd: String?
+    }
+
+    private let overlays: OverlayCenter
+    private let queue = DispatchQueue(label: "com.kirahowe.agents.control")
+    private var listenFD: Int32 = -1
+    private var acceptSource: DispatchSourceRead?
+
+    /// The client waiting on the live overlay, if any. Only ever touched on
+    /// the main actor, alongside the `OverlayCenter` state it mirrors, so the
+    /// "is an overlay running" question has exactly one answer rather than two
+    /// that can disagree.
+    @MainActor private var pendingClientFD: Int32?
+
+    init(overlays: OverlayCenter) {
+        self.overlays = overlays
+    }
+
+    @MainActor
+    func start() {
+        overlays.onFinished = { [weak self] _ in
+            self?.completePending(ok: true, error: nil)
+        }
+        queue.async { [weak self] in self?.bindAndListen() }
+    }
+
+    // MARK: - Socket setup
+
+    private func bindAndListen() {
+        let path = Self.socketPath
+        // A socket file outlives a crash, and bind(2) will not reuse one, so
+        // clearing a stale entry here is what makes the app restartable
+        // without the user ever seeing "address already in use".
+        unlink(path)
+
+        let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+        guard fd >= 0 else {
+            NSLog("ControlServer: socket() failed: \(String(cString: strerror(errno)))")
+            return
+        }
+
+        var addr = sockaddr_un()
+        addr.sun_family = sa_family_t(AF_UNIX)
+        let pathBytes = Array(path.utf8)
+        guard pathBytes.count < MemoryLayout.size(ofValue: addr.sun_path) else {
+            NSLog("ControlServer: socket path too long: \(path)")
+            close(fd)
+            return
+        }
+        withUnsafeMutableBytes(of: &addr.sun_path) { raw in
+            raw.copyBytes(from: pathBytes)
+        }
+
+        let size = socklen_t(MemoryLayout<sockaddr_un>.size)
+        let bound = withUnsafePointer(to: &addr) { pointer in
+            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                bind(fd, sa, size)
+            }
+        }
+        guard bound == 0 else {
+            NSLog("ControlServer: bind() failed: \(String(cString: strerror(errno)))")
+            close(fd)
+            return
+        }
+
+        // Owner-only: the socket grants the ability to run a command in this
+        // app, so it must not be reachable by other users on the machine.
+        chmod(path, S_IRUSR | S_IWUSR)
+
+        guard listen(fd, 8) == 0 else {
+            NSLog("ControlServer: listen() failed: \(String(cString: strerror(errno)))")
+            close(fd)
+            return
+        }
+
+        listenFD = fd
+        let source = DispatchSource.makeReadSource(fileDescriptor: fd, queue: queue)
+        source.setEventHandler { [weak self] in self?.acceptOne() }
+        source.resume()
+        acceptSource = source
+    }
+
+    private func acceptOne() {
+        let client = accept(listenFD, nil, nil)
+        guard client >= 0 else { return }
+        // Each connection is served off the accept queue: a request blocks
+        // for as long as its review is open, which would otherwise stall
+        // every later connection behind it.
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            self?.serve(client: client)
+        }
+    }
+
+    // MARK: - Request handling
+
+    private func serve(client: Int32) {
+        guard let line = readLine(from: client), !line.isEmpty else {
+            close(client)
+            return
+        }
+        guard let request = try? JSONDecoder().decode(Request.self, from: Data(line.utf8)) else {
+            reply(to: client, ok: false, error: "malformed request", closing: true)
+            return
+        }
+        guard request.cmd == "overlay-run" else {
+            reply(to: client, ok: false, error: "unknown cmd: \(request.cmd)", closing: true)
+            return
+        }
+        guard let command = request.command, !command.isEmpty else {
+            reply(to: client, ok: false, error: "missing command", closing: true)
+            return
+        }
+        let cwd = request.cwd ?? NSHomeDirectory()
+
+        Task { @MainActor [weak self] in
+            guard let self else {
+                close(client)
+                return
+            }
+            guard self.pendingClientFD == nil else {
+                self.reply(to: client, ok: false, error: "a review is already open", closing: true)
+                return
+            }
+            do {
+                _ = try self.overlays.present(command: command, workingDirectory: cwd)
+                // No reply yet — the overlay is live, and this connection is
+                // the thing the caller is blocked on. `completePending` answers
+                // it when the command exits.
+                self.pendingClientFD = client
+            } catch {
+                self.reply(to: client, ok: false, error: "a review is already open", closing: true)
+            }
+        }
+    }
+
+    @MainActor
+    private func completePending(ok: Bool, error: String?) {
+        guard let client = pendingClientFD else { return }
+        pendingClientFD = nil
+        reply(to: client, ok: ok, error: error, closing: true)
+    }
+
+    private func reply(to client: Int32, ok: Bool, error: String?, closing: Bool) {
+        var payload: [String: Any] = ["ok": ok]
+        if let error { payload["error"] = error }
+        let data = (try? JSONSerialization.data(withJSONObject: payload))
+            ?? Data(#"{"ok":false}"#.utf8)
+        var line = data
+        line.append(0x0A)
+        line.withUnsafeBytes { raw in
+            var sent = 0
+            while sent < raw.count {
+                let n = write(client, raw.baseAddress!.advanced(by: sent), raw.count - sent)
+                if n <= 0 { break }
+                sent += n
+            }
+        }
+        if closing { close(client) }
+    }
+
+    /// Reads one newline-terminated request. Capped because this socket takes
+    /// a single small JSON object and nothing else — an unbounded read here
+    /// would let any local process grow the app's memory at will.
+    private func readLine(from fd: Int32, limit: Int = 64 * 1024) -> String? {
+        var bytes: [UInt8] = []
+        var byte: UInt8 = 0
+        while bytes.count < limit {
+            let n = read(fd, &byte, 1)
+            if n <= 0 { return bytes.isEmpty ? nil : String(decoding: bytes, as: UTF8.self) }
+            if byte == 0x0A { break }
+            bytes.append(byte)
+        }
+        return String(decoding: bytes, as: UTF8.self)
+    }
+}

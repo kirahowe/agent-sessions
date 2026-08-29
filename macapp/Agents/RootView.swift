@@ -5,6 +5,7 @@ import SwiftUI
 struct RootView: View {
     @ObservedObject var store: AppStore
     let center: TerminalCenter
+    @ObservedObject var overlays: OverlayCenter
     @ObservedObject var uiState: UIState
     @State private var isDashboardPresented = true
 
@@ -40,9 +41,13 @@ struct RootView: View {
             // a live TerminalView blanks its Metal surface. The empty state
             // is an overlay on top, never a conditional swap.
             ZStack {
-                TerminalHostView(store: store, center: center)
+                TerminalHostView(store: store, center: center, overlays: overlays)
 
-                if store.selection == nil {
+                // Suppressed while a review is open: the empty state is a
+                // ZStack sibling layered ON TOP of the terminal host, so
+                // without this it would paint over a full-pane review in the
+                // one case where a review can run with nothing selected.
+                if store.selection == nil, overlays.activeID == nil {
                     VStack(spacing: 12) {
                         Image(systemName: "terminal")
                             .font(.system(size: 48))
