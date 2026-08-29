@@ -27,6 +27,64 @@ The generated `macapp/Agents.xcodeproj` and build output under `macapp/.build`
 are gitignored — `bb gen` regenerates the project from `macapp/project.yml`
 whenever you need it.
 
+## Workspaces
+
+A workspace is an isolated draft of a project: agents read, write, and run
+commands in it without touching the project's own files. Create one with
+**New Workspace** (⌘N) from the File menu, or from a project's header menu —
+either way you pick the project and can set an optional sidebar label. It
+lives on disk at `<project>/workspaces/<generated-name>` (the label is
+sidebar-only; it never renames the workspace), and it's a jj workspace or a
+git worktree depending on the project, detected automatically — a colocated
+jj/git repo is treated as jj. Each workspace keeps its own sessions in the
+sidebar, nested underneath it.
+
+### Closing a workspace
+
+**Close Workspace…**, on a workspace row's context menu (or its ellipsis
+button), or on the File menu for the selected session's workspace, opens one
+sheet that covers every outcome:
+
+- With changes to add, the sheet lists them in plain language and offers
+  **Add Changes & Close** — add the draft to the project's shared progress,
+  then remove the workspace — or the destructive **Close Without Adding…**,
+  which asks once more before it proceeds.
+- If some of those changes are undescribed, the sheet asks for a one-line
+  summary before it will add them.
+- With nothing to add, it just offers **Close Workspace** and **Cancel**.
+- If the changes overlap newer project progress, the sheet changes nothing.
+  It says the changes need attention and offers **Return to Workspace** or
+  **Close Without Adding…** — it never offers an add it already knows would
+  fail.
+- If the project has no shared progress yet — a brand-new repo — the sheet
+  offers to set the project up with these changes as its starting point.
+- Rarely, the app adds the changes but new work arrives in the workspace
+  while it's closing, so it keeps the workspace open and says so; close it
+  again once you're ready.
+
+Closing stops every session in that workspace before anything changes, because
+the workspace's files are about to be rewritten out from under them. The sheet
+tells you how many sessions it will stop. If the close is refused — an overlap,
+or the workspace changing mid-flight — the sessions come back as fresh shells;
+a session that was running an agent prints its resume command (see "Resuming
+agent sessions after a restart" below).
+
+After a successful add, the app also brings the project root's own unlanded
+work up to date with the new progress, automatically — but only when no
+sessions are open there, since updating it any other time would rewrite files
+out from under a running agent. When it can't reconcile automatically, the
+project header shows an orange triangle and its menu offers **Refresh Project
+Workspace** instead. Nothing is lost either way, and other open workspaces are
+never rewritten by someone else's close — each one reconciles with the latest
+progress on its own, the next time it closes.
+
+For the curious: adding changes means, under jj, rebasing the workspace's
+commits onto trunk and moving the trunk bookmark; under git, rebasing the
+`agents/<name>` branch and fast-forwarding trunk. Closing without adding just
+deregisters the workspace and moves its folder to the Bin — the commits stay
+in the repository's history (jj) or on the `agents/<name>` branch (git), so
+they're recoverable by hand.
+
 ## Resuming agent sessions after a restart
 
 The app remembers the last agent session associated with each terminal,

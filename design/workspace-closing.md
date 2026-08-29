@@ -26,15 +26,21 @@ the workspace, and explains that its changes need attention.
 3. Active workspaces retain stable files and history while sibling workspaces
    close.
 4. Reconciliation with newer project progress is automatic and lazy.
-5. The project working copy follows newly integrated progress silently when it
-   can do so without conflict. An overlap preserves its work and becomes a
-   non-fatal attention state; it never retroactively turns a successful close
-   into a failure.
+5. The project working copy follows newly integrated progress automatically
+   only while no session is open in the project root, and only when it can do
+   so without conflict. A root session's files must not change underneath it,
+   exactly as invariant 3 protects sibling workspaces. Otherwise the project
+   is flagged for attention and the user brings it up to date from the project
+   menu. Neither a deferral nor an overlap retroactively turns a successful
+   close into a failure.
 6. Concurrent repository activity must not be lost by speculative previews or
    rollback of unrelated operations.
 7. Every terminal rooted in the workspace is stopped before the engine begins
-   a land or forget operation. Rows and resume metadata remain intact until the
-   engine confirms whether the workspace was removed.
+   a land or forget operation. Stopping ends the process, so the sheet states
+   that cost before the user commits to it, and a refused operation brings each
+   session back as a fresh shell with its saved resume hint. Rows and resume
+   metadata remain intact until the engine confirms whether the workspace was
+   removed.
 
 ## Experience
 
@@ -54,16 +60,32 @@ hashes, clean-conflict checkmarks, divergence warnings, or instructions to
 rebase. If undescribed working-copy changes need a summary, the sheet asks for
 one only in that case.
 
+Because the workspace's files are about to be rewritten, either operation
+first stops every session in the workspace. The sheet says how many sessions
+it will stop; a session that comes back after a refused close prints its
+resume hint.
+
 A workspace with no changes offers **Close Workspace** and **Cancel**.
+
+A project with no shared progress yet is offered **Set Up Project & Close**,
+which establishes the project's starting progress from these changes. The
+trunk name the engine creates for that (`main`) is an engine default the sheet
+never shows.
 
 If changes overlap newer project progress, the attempted add changes nothing
 and leaves the workspace open. The result explains that the changes need
 attention and offers **Return to Workspace** plus the separately destructive
 **Close Without Adding…** path. It never offers an add action known to fail.
 
-The sheet remains present while preparing, adding, and closing. Success may
-briefly report the number of changes added before the workspace row collapses.
-There is no second rebase dialog.
+If new work reaches the workspace while its changes are being added, the
+changes are still added but the workspace stays open: the sheet says so and
+offers **Return to Workspace**, and closing it again reviews only the newer
+work.
+
+The sheet remains present while preparing, adding, and closing. Success reports
+the number of changes added and any follow-up notice, and dismisses on
+**Done**; the workspace row is removed the moment the engine confirms the
+close. There is no second rebase dialog.
 
 ## Integration design
 
@@ -73,8 +95,13 @@ published, the thin `agents-cli` wrapper temporarily adds the external
 checkout's `src` directory to Babashka's classpath, resolving the checkout from
 a nonblank `WORKSTREAM_MANAGER_ROOT` or from
 `~/code/projects/workstream-manager` by default. The external checkout remains
-the source of truth; once the library is published, replace only this bootstrap
-with the published library coordinate.
+the source of truth. The next step is vendoring rather than publishing:
+Babashka git dependencies need a JVM to resolve, which these machines do not
+have, and Jujutsu makes git submodules awkward. A `bb vendor` task will copy
+`src/wsm` at a pinned commit into a bundled resource directory that the wrapper
+falls back to when `WORKSTREAM_MANAGER_ROOT` is unset and the default checkout
+is absent, so release builds carry workspace features without a sibling
+checkout. Only this bootstrap changes when that lands.
 
 The app and Xcode release builds bundle only the thin wrapper, so they continue
 to compile without the local checkout. In that environment workspace operations
@@ -122,9 +149,11 @@ change after a preview.
 
 Other agent workspaces are not rebased after a successful close; their future
 land operation already reconciles them with current project progress. The
-project working copy is reconciled automatically and silently. A conflict is
-reported as structured, non-fatal follow-up attention while the workspace close
-itself remains successful.
+project working copy is reconciled automatically only while no root session is
+open; with a root session live the app defers, flags the project, and leaves
+reconciliation to the project menu's manual refresh, which is never gated. A
+conflict or a deferral is reported as structured, non-fatal follow-up
+attention while the workspace close itself remains successful.
 
 ## Delivery sequence
 
