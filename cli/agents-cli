@@ -1,5 +1,8 @@
 #!/usr/bin/env bb
 
+;; Temporary delegation to wsm.cli: use a nonblank override or default root,
+;; and own one JSON envelope. Dependency failures are normalized here;
+;; Exception and Error are caught explicitly.
 (require '[babashka.classpath :as classpath]
          '[cheshire.core :as json]
          '[clojure.string :as str])
@@ -33,5 +36,7 @@
     (if-let [main (resolve 'wsm.cli/-main)]
       (main *command-line-args*)
       (throw (ex-info "wsm.cli/-main is unavailable" {})))
-    (catch Throwable throwable
+    (catch Exception throwable
+      (emit-dependency-error! root throwable))
+    (catch Error throwable
       (emit-dependency-error! root throwable))))

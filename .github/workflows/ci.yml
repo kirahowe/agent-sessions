@@ -17,8 +17,16 @@ jobs:
       # warning/embedding "(no email configured)" in test commits.
       JJ_USER: ci
       JJ_EMAIL: ci@invalid.example
+      AGENTS_REQUIRE_TOOLS: "1"
+      WORKSTREAM_MANAGER_ROOT: ${{ github.workspace }}/.ci/workstream-manager
     steps:
       - uses: actions/checkout@v4
+
+      - name: Checkout workstream-manager
+        uses: actions/checkout@v4
+        with:
+          repository: kirahowe/workstream-manager
+          path: .ci/workstream-manager
 
       - name: Install tools
         # macos-26 runners are arm64, so brew lands these in
@@ -30,14 +38,16 @@ jobs:
         run: bb cli-test
 
       - name: App tests
-        # AGENTS_REQUIRE_TOOLS turns WorkspaceEngineCLITests' XCTSkips into
-        # hard failures: on CI a missing tool is a configuration bug, and a
-        # skip would silently drop the only Swift<->CLI integration
-        # coverage. Set twice because xcodebuild's test host does not
-        # reliably inherit the shell environment — the TEST_RUNNER_ prefix
-        # is xcodebuild's supported channel for injecting env vars into the
-        # test process (prefix stripped on delivery).
+        # AGENTS_REQUIRE_TOOLS turns integration dependency XCTSkips into
+        # hard failures: on CI a missing tool or manager checkout is a
+        # configuration bug that would silently drop Swift<->CLI coverage.
+        # Set each value twice because xcodebuild's test host does not reliably
+        # inherit the shell environment — the TEST_RUNNER_ prefix is its
+        # supported channel for injecting env vars into the test process
+        # (prefix stripped on delivery).
         env:
           AGENTS_REQUIRE_TOOLS: "1"
           TEST_RUNNER_AGENTS_REQUIRE_TOOLS: "1"
+          WORKSTREAM_MANAGER_ROOT: ${{ github.workspace }}/.ci/workstream-manager
+          TEST_RUNNER_WORKSTREAM_MANAGER_ROOT: ${{ github.workspace }}/.ci/workstream-manager
         run: bb test

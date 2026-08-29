@@ -9,11 +9,24 @@
 
 (def ^:private cli-dir (fs/parent (fs/absolutize *file*)))
 (def ^:private cli-path (str (fs/path cli-dir "agents-cli")))
-(def ^:private manager-root
+(def ^:private skipped-integration-cases (atom []))
+
+(defn- default-manager-root []
   (fs/path (System/getProperty "user.home") "code" "projects"
            "workstream-manager"))
-(def ^:private manager-entrypoint
-  (fs/path manager-root "src" "wsm" "cli.clj"))
+
+(defn- manager-root []
+  (let [configured-root (some-> (System/getenv "WORKSTREAM_MANAGER_ROOT")
+                                str/trim)]
+    (if (seq configured-root)
+      (fs/path configured-root)
+      (default-manager-root))))
+
+(defn- skip-integration! [case-name]
+  (swap! skipped-integration-cases conj case-name))
+
+(defn- integrations-required? []
+  (= "1" (System/getenv "AGENTS_REQUIRE_TOOLS")))
 
 (defn- run-process!
   ([args]
@@ -46,19 +59,20 @@
     (assoc result :json (json/parse-string (str/trim out) true))))
 
 (defn- run-cli-at! [script & args]
-  (apply run-cli-at-with-manager! script manager-root args))
+  (apply run-cli-at-with-manager! script (manager-root) args))
 
 (defn- run-cli! [& args]
   (apply run-cli-at! cli-path args))
 
-(defn- manager-checkout-available? []
-  (fs/regular-file? manager-entrypoint))
+(defn- manager-checkout-available? [root]
+  (fs/regular-file? (fs/path root "src" "wsm" "cli.clj")))
 
-(defmacro deftest-with-manager [name & body]
+(defmacro ^{:private true :clj-kondo/lint-as 'clojure.test/deftest}
+  deftest-with-manager [name & body]
   `(deftest ~name
-     (if (manager-checkout-available?)
+     (if (manager-checkout-available? (manager-root))
        (do ~@body)
-       (is true "Skipped: local workstream-manager checkout is unavailable"))))
+       (skip-integration! ~(str name)))))
 
 (defn- cleanup! [root]
   (try
@@ -104,10 +118,9 @@
         :out
         str/trim)))
 
-
 (deftest wrapper-contract-and-packaged-layout-test
   (testing "repository and copied scripts resolve workstream-manager from WORKSTREAM_MANAGER_ROOT"
-    (if (manager-checkout-available?)
+    (if (manager-checkout-available? (manager-root))
       (let [root (fs/create-temp-dir)]
         (try
           (let [packaged-cli (str (fs/path root "agents-cli"))]
@@ -117,7 +130,7 @@
                                     ["copied script" packaged-cli]]]
               (testing label
                 (let [{:keys [exit json]}
-                      (run-cli-at-with-manager! script manager-root
+                      (run-cli-at-with-manager! script (manager-root)
                                                 "not-a-command")]
                   (is (= 1 exit))
                   (is (false? (:ok json)))
@@ -125,7 +138,8 @@
                   (is (string? (get-in json [:error :message])))))))
           (finally
             (cleanup! root))))
-      (is true "Skipped: local workstream-manager checkout is unavailable")))
+      (skip-integration!
+       "wrapper-contract-and-packaged-layout-test / packaged layout")))
   (testing "a missing local dependency emits one JSON error envelope"
     (let [root (fs/create-temp-dir)]
       (try
@@ -139,6 +153,67 @@
                              (str missing-root))))
         (finally
           (cleanup! root))))))
+
+(deftest wrapper-error-envelope-isolation-test
+  (let [root (fs/create-temp-dir)]
+    (try
+      (let [missing-root (str (fs/path root "missing"))
+            copied (str (fs/path root "agents-cli"))
+            manager (str (fs/path root "manager"))
+            source (fs/path manager "src" "wsm")]
+        (fs/copy cli-path copied)
+        (.setExecutable (java.io.File. copied) true)
+        (doseq [[label script] [["repository" cli-path] ["copied" copied]]]
+          (testing (str label " missing dependency")
+            (let [{:keys [exit out err] :as result}
+                  (run-process! [script "not-a-command"]
+                                {:env (assoc (into {} (System/getenv))
+                                             "WORKSTREAM_MANAGER_ROOT" missing-root)})]
+              (is (= 1 exit))
+              (is (re-matches #"[^\r\n]+\r?\n" out))
+              (is (not (re-find #"(?m)Exception|AssertionError|at " err)))
+              (is (= "dependency-unavailable"
+                     (get-in (assoc result :json
+                                    (json/parse-string (str/trim out) true))
+                             [:json :error :code]))))))
+        (fs/create-dirs source)
+        (spit (str (fs/path source "cli.clj"))
+              "(ns wsm.cli)\n(defn -main [_] (throw (AssertionError. \"boom\")))\n")
+        (let [{:keys [exit out err]}
+              (run-process! [cli-path "not-a-command"]
+                            {:env (assoc (into {} (System/getenv))
+                                         "WORKSTREAM_MANAGER_ROOT" manager)})]
+          (is (= 1 exit))
+          (is (re-matches #"[^\r\n]+\r?\n" out))
+          (is (not (re-find #"(?m)Exception|AssertionError|at " err)))
+          (is (= "dependency-unavailable"
+                 (get-in (json/parse-string (str/trim out) true) [:error :code])))))
+      (finally
+        (cleanup! root)))))
+
+(deftest-with-manager default-manager-root-fallback-test
+  (let [root (fs/create-temp-dir)
+        home (fs/path root "home")
+        fallback-root (fs/path home "code" "projects"
+                               "workstream-manager")]
+    (try
+      (fs/create-dirs (fs/parent fallback-root))
+      (fs/create-sym-link fallback-root (manager-root))
+      (doseq [[label environment]
+              [["unset" (dissoc (into {} (System/getenv))
+                                "WORKSTREAM_MANAGER_ROOT")]
+               ["whitespace" (assoc (into {} (System/getenv))
+                                    "WORKSTREAM_MANAGER_ROOT" "  ")]]]
+        (testing label
+          (let [{:keys [exit out]}
+                (run-process! ["bb" (str "-Duser.home=" home) cli-path
+                               "not-a-command"]
+                              {:env environment})
+                envelope (json/parse-string (str/trim out) true)]
+            (is (= 1 exit))
+            (is (= "bad-args" (get-in envelope [:error :code]))))))
+      (finally
+        (cleanup! root)))))
 
 (deftest-with-manager jj-consumer-flow-test
   (testing "the wrapper creates, previews, and lands a representative jj workspace"
@@ -163,25 +238,33 @@
                  "workspace-land-preview jj consumer"
                  (run-cli! "workspace-land-preview" "--project" project
                            "--name" "jj-consumer"))
-                preview (:preview preview-json)]
+                preview (:preview preview-json)
+                target-snapshot (:target_snapshot preview)]
             (is (= 0 preview-exit))
             (is (= "jj" (:vcs preview)))
             (is (= ["jj consumer change"] (mapv :subject (:commits preview))))
             (is (= [] (:conflicts preview)))
-            (is (false? (:needs_message preview))))
-          (let [{land-exit :exit land-json :json}
-                (require-cli-success
-                 "workspace-land jj consumer"
-                 (run-cli! "workspace-land" "--project" project
-                           "--name" "jj-consumer"))
-                show-result
-                (run-process!
-                 ["jj" "--ignore-working-copy" "--no-pager" "-R" project
-                  "file" "show" "-r" "main" "root:\"consumer.txt\""])
-                shown (:out (require-success "jj show landed file" show-result))]
-            (is (= 0 land-exit))
-            (is (true? (:ok land-json)))
-            (is (= "jj consumer\n" shown))))
+            (is (false? (:needs_message preview)))
+            (is (seq target-snapshot))
+            (let [{land-exit :exit land-json :json}
+                  (require-cli-success
+                   "workspace-land jj consumer"
+                   (run-cli! "workspace-land" "--project" project
+                             "--name" "jj-consumer"
+                             "--expected-snapshot" target-snapshot))
+                  rebase-result
+                  (require-cli-success "rebase-onto-trunk jj consumer"
+                                       (run-cli! "rebase-onto-trunk" "--project" project))
+                  show-result
+                  (run-process!
+                   ["jj" "--ignore-working-copy" "--no-pager" "-R" project
+                    "file" "show" "-r" "main" "root:\"consumer.txt\""])
+                  shown (:out (require-success "jj show landed file" show-result))]
+              (is (= 0 land-exit))
+              (is (= 0 (:exit rebase-result)))
+              (is (= 0 (get-in rebase-result [:json :rebased :count])))
+              (is (true? (:ok land-json)))
+              (is (= "jj consumer\n" shown)))))
         (finally
           (cleanup! root))))))
 
@@ -210,25 +293,33 @@
                  "workspace-land-preview git consumer"
                  (run-cli! "workspace-land-preview" "--project" project
                            "--name" "git-consumer"))
-                preview (:preview preview-json)]
+                preview (:preview preview-json)
+                target-snapshot (:target_snapshot preview)]
             (is (= 0 preview-exit))
             (is (= "git" (:vcs preview)))
             (is (= ["git consumer change"] (mapv :subject (:commits preview))))
             (is (= [] (:conflicts preview)))
-            (is (false? (:needs_message preview))))
-          (let [{land-exit :exit land-json :json}
-                (require-cli-success
-                 "workspace-land git consumer"
-                 (run-cli! "workspace-land" "--project" project
-                           "--name" "git-consumer"))]
-            (is (= 0 land-exit))
-            (is (true? (:ok land-json)))
-            (is (= (get-in land-json [:landed :commit_id])
-                   (git-line! project "rev-parse" "main")))
-            (is (= "git consumer\n"
-                   (:out (require-success
-                          "git show landed file"
-                          (run-git! project "show" "main:consumer.txt")))))))
+            (is (false? (:needs_message preview)))
+            (is (seq target-snapshot))
+            (let [{land-exit :exit land-json :json}
+                  (require-cli-success
+                   "workspace-land git consumer"
+                   (run-cli! "workspace-land" "--project" project
+                             "--name" "git-consumer"
+                             "--expected-snapshot" target-snapshot))
+                  rebase-result
+                  (require-cli-success "rebase-onto-trunk git consumer"
+                                       (run-cli! "rebase-onto-trunk" "--project" project))]
+              (is (= 0 land-exit))
+              (is (= 0 (:exit rebase-result)))
+              (is (= 0 (get-in rebase-result [:json :rebased :count])))
+              (is (true? (:ok land-json)))
+              (is (= (get-in land-json [:landed :commit_id])
+                     (git-line! project "rev-parse" "main")))
+              (is (= "git consumer\n"
+                     (:out (require-success
+                            "git show landed file"
+                            (run-git! project "show" "main:consumer.txt"))))))))
         (finally
           (cleanup! root))))))
 
@@ -265,7 +356,9 @@
         (finally
           (cleanup! root))))))
 
-
-(let [{:keys [fail error] :as results} (run-tests 'test-agents-cli)]
+(let [{:keys [fail error] :as results} (run-tests 'test-agents-cli)
+      skipped @skipped-integration-cases
+      skipped-required? (and (integrations-required?) (seq skipped))]
   (println "SUMMARY:" (pr-str results))
-  (System/exit (if (or (pos? fail) (pos? error)) 1 0)))
+  (println "SKIPPED INTEGRATION CASES:" (count skipped) (pr-str skipped))
+  (System/exit (if (or (pos? fail) (pos? error) skipped-required?) 1 0)))

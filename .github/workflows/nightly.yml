@@ -108,7 +108,9 @@ jobs:
             echo
             echo "Unsigned build: on first launch macOS will require"
             echo "System Settings > Privacy & Security > Open Anyway."
-            echo "Requires bb and jj for workspace features (the app guides you)."
+            echo "Workspace features require bb plus jj or git."
+            echo "The app also needs a local workstream-manager checkout at"
+            echo "~/code/projects/workstream-manager."
           } > notes.md
           gh release delete nightly --yes --cleanup-tag 2>/dev/null || true
           gh release create nightly "Agents-nightly-b${BUILD}.zip" appcast-dir/appcast.xml \

@@ -9,6 +9,10 @@ terminals (running your actual login shell) in the detail area.
 - Xcode (macOS 15+ deployment target)
 - [XcodeGen](https://github.com/yonaskolb/XcodeGen): `brew install xcodegen`
 - [Babashka](https://babashka.org/): `brew install borkdude/brew/babashka`
+- Temporary local checkout of
+  [workstream-manager](https://github.com/kirahowe/workstream-manager) at
+  `$HOME/code/projects/workstream-manager` (until the dependency is
+  published). Set `WORKSTREAM_MANAGER_ROOT` to use a different checkout.
 
 ## Usage
 
