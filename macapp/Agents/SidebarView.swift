@@ -42,8 +42,8 @@ struct SidebarView: View {
                             Image(systemName: "exclamationmark.triangle.fill")
                                 .imageScale(.small)
                                 .foregroundStyle(.orange)
-                                .help("Project workspace needs attention before it can follow the latest project progress.")
-                                .accessibilityLabel("Project workspace needs attention to follow the latest project progress")
+                                .help("Project workspace hasn't followed the latest project progress yet. Refresh it from the project menu.")
+                                .accessibilityLabel("Project workspace hasn't followed the latest project progress")
                         }
                         Spacer()
                         Menu {

@@ -85,9 +85,12 @@ protocol WorkspaceEngineProviding: AnyObject {
         expectedSnapshot: String
     ) async throws -> LandResult
     func previewLand(_ workspace: WorkspaceRow, createTrunk: String?) async throws -> LandPreview
-    /// Reconciles the project working copy after a successful close. This is
-    /// always requested automatically; a conflict is non-fatal follow-up
-    /// attention because the workspace close has already succeeded.
+    /// Reconciles the project working copy after a successful close.
+    /// Requested automatically unless the project root has a live session of
+    /// its own — rewriting that working copy under a running terminal would
+    /// be destructive, so AppStore defers to a manual refresh in that case
+    /// instead. A conflict is non-fatal follow-up attention either way,
+    /// because the workspace close has already succeeded.
     func rebaseOntoTrunk(projectPath: String) async throws -> Int
 }
 

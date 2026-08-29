@@ -206,6 +206,7 @@ private struct CloseWorkspaceView: View {
 
         case .ready(let changes):
             changeReview(changes)
+            sessionStopNotice(count: store.closeWorkspaceSessionCount)
             actionButtons(addEnabled: true)
 
         case .summaryRequired(let changes):
@@ -222,6 +223,7 @@ private struct CloseWorkspaceView: View {
                 )
                 .textFieldStyle(.roundedBorder)
             }
+            sessionStopNotice(count: store.closeWorkspaceSessionCount)
             actionButtons(
                 addEnabled: !presentation.summary
                     .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -230,6 +232,7 @@ private struct CloseWorkspaceView: View {
 
         case .noChanges:
             Text("This workspace has no changes to add.")
+            sessionStopNotice(count: store.closeWorkspaceSessionCount)
             HStack {
                 Spacer()
                 Button("Cancel") {
@@ -246,6 +249,7 @@ private struct CloseWorkspaceView: View {
                 .font(.headline)
                 .foregroundStyle(.orange)
             Text("The workspace will be closed without adding these changes to the project.")
+            sessionStopNotice(count: store.closeWorkspaceSessionCount)
             HStack {
                 Spacer()
                 Button("Cancel") {
@@ -272,6 +276,7 @@ private struct CloseWorkspaceView: View {
             if !details.isEmpty {
                 changeList(details)
             }
+            sessionStopNotice(count: store.closeWorkspaceSessionCount)
             HStack {
                 Button("Close Without Adding…", role: .destructive) {
                     store.requestCloseWithoutAdding()
@@ -300,6 +305,7 @@ private struct CloseWorkspaceView: View {
                     .textFieldStyle(.roundedBorder)
                 }
             }
+            sessionStopNotice(count: store.closeWorkspaceSessionCount)
             HStack {
                 Button("Close Without Adding…", role: .destructive) {
                     store.requestCloseWithoutAdding()
@@ -398,6 +404,24 @@ private struct CloseWorkspaceView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
         }
         .frame(maxHeight: 220)
+    }
+
+    /// Discloses, immediately above the sheet's action buttons, how many
+    /// live sessions closing the workspace will stop — see
+    /// `AppStore.closeWorkspaceSessionCount`. Renders nothing at 0 so phases
+    /// with no sessions to stop (or no workspace to resolve) show no notice
+    /// at all.
+    @ViewBuilder
+    private func sessionStopNotice(count: Int) -> some View {
+        if count > 0 {
+            let text = count == 1
+                ? "Closing stops the 1 session running in this workspace."
+                : "Closing stops the \(count) sessions running in this workspace."
+            Text(text)
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .accessibilityLabel(text)
+        }
     }
 
     private func actionButtons(addEnabled: Bool) -> some View {

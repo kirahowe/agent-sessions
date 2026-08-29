@@ -756,6 +756,12 @@ final class AppStoreTests: XCTestCase {
 
     // MARK: - 26: close without adding
 
+    /// Builds one workspace ready for the close flow, with NO live session on
+    /// the project root: `addProject(path:)` creates a root "Session 1", but
+    /// a live root session is exactly the condition that defers automatic
+    /// reconciliation (see `hasLiveRootSessions(in:)`), and most close-flow
+    /// tests are about the reconcile-immediately path. Callers that want the
+    /// deferred path re-add a root session themselves after calling this.
     private func makeClosableWorkspace(
         store: AppStore,
         fake: FakeWorkspaceEngine,
@@ -770,6 +776,9 @@ final class AppStoreTests: XCTestCase {
         )
         fake.nextCreateResult = .success(workspace)
         await store.createWorkspace(in: path)
+        if let rootSession = store.sessions.first(where: { $0.target == .root(projectPath: path) }) {
+            store.closeSession(rootSession.id)
+        }
         return workspace
     }
 
@@ -777,6 +786,10 @@ final class AppStoreTests: XCTestCase {
         let fake = FakeWorkspaceEngine()
         let (store, spy, stateURL) = TestSupport.makeStore(engine: fake)
         let workspace = await makeClosableWorkspace(store: store, fake: fake)
+        // The helper already closed the project's default root session; that
+        // is setup noise, not something this test is about, so it's carried
+        // forward as a baseline rather than asserted away.
+        let closedIDsAfterSetup = spy.closedIDs
         let sessionID = store.sessions.first {
             $0.target == .workspace(projectPath: workspace.projectPath, name: workspace.name)
         }!.id
@@ -789,7 +802,7 @@ final class AppStoreTests: XCTestCase {
         let selectionBefore = store.selection
         let persistedBefore = try! Data(contentsOf: stateURL)
         fake.onDeleteWorkspace = {
-            XCTAssertTrue(spy.closedIDs.isEmpty)
+            XCTAssertEqual(spy.closedIDs, closedIDsAfterSetup)
             XCTAssertEqual(store.sessions, sessionsBefore)
             XCTAssertEqual(store.workspaces, workspacesBefore)
             XCTAssertEqual(store.selection, selectionBefore)
@@ -798,7 +811,7 @@ final class AppStoreTests: XCTestCase {
 
         await store.closeWithoutAddingWorkspace()
 
-        XCTAssertTrue(spy.closedIDs.isEmpty)
+        XCTAssertEqual(spy.closedIDs, closedIDsAfterSetup)
         XCTAssertEqual(spy.resumeCalls, [Set([sessionID])])
         XCTAssertEqual(store.sessions, sessionsBefore)
         XCTAssertEqual(store.workspaces, workspacesBefore)
@@ -828,6 +841,10 @@ final class AppStoreTests: XCTestCase {
         let fake = FakeWorkspaceEngine()
         let (store, spy, stateURL) = TestSupport.makeStore(engine: fake)
         let workspace = await makeClosableWorkspace(store: store, fake: fake)
+        // The helper already closed the project's default root session; that
+        // is setup noise, not something this test is about, so it's carried
+        // forward as a baseline rather than asserted away.
+        let closedIDsAfterSetup = spy.closedIDs
         let sessionID = store.sessions.first {
             $0.target == .workspace(projectPath: workspace.projectPath, name: workspace.name)
         }!.id
@@ -846,7 +863,7 @@ final class AppStoreTests: XCTestCase {
         fake.onDeleteWorkspace = {
             events.append("engine-forget")
             XCTAssertEqual(spy.quiesceCalls, [Set([sessionID])])
-            XCTAssertTrue(spy.closedIDs.isEmpty)
+            XCTAssertEqual(spy.closedIDs, closedIDsAfterSetup)
             XCTAssertEqual(store.sessions, sessionsBefore)
             XCTAssertEqual(store.workspaces, workspacesBefore)
             XCTAssertEqual(store.selection, selectionBefore)
@@ -864,7 +881,7 @@ final class AppStoreTests: XCTestCase {
         await store.closeWithoutAddingWorkspace()
 
         XCTAssertEqual(events, ["terminal-quiesce", "engine-forget", "terminal-close"])
-        XCTAssertEqual(spy.closedIDs, [sessionID])
+        XCTAssertEqual(spy.closedIDs, closedIDsAfterSetup + [sessionID])
         XCTAssertFalse(store.sessions.contains { $0.id == sessionID })
         XCTAssertFalse(store.workspaces.contains { $0.id == workspace.id })
         XCTAssertNil(store.selection)
@@ -884,6 +901,10 @@ final class AppStoreTests: XCTestCase {
         let fake = FakeWorkspaceEngine()
         let (store, spy, _) = TestSupport.makeStore(engine: fake)
         let workspace = await makeClosableWorkspace(store: store, fake: fake)
+        // The helper already closed the project's default root session; that
+        // is setup noise, not something this test is about, so it's carried
+        // forward as a baseline rather than asserted away.
+        let closedIDsAfterSetup = spy.closedIDs
         let sessionID = store.sessions.first {
             $0.target == .workspace(projectPath: workspace.projectPath, name: workspace.name)
         }!.id
@@ -895,7 +916,7 @@ final class AppStoreTests: XCTestCase {
 
         await store.closeWithoutAddingWorkspace()
 
-        XCTAssertEqual(spy.closedIDs, [sessionID])
+        XCTAssertEqual(spy.closedIDs, closedIDsAfterSetup + [sessionID])
         XCTAssertFalse(store.sessions.contains { $0.id == sessionID })
         XCTAssertFalse(store.workspaces.contains { $0.id == workspace.id })
         XCTAssertEqual(
@@ -1110,6 +1131,10 @@ final class AppStoreTests: XCTestCase {
         let fake = FakeWorkspaceEngine()
         let (store, spy, _) = TestSupport.makeStore(engine: fake)
         let workspace = await makeClosableWorkspace(store: store, fake: fake)
+        // The helper already closed the project's default root session; that
+        // is setup noise, not something this test is about, so it's carried
+        // forward as a baseline rather than asserted away.
+        let closedIDsAfterSetup = spy.closedIDs
         let workspaceSessionIDs = store.sessions.filter {
             $0.target == .workspace(projectPath: workspace.projectPath, name: workspace.name)
         }.map(\.id)
@@ -1141,7 +1166,7 @@ final class AppStoreTests: XCTestCase {
         XCTAssertNil(fake.landCalls.first?.message)
         XCTAssertEqual(fake.rebaseOntoTrunkCalls, [workspace.projectPath])
         XCTAssertTrue(workspaceWasRemovedBeforeReconciliation)
-        XCTAssertEqual(Set(spy.closedIDs), Set(workspaceSessionIDs))
+        XCTAssertEqual(Set(spy.closedIDs), Set(closedIDsAfterSetup + workspaceSessionIDs))
         XCTAssertFalse(store.workspaces.contains { $0.id == workspace.id })
         XCTAssertEqual(
             store.closeWorkspace?.phase,
@@ -1153,6 +1178,10 @@ final class AppStoreTests: XCTestCase {
         let fake = FakeWorkspaceEngine()
         let (store, spy, _) = TestSupport.makeStore(engine: fake)
         let workspace = await makeClosableWorkspace(store: store, fake: fake)
+        // The helper already closed the project's default root session; that
+        // is setup noise, not something this test is about, so it's carried
+        // forward as a baseline rather than asserted away.
+        let closedIDsAfterSetup = spy.closedIDs
         let oldSessionIDs = store.sessions.filter {
             $0.target == .workspace(projectPath: workspace.projectPath, name: workspace.name)
         }.map(\.id)
@@ -1181,7 +1210,7 @@ final class AppStoreTests: XCTestCase {
 
         XCTAssertFalse(store.workspaces.contains { $0.id == workspace.id })
         XCTAssertTrue(oldSessionIDs.allSatisfy { id in !store.sessions.contains { $0.id == id } })
-        XCTAssertEqual(Set(spy.closedIDs), Set(oldSessionIDs))
+        XCTAssertEqual(Set(spy.closedIDs), Set(closedIDsAfterSetup + oldSessionIDs))
         XCTAssertEqual(fake.rebaseOntoTrunkCalls, [workspace.projectPath])
         XCTAssertEqual(store.closeWorkspace, newerSheet)
     }
@@ -1190,6 +1219,10 @@ final class AppStoreTests: XCTestCase {
         let fake = FakeWorkspaceEngine()
         let (store, spy, _) = TestSupport.makeStore(engine: fake)
         let workspace = await makeClosableWorkspace(store: store, fake: fake)
+        // The helper already closed the project's default root session; that
+        // is setup noise, not something this test is about, so it's carried
+        // forward as a baseline rather than asserted away.
+        let closedIDsAfterSetup = spy.closedIDs
         fake.nextPreviewResult = .success(
             LandPreview(
                 bookmark: "ignored",
@@ -1207,7 +1240,7 @@ final class AppStoreTests: XCTestCase {
 
         await store.addChangesAndCloseWorkspace()
 
-        XCTAssertTrue(spy.closedIDs.isEmpty)
+        XCTAssertEqual(spy.closedIDs, closedIDsAfterSetup)
         XCTAssertEqual(store.sessions, sessionsBefore)
         XCTAssertTrue(store.workspaces.contains { $0.id == workspace.id })
         XCTAssertTrue(fake.rebaseOntoTrunkCalls.isEmpty)
@@ -2287,6 +2320,10 @@ final class AppStoreTests: XCTestCase {
         let fake = FakeWorkspaceEngine()
         let (store, spy, stateURL) = TestSupport.makeStore(engine: fake)
         let workspace = await makeClosableWorkspace(store: store, fake: fake)
+        // The helper already closed the project's default root session; that
+        // is setup noise, not something this test is about, so it's carried
+        // forward as a baseline rather than asserted away.
+        let closedIDsAfterSetup = spy.closedIDs
         let sessionID = store.sessions.first {
             $0.target == .workspace(projectPath: workspace.projectPath, name: workspace.name)
         }!.id
@@ -2314,7 +2351,7 @@ final class AppStoreTests: XCTestCase {
         let selectionBefore = store.selection
         await store.addChangesAndCloseWorkspace()
 
-        XCTAssertTrue(spy.closedIDs.isEmpty)
+        XCTAssertEqual(spy.closedIDs, closedIDsAfterSetup)
         XCTAssertTrue(store.sessions.contains { $0.id == sessionID })
         XCTAssertTrue(store.workspaces.contains { $0.id == workspace.id })
         XCTAssertEqual(store.selection, selectionBefore)
@@ -2340,6 +2377,10 @@ final class AppStoreTests: XCTestCase {
         let fake = FakeWorkspaceEngine()
         let (store, spy, _) = TestSupport.makeStore(engine: fake)
         let workspace = await makeClosableWorkspace(store: store, fake: fake)
+        // The helper already closed the project's default root session; that
+        // is setup noise, not something this test is about, so it's carried
+        // forward as a baseline rather than asserted away.
+        let closedIDsAfterSetup = spy.closedIDs
         fake.nextPreviewResult = .failure(.sharedHistory("Changes cannot be isolated"))
         let sessionsBefore = store.sessions
 
@@ -2352,7 +2393,7 @@ final class AppStoreTests: XCTestCase {
                 details: []
             )
         )
-        XCTAssertTrue(spy.closedIDs.isEmpty)
+        XCTAssertEqual(spy.closedIDs, closedIDsAfterSetup)
         XCTAssertEqual(store.sessions, sessionsBefore)
         XCTAssertTrue(store.workspaces.contains { $0.id == workspace.id })
     }
@@ -2361,6 +2402,10 @@ final class AppStoreTests: XCTestCase {
         let fake = FakeWorkspaceEngine()
         let (store, spy, _) = TestSupport.makeStore(engine: fake)
         let workspace = await makeClosableWorkspace(store: store, fake: fake)
+        // The helper already closed the project's default root session; that
+        // is setup noise, not something this test is about, so it's carried
+        // forward as a baseline rather than asserted away.
+        let closedIDsAfterSetup = spy.closedIDs
         fake.nextPreviewResult = .failure(.landConflict("conflicted preferred Jujutsu trunk"))
         let sessionsBefore = store.sessions
         let workspacesBefore = store.workspaces
@@ -2375,7 +2420,7 @@ final class AppStoreTests: XCTestCase {
             )
         )
         XCTAssertNil(store.lastError)
-        XCTAssertTrue(spy.closedIDs.isEmpty)
+        XCTAssertEqual(spy.closedIDs, closedIDsAfterSetup)
         XCTAssertEqual(store.sessions, sessionsBefore)
         XCTAssertEqual(store.workspaces, workspacesBefore)
     }
@@ -3343,6 +3388,10 @@ final class AppStoreTests: XCTestCase {
         let fake = FakeWorkspaceEngine()
         let (store, spy, stateURL) = TestSupport.makeStore(engine: fake)
         let workspace = await makeClosableWorkspace(store: store, fake: fake)
+        // The helper already closed the project's default root session; that
+        // is setup noise, not something this test is about, so it's carried
+        // forward as a baseline rather than asserted away.
+        let closedIDsAfterSetup = spy.closedIDs
         fake.nextPreviewResult = .failure(.nothingToLand("nothing to add"))
         await store.prepareCloseWorkspace(workspace.id)
 
@@ -3371,7 +3420,7 @@ final class AppStoreTests: XCTestCase {
 
         XCTAssertEqual(fake.deleteCalls, [workspace])
         XCTAssertEqual(fake.deleteOnlyIfUnchangedCalls, [true])
-        XCTAssertEqual(Set(spy.closedIDs), workspaceSessionIDs)
+        XCTAssertEqual(Set(spy.closedIDs), Set(closedIDsAfterSetup).union(workspaceSessionIDs))
         XCTAssertTrue(spy.resumeCalls.isEmpty)
     }
 
@@ -3379,6 +3428,10 @@ final class AppStoreTests: XCTestCase {
         let fake = FakeWorkspaceEngine()
         let (store, spy, stateURL) = TestSupport.makeStore(engine: fake)
         let workspace = await makeClosableWorkspace(store: store, fake: fake)
+        // The helper already closed the project's default root session; that
+        // is setup noise, not something this test is about, so it's carried
+        // forward as a baseline rather than asserted away.
+        let closedIDsAfterSetup = spy.closedIDs
         fake.nextPreviewResult = .failure(.nothingToLand("nothing to add"))
         await store.prepareCloseWorkspace(workspace.id)
 
@@ -3407,7 +3460,7 @@ final class AppStoreTests: XCTestCase {
         XCTAssertEqual(fake.deleteOnlyIfUnchangedCalls, [true])
         XCTAssertEqual(spy.quiesceCalls, [workspaceSessionIDs])
         XCTAssertEqual(spy.resumeCalls, [workspaceSessionIDs])
-        XCTAssertTrue(spy.closedIDs.isEmpty)
+        XCTAssertEqual(spy.closedIDs, closedIDsAfterSetup)
         XCTAssertEqual(store.sessions, sessionsBefore)
         XCTAssertEqual(store.workspaces, workspacesBefore)
         XCTAssertEqual(store.selection, selectionBefore)
@@ -3433,6 +3486,10 @@ final class AppStoreTests: XCTestCase {
         )
         await store.prepareCloseWorkspace(workspace.id)
 
+        // The helper already closed the project's default root session; that
+        // is setup noise, not something this test is about, so it's carried
+        // forward as a baseline rather than asserted away.
+        let closedIDsAfterSetup = spy.closedIDs
         let sessionsBefore = store.sessions
         let workspacesBefore = store.workspaces
         let selectionBefore = store.selection
@@ -3446,7 +3503,7 @@ final class AppStoreTests: XCTestCase {
 
         XCTAssertEqual(spy.quiesceCalls, [workspaceSessionIDs])
         XCTAssertEqual(spy.resumeCalls, [workspaceSessionIDs])
-        XCTAssertTrue(spy.closedIDs.isEmpty)
+        XCTAssertEqual(spy.closedIDs, closedIDsAfterSetup)
         XCTAssertEqual(store.sessions, sessionsBefore)
         XCTAssertEqual(store.workspaces, workspacesBefore)
         XCTAssertEqual(store.selection, selectionBefore)
@@ -3537,6 +3594,10 @@ final class AppStoreTests: XCTestCase {
         let fake = FakeWorkspaceEngine()
         let (store, spy, _) = TestSupport.makeStore(engine: fake)
         let workspace = await makeClosableWorkspace(store: store, fake: fake)
+        // The helper already closed the project's default root session; that
+        // is setup noise, not something this test is about, so it's carried
+        // forward as a baseline rather than asserted away.
+        let closedIDsAfterSetup = spy.closedIDs
         fake.nextPreviewResult = .success(
             LandPreview(
                 bookmark: "main",
@@ -3575,12 +3636,16 @@ final class AppStoreTests: XCTestCase {
 
         XCTAssertEqual(fake.landCalls.count, 1)
         XCTAssertEqual(spy.resumeCalls, spy.quiesceCalls)
-        XCTAssertTrue(spy.closedIDs.isEmpty)
+        XCTAssertEqual(spy.closedIDs, closedIDsAfterSetup)
     }
     func test77_targetChangeAfterPreviewRestartsSessionsAndRefreshesPreparedChanges() async {
         let fake = FakeWorkspaceEngine()
         let (store, spy, stateURL) = TestSupport.makeStore(engine: fake)
         let workspace = await makeClosableWorkspace(store: store, fake: fake)
+        // The helper already closed the project's default root session; that
+        // is setup noise, not something this test is about, so it's carried
+        // forward as a baseline rather than asserted away.
+        let closedIDsAfterSetup = spy.closedIDs
         let target = TargetRef.workspace(projectPath: workspace.projectPath, name: workspace.name)
         let session = store.sessions.first { $0.target == target }!
         spy.onTitleChange?(session.id, "π > Preserve this session")
@@ -3614,7 +3679,7 @@ final class AppStoreTests: XCTestCase {
         XCTAssertEqual(fake.landCalls.map(\.expectedSnapshot), ["target-old"])
         XCTAssertEqual(spy.quiesceCalls, [sessionIDs])
         XCTAssertEqual(spy.resumeCalls, [sessionIDs])
-        XCTAssertTrue(spy.closedIDs.isEmpty)
+        XCTAssertEqual(spy.closedIDs, closedIDsAfterSetup)
         XCTAssertEqual(store.sessions, sessionsBefore)
         XCTAssertEqual(store.workspaces, workspacesBefore)
         XCTAssertEqual(try! Data(contentsOf: stateURL), persistedBefore)
@@ -3659,6 +3724,10 @@ final class AppStoreTests: XCTestCase {
         let fake = FakeWorkspaceEngine()
         let (store, spy, _) = TestSupport.makeStore(engine: fake)
         let workspace = await makeClosableWorkspace(store: store, fake: fake)
+        // The helper already closed the project's default root session; that
+        // is setup noise, not something this test is about, so it's carried
+        // forward as a baseline rather than asserted away.
+        let closedIDsAfterSetup = spy.closedIDs
         let sessionIDs = Set(store.sessions.filter {
             $0.target == .workspace(projectPath: workspace.projectPath, name: workspace.name)
         }.map(\.id))
@@ -3685,7 +3754,7 @@ final class AppStoreTests: XCTestCase {
 
         XCTAssertEqual(fake.landCalls.map(\.expectedSnapshot), ["setup-old"])
         XCTAssertEqual(spy.resumeCalls, [sessionIDs])
-        XCTAssertTrue(spy.closedIDs.isEmpty)
+        XCTAssertEqual(spy.closedIDs, closedIDsAfterSetup)
         XCTAssertTrue(store.workspaces.contains { $0.id == workspace.id })
         XCTAssertEqual(fake.previewLandCalls.map(\.createTrunk), [nil, "main", nil, "main"])
         XCTAssertEqual(store.closeWorkspace?.phase, .projectSetupRequired(changes: ["Current setup"], needsMessage: false))
@@ -3730,5 +3799,205 @@ final class AppStoreTests: XCTestCase {
         await staleClose.value
 
         XCTAssertEqual(store.closeWorkspace, replacement)
+    }
+
+    // MARK: - 90: deferred reconciliation with a live project-root session
+
+    // test33 already proves the no-live-root-session case reconciles
+    // automatically (makeClosableWorkspace's fixture has none), so there is
+    // no separate "reconciles immediately" test here — that would just be
+    // test33 again under a new name.
+
+    func test90_addAndCloseWithLiveRootSessionDefersReconciliation() async {
+        let fake = FakeWorkspaceEngine()
+        let (store, spy, _) = TestSupport.makeStore(engine: fake)
+        let path = "/tmp/proj-live-root"
+        let workspace = await makeClosableWorkspace(store: store, fake: fake, path: path)
+        // Unlike the default fixture, this test wants the project root to
+        // still have a session of its own when the close completes.
+        store.newSession(in: .root(projectPath: path))
+        let rootSessionID = store.sessions.first { $0.target == .root(projectPath: path) }!.id
+        let workspaceSessionIDs = store.sessions.filter {
+            $0.target == .workspace(projectPath: workspace.projectPath, name: workspace.name)
+        }.map(\.id)
+        fake.nextPreviewResult = .success(
+            LandPreview(
+                bookmark: "ignored",
+                bookmarkCommit: "ignored",
+                commits: [LandCommit(id: "1", subject: "Change")],
+                conflicts: [],
+                needsMessage: false,
+                diverging: [],
+                targetSnapshot: "test-snapshot"
+            )
+        )
+
+        await store.prepareCloseWorkspace(workspace.id)
+        await store.addChangesAndCloseWorkspace()
+
+        XCTAssertTrue(
+            fake.rebaseOntoTrunkCalls.isEmpty,
+            "a live root session must defer automatic reconciliation rather than rewrite the working copy under it"
+        )
+        XCTAssertTrue(store.projectWorkingCopyAttention.contains(path))
+        XCTAssertEqual(
+            store.closeWorkspace?.phase,
+            .success(addedChanges: 1, notice: AppStore.deferredReconciliationNotice)
+        )
+        XCTAssertFalse(store.workspaces.contains { $0.id == workspace.id })
+        XCTAssertTrue(Set(spy.closedIDs).isSuperset(of: workspaceSessionIDs))
+        XCTAssertTrue(workspaceSessionIDs.allSatisfy { id in !store.sessions.contains { $0.id == id } })
+        XCTAssertTrue(
+            store.sessions.contains { $0.id == rootSessionID },
+            "the project's own live session must survive the deferred close"
+        )
+    }
+
+    func test90b_retainedLandWithLiveRootSessionDefersAndComposesNotice() async {
+        let fake = FakeWorkspaceEngine()
+        let (store, spy, _) = TestSupport.makeStore(engine: fake)
+        let path = "/tmp/proj-live-root-retained"
+        let workspace = await makeClosableWorkspace(store: store, fake: fake, path: path)
+        store.newSession(in: .root(projectPath: path))
+        let workspaceSessionID = store.sessions.first {
+            $0.target == .workspace(projectPath: workspace.projectPath, name: workspace.name)
+        }!.id
+        fake.nextPreviewResult = .success(
+            LandPreview(
+                bookmark: "ignored",
+                bookmarkCommit: "ignored",
+                commits: [LandCommit(id: "1", subject: "Change")],
+                conflicts: [],
+                needsMessage: false,
+                diverging: [],
+                targetSnapshot: "test-snapshot"
+            )
+        )
+        fake.nextLandResult = .success(
+            LandResult(
+                commitID: "abc",
+                bookmark: "main",
+                cleanupWarning: "Registration warning.",
+                workspaceRetained: true
+            )
+        )
+
+        await store.prepareCloseWorkspace(workspace.id)
+        await store.addChangesAndCloseWorkspace()
+
+        XCTAssertTrue(fake.rebaseOntoTrunkCalls.isEmpty)
+        XCTAssertTrue(store.projectWorkingCopyAttention.contains(path))
+        XCTAssertEqual(
+            store.closeWorkspace?.phase,
+            .workspaceRetained(
+                addedChanges: 1,
+                notice: "Registration warning.\n" + AppStore.deferredReconciliationNotice
+            )
+        )
+        XCTAssertTrue(store.workspaces.contains { $0.id == workspace.id })
+        XCTAssertTrue(store.sessions.contains { $0.id == workspaceSessionID })
+        XCTAssertFalse(spy.closedIDs.contains(workspaceSessionID))
+    }
+
+    func test90c_manualRefreshStaysUngatedWithLiveRootSession() async {
+        let fake = FakeWorkspaceEngine()
+        let (store, _, _) = TestSupport.makeStore(engine: fake)
+        let path = "/tmp/proj-live-root-manual-refresh"
+        let workspace = await makeClosableWorkspace(store: store, fake: fake, path: path)
+        store.newSession(in: .root(projectPath: path))
+        fake.nextPreviewResult = .success(
+            LandPreview(
+                bookmark: "ignored",
+                bookmarkCommit: "ignored",
+                commits: [LandCommit(id: "1", subject: "Change")],
+                conflicts: [],
+                needsMessage: false,
+                diverging: [],
+                targetSnapshot: "test-snapshot"
+            )
+        )
+
+        await store.prepareCloseWorkspace(workspace.id)
+        await store.addChangesAndCloseWorkspace()
+        XCTAssertTrue(
+            store.projectWorkingCopyAttention.contains(path),
+            "setup: the close must have deferred reconciliation for this test to be meaningful"
+        )
+
+        fake.nextRebaseResult = .success(0)
+        await store.refreshProjectWorkspace(path)
+
+        XCTAssertEqual(
+            fake.rebaseOntoTrunkCalls, [path],
+            "manual refresh must stay ungated even though the project root has a live session"
+        )
+        XCTAssertFalse(store.projectWorkingCopyAttention.contains(path))
+    }
+
+    // MARK: - 91: session-stop disclosure
+
+    func test91_closeWorkspaceSessionCountIsZeroWithoutASheet() {
+        let (store, _, _) = TestSupport.makeStore()
+        let path = "/tmp/proj-no-sheet"
+        store.addProject(path: path)
+        store.newSession(in: .root(projectPath: path))
+
+        XCTAssertEqual(
+            store.closeWorkspaceSessionCount, 0,
+            "with no close sheet open there is nothing to warn about stopping"
+        )
+    }
+
+    func test91b_closeWorkspaceSessionCountCountsOnlyTheWorkspaceUnderReview() async {
+        let fake = FakeWorkspaceEngine()
+        let (store, _, _) = TestSupport.makeStore(engine: fake)
+        let path = "/tmp/proj-91b"
+        let workspace = await makeClosableWorkspace(store: store, fake: fake, path: path)
+        // makeClosableWorkspace already leaves one session in the workspace
+        // under review; add a second so the count distinguishes "1" from
+        // "every session in the workspace".
+        store.newSession(in: .workspace(projectPath: path, name: workspace.name))
+        // A root session on the SAME project must never be counted — only
+        // workspace-targeted rows are sessions the close sheet will stop.
+        store.newSession(in: .root(projectPath: path))
+        // A session in an unrelated workspace must not leak into the count.
+        _ = await makeClosableWorkspace(store: store, fake: fake, path: "/tmp/proj-91b-other")
+        fake.nextPreviewResult = .failure(.nothingToLand("nothing"))
+
+        await store.prepareCloseWorkspace(workspace.id)
+
+        XCTAssertEqual(
+            store.closeWorkspaceSessionCount, 2,
+            "the sheet must warn about exactly the sessions running in the workspace being closed"
+        )
+    }
+
+    func test91c_closeWorkspaceSessionCountFollowsSessionsClosedWhileTheSheetIsOpen() async {
+        let fake = FakeWorkspaceEngine()
+        let (store, _, _) = TestSupport.makeStore(engine: fake)
+        let path = "/tmp/proj-91c"
+        let workspace = await makeClosableWorkspace(store: store, fake: fake, path: path)
+        store.newSession(in: .workspace(projectPath: path, name: workspace.name))
+        let workspaceSessionIDs = store.sessions
+            .filter { $0.target == .workspace(projectPath: path, name: workspace.name) }
+            .map(\.id)
+        XCTAssertEqual(workspaceSessionIDs.count, 2, "setup: the workspace must start with two sessions")
+        fake.nextPreviewResult = .failure(.nothingToLand("nothing"))
+        await store.prepareCloseWorkspace(workspace.id)
+        XCTAssertEqual(store.closeWorkspaceSessionCount, 2)
+
+        store.closeSession(workspaceSessionIDs[0])
+
+        XCTAssertEqual(
+            store.closeWorkspaceSessionCount, 1,
+            "the live count must drop when a session is closed while the sheet is still open"
+        )
+
+        store.cancelCloseWorkspace()
+
+        XCTAssertEqual(
+            store.closeWorkspaceSessionCount, 0,
+            "with the sheet dismissed there is no longer a workspace under review"
+        )
     }
 }

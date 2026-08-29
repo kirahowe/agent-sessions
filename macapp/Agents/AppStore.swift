@@ -73,10 +73,18 @@ final class AppStore: ObservableObject {
     /// no meaningful value to restore after a relaunch — see
     /// `SessionActivity`'s doc comment.
     @Published private(set) var attention: [String: AttentionState] = [:]
-    /// Project working copies whose progress could not be reconciled, keyed
-    /// by project path so attention survives dismissal of the close sheet.
-    /// Like live session attention, this is intentionally in-memory only.
+    /// Project working copies whose progress hasn't been reconciled — either
+    /// because automatic reconciliation failed, or because it was deferred
+    /// while the project root had a live session of its own — keyed by
+    /// project path so attention survives dismissal of the close sheet. Like
+    /// live session attention, this is intentionally in-memory only.
     @Published private(set) var projectWorkingCopyAttention: Set<String> = []
+
+    /// Shown (composed with any `cleanupWarning`) whenever a successful close
+    /// left reconciliation deferred rather than reconciling automatically —
+    /// see `hasLiveRootSessions(in:)`. A single shared constant so tests
+    /// assert against it instead of duplicating the sentence.
+    static let deferredReconciliationNotice = "The project's own sessions are still running, so its workspace hasn't been updated with these changes yet. Refresh it from the project menu when you're ready."
 
     /// Count of sessions currently `.blocked` — agents actively burning the
     /// user's time waiting on a permission prompt, as opposed to `.yourTurn`
@@ -88,6 +96,17 @@ final class AppStore: ObservableObject {
     /// going unnoticed.
     var blockedSessionCount: Int {
         attention.values.filter { $0.activity == .blocked }.count
+    }
+
+    /// Sessions the current close sheet will stop — every row targeting the
+    /// workspace under review. Live rather than captured with the sheet so a
+    /// session closed while the sheet is open is not counted; 0 with no sheet
+    /// or when the workspace row is gone.
+    var closeWorkspaceSessionCount: Int {
+        guard let workspaceID = closeWorkspace?.workspaceID,
+              let workspace = workspaces.first(where: { $0.id == workspaceID })
+        else { return 0 }
+        return workspaceSessionIDs(for: workspace).count
     }
 
     /// Pure formatting for the Dock tile's badge label, pulled out as a
@@ -593,6 +612,28 @@ final class AppStore: ObservableObject {
             tearDownClosedWorkspace(workspace)
         }
 
+        if hasLiveRootSessions(in: workspace.projectPath) {
+            // The project root itself is a session target. Rewriting its
+            // working copy while one of its own terminals is live would
+            // change files underneath that session, so reconciliation is
+            // deferred to a manual refresh from the project menu instead of
+            // running automatically here.
+            projectWorkingCopyAttention.insert(workspace.projectPath)
+            guard projectLifecycleTokens[workspace.projectPath] == lifecycleToken,
+                  isCurrentClosePresentation(workspace, presentationID: presentationID)
+            else { return }
+            let notice = [result.cleanupWarning, Self.deferredReconciliationNotice]
+                .compactMap { $0 }
+                .joined(separator: "\n")
+            if result.workspaceRetained {
+                guard isCurrentWorkspaceLifecycle(workspace, token: lifecycleToken) else { return }
+                closeWorkspace?.phase = .workspaceRetained(addedChanges: changeCount, notice: notice)
+            } else {
+                closeWorkspace?.phase = .success(addedChanges: changeCount, notice: notice)
+            }
+            return
+        }
+
         let reconciled = await reconcileProjectWorkspace(workspace.projectPath)
         guard projectLifecycleTokens[workspace.projectPath] == lifecycleToken,
               isCurrentClosePresentation(workspace, presentationID: presentationID)
@@ -717,6 +758,16 @@ final class AppStore: ObservableObject {
                 message: "The workspace couldn't be closed. The workspace remains open. Return to it and try again."
             )
         }
+    }
+
+    /// True when the project root itself (not any workspace) has a live
+    /// session — often an agent mid-task whose files would change underneath
+    /// it if the working copy were rewritten. Gates automatic reconciliation
+    /// in `applyWorkspaceChanges`; deliberately NOT consulted by
+    /// `refreshProjectWorkspace`, which is the user's explicit "I'm ready
+    /// now" signal and must stay ungated.
+    private func hasLiveRootSessions(in projectPath: String) -> Bool {
+        sessions.contains { $0.target == .root(projectPath: projectPath) }
     }
 
     private func workspaceSessionIDs(for workspace: WorkspaceRow) -> Set<String> {
