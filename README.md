@@ -45,6 +45,17 @@ CLI-agent protocol, then persist the session metadata OMP reports. Named OMP
 profiles are not included in that protocol yet, so Agents cannot construct a
 profile-qualified resume command for them.
 
+## Agent dashboard
+
+The right-side Agent Dashboard is an attention-first overview of every open
+session. Blocked sessions appear first, then sessions waiting for you, followed
+by sessions with no attention signal. Selecting a row opens that terminal. Use
+the trailing-sidebar toolbar button to collapse or reopen the pane.
+
+“No attention needed” intentionally does not claim the agent is working:
+without a structured status signal, the app cannot distinguish a running agent
+from an idle shell.
+
 ## Waiting indicators
 
 Sessions show an indicator in the sidebar when their agent needs you:
@@ -55,7 +66,8 @@ Sessions show an indicator in the sidebar when their agent needs you:
   counted on the Dock tile's badge, so they stay visible when the app isn't
   focused.
 
-No indicator means the agent is working, or has nothing to say.
+No indicator means the app has no attention signal; the agent may be working
+or idle.
 
 The two states differ by shape and motion, not only by colour: a session that
 can wait indefinitely and one that is burning time deserve different urgency,

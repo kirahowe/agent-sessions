@@ -6,6 +6,7 @@ struct RootView: View {
     @ObservedObject var store: AppStore
     let center: TerminalCenter
     @ObservedObject var uiState: UIState
+    @State private var isDashboardPresented = true
 
     private var windowTitle: String {
         if let selectedID = store.selection,
@@ -54,6 +55,21 @@ struct RootView: View {
                     }
                     .multilineTextAlignment(.center)
                 }
+            }
+        }
+        .inspector(isPresented: $isDashboardPresented) {
+            AgentDashboardView(store: store)
+                .inspectorColumnWidth(min: 300, ideal: 320, max: 340)
+        }
+        .toolbar {
+            ToolbarItem(placement: .primaryAction) {
+                Button {
+                    isDashboardPresented.toggle()
+                } label: {
+                    Label("Agent Dashboard", systemImage: "sidebar.trailing")
+                }
+                .help(isDashboardPresented ? "Hide Agent Dashboard" : "Show Agent Dashboard")
+                .accessibilityLabel(isDashboardPresented ? "Hide Agent Dashboard" : "Show Agent Dashboard")
             }
         }
         .navigationTitle(windowTitle)

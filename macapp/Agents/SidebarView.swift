@@ -241,7 +241,7 @@ private struct SessionRowView: View {
 /// row starts showing an indicator again, so the animation always restarts
 /// cleanly from the beginning and never lingers past the activity it was
 /// animating.
-private struct SessionActivityIndicator: View {
+struct SessionActivityIndicator: View {
     let activity: SessionActivity
 
     /// Reduce Motion must suppress the pulse entirely, not just slow it
