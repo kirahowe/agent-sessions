@@ -2,18 +2,15 @@ import AppKit
 import GhosttyTerminal
 import SwiftUI
 
-/// A single, permanently-mounted container for every live session's
-/// `TerminalView`. Reparenting or recreating a live `TerminalView` blanks
-/// its Metal surface, so `makeNSView` builds the container exactly once for
-/// the app's whole lifetime, and every session's terminal becomes a
-/// permanent subview added at most once. Switching the selected session
-/// only toggles `.isHidden` and moves first responder — it never
-/// adds/removes/reparents views. Views are only ever removed when their
-/// session is actually closed (via `TerminalCenter`, which happens
-/// elsewhere).
+/// A single container for every active session's TerminalView. Switching the
+/// selected session only toggles visibility and focus; live views are never
+/// reparented because that blanks their Metal surfaces. Workspace closing is
+/// the deliberate exception: TerminalCenter removes and frees each target
+/// surface while it is quiesced, and this host must not lazily request a new
+/// one until the manager outcome resumes that session.
 struct TerminalHostView: NSViewRepresentable {
     @ObservedObject var store: AppStore
-    let center: TerminalCenter
+    @ObservedObject var center: TerminalCenter
 
     func makeNSView(context: Context) -> NSView {
         NSView()
@@ -21,19 +18,19 @@ struct TerminalHostView: NSViewRepresentable {
 
     func updateNSView(_ containerView: NSView, context: Context) {
         guard let selectedID = store.selection,
-              let row = store.sessions.first(where: { $0.id == selectedID })
+              let row = store.sessions.first(where: { $0.id == selectedID }),
+              !center.isSessionQuiesced(selectedID),
+              let terminalView = center.terminalView(
+                  for: selectedID,
+                  workingDirectory: store.workingDirectory(for: row),
+                  restoredResume: row.resume
+              )
         else {
             for subview in containerView.subviews {
                 subview.isHidden = true
             }
             return
         }
-
-        let terminalView = center.terminalView(
-            for: selectedID,
-            workingDirectory: store.workingDirectory(for: row),
-            restoredResume: row.resume
-        )
 
         if terminalView.superview !== containerView {
             terminalView.translatesAutoresizingMaskIntoConstraints = false

@@ -1,22 +1,34 @@
 import AppKit
+import Combine
 import GhosttyTerminal
 
-/// Owns the lifecycle of every live `TerminalView`/`TerminalController` pair,
+/// Owns the lifecycle of every live TerminalView/TerminalController pair,
 /// one per session. Scoped strictly to terminal lifecycle (create/get/close);
 /// NSView container/subview/constraint/visibility/focus mechanics live in
 /// `TerminalHostView`.
 @MainActor
-final class TerminalCenter: SessionTerminating {
+final class TerminalCenter: ObservableObject, SessionTerminating {
     private struct Entry {
         let view: TerminalView
-        let controller: TerminalController
-        let delegateProxy: SessionDelegateProxy
-        let restoredResume: SessionResumeMetadata?
+        var controller: TerminalController?
+        var delegateProxy: SessionDelegateProxy
+        var restoredResume: SessionResumeMetadata?
         var resumeHintScheduled = false
         var didShowResumeHint = false
     }
 
     private var entries: [String: Entry] = [:]
+    @Published private(set) var quiescedSessionIDs: Set<String> = []
+
+    private let textDelivery: @MainActor (TerminalView, String) -> Void
+
+    init(
+        textDelivery: @escaping @MainActor (TerminalView, String) -> Void = { view, text in
+            view.sendText(text)
+        }
+    ) {
+        self.textDelivery = textDelivery
+    }
 
     /// The terminal configuration applied to every session's controller,
     /// via `TerminalController`'s `terminalConfiguration:` parameter.
@@ -101,15 +113,31 @@ final class TerminalCenter: SessionTerminating {
         for sessionID: String,
         workingDirectory: String,
         restoredResume: SessionResumeMetadata?
-    ) -> TerminalView {
-        if let entry = entries[sessionID] {
+    ) -> TerminalView? {
+        guard !quiescedSessionIDs.contains(sessionID) else { return nil }
+
+        if var entry = entries[sessionID] {
+            if entry.controller == nil {
+                let proxy = SessionDelegateProxy(sessionID: sessionID, center: self)
+                let controller = TerminalController(
+                    terminalConfiguration: Self.terminalConfiguration
+                )
+                entry.delegateProxy = proxy
+                entry.controller = controller
+                entry.restoredResume = restoredResume
+                entry.resumeHintScheduled = false
+                entry.didShowResumeHint = false
+                entry.view.delegate = proxy
+                entries[sessionID] = entry
+                entry.view.controller = controller
+            }
             return entry.view
         }
 
         let proxy = SessionDelegateProxy(sessionID: sessionID, center: self)
         // DropTerminalView adds Finder drag-and-drop (the package itself has
         // none) — see its doc comment for why. The stored type stays
-        // `TerminalView`; every caller only needs the base API.
+        // TerminalView; every caller only needs the base API.
         let view = DropTerminalView(frame: .zero)
 
         // Setup order mirrors the package's own AppKit example: delegate,
@@ -121,10 +149,6 @@ final class TerminalCenter: SessionTerminating {
             workingDirectory: workingDirectory,
             envVars: Self.sessionEnvVars
         )
-        // configSource/theme are left at their defaults (`.none`/`.default`)
-        // deliberately — see the doc comment on `terminalConfiguration`
-        // above for why that, plus this parameter, exactly reproduces what
-        // the closure-taking convenience initializer used to do.
         let controller = TerminalController(terminalConfiguration: Self.terminalConfiguration)
         view.controller = controller
 
@@ -168,22 +192,54 @@ final class TerminalCenter: SessionTerminating {
 
         entry.didShowResumeHint = true
         entries[sessionID] = entry
-        entry.view.sendText(SessionResumeMetadata.resumeHintCommand(for: metadata))
+        textDelivery(
+            entry.view,
+            SessionResumeMetadata.resumeHintCommand(for: metadata)
+        )
     }
 
-    /// Tears down a session's terminal: removes the view from its superview
-    /// and drops every strong reference we hold (view, controller, delegate
-    /// proxy) so ARC's deinit chain runs the actual ghostty teardown. No-op
-    /// if the id isn't cached.
+    /// Permanently tears down a session terminal. Explicitly clearing the
+    /// controller calls Ghostty's synchronous surface-free path before this
+    /// method returns; ARC is not used as the lifecycle boundary.
     func closeSession(_ sessionID: String) {
+        quiescedSessionIDs.remove(sessionID)
         guard let entry = entries.removeValue(forKey: sessionID) else { return }
+        entry.delegateProxy.suppressesProcessExit = true
+        entry.view.delegate = nil
         entry.view.removeFromSuperview()
+        entry.view.controller = nil
     }
 
-    /// Called by a session's delegate proxy when its shell process exits.
-    /// Tears down the terminal first, then notifies the callback regardless
-    /// of what the caller does with the notification.
+    /// Prevents target processes from writing during a manager operation.
+    /// Clearing TerminalView.controller synchronously tears down and calls
+    /// ghostty_surface_free before returning.
+    func quiesceSessions(_ ids: Set<String>) async {
+        quiescedSessionIDs.formUnion(ids)
+        for sessionID in ids {
+            guard var entry = entries[sessionID] else { continue }
+            entry.delegateProxy.suppressesProcessExit = true
+            entry.view.delegate = nil
+            entry.view.removeFromSuperview()
+            entry.view.controller = nil
+            entry.controller = nil
+            entry.resumeHintScheduled = false
+            entry.didShowResumeHint = false
+            entries[sessionID] = entry
+        }
+    }
+
+    func resumeSessions(_ ids: Set<String>) {
+        quiescedSessionIDs.subtract(ids)
+    }
+
+    func isSessionQuiesced(_ sessionID: String) -> Bool {
+        quiescedSessionIDs.contains(sessionID)
+    }
+
+    /// Ignores process-exit delivery while a close operation owns terminal
+    /// teardown, so persisted rows survive until the manager succeeds.
     func handleProcessExit(sessionID: String) {
+        guard !quiescedSessionIDs.contains(sessionID) else { return }
         closeSession(sessionID)
         onProcessExit?(sessionID)
     }
@@ -221,7 +277,7 @@ final class SessionDelegateProxy:
 {
     let sessionID: String
     weak var center: TerminalCenter?
-
+    var suppressesProcessExit = false
     init(sessionID: String, center: TerminalCenter) {
         self.sessionID = sessionID
         self.center = center
@@ -236,6 +292,7 @@ final class SessionDelegateProxy:
     }
 
     func terminalDidClose(processAlive: Bool) {
+        guard !suppressesProcessExit else { return }
         center?.handleProcessExit(sessionID: sessionID)
     }
 

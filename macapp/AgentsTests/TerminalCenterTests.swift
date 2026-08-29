@@ -1,3 +1,4 @@
+import AppKit
 import GhosttyTerminal
 import XCTest
 @testable import Agents
@@ -93,5 +94,107 @@ final class TerminalCenterTests: XCTestCase {
             TerminalCenter.sessionEnvVars["WARP_CLI_AGENT_PROTOCOL_VERSION"],
             "1"
         )
+    }
+
+    func testQuiescedSessionCannotBeLazilyRecreatedUntilResumed() async {
+        let center = TerminalCenter()
+        let sessionID = "quiesced"
+
+        await center.quiesceSessions(Set([sessionID]))
+
+        XCTAssertTrue(center.isSessionQuiesced(sessionID))
+        XCTAssertNil(
+            center.terminalView(
+                for: sessionID,
+                workingDirectory: "/tmp",
+                restoredResume: nil
+            )
+        )
+
+        center.resumeSessions(Set([sessionID]))
+
+        XCTAssertFalse(center.isSessionQuiesced(sessionID))
+        XCTAssertNotNil(
+            center.terminalView(
+                for: sessionID,
+                workingDirectory: "/tmp",
+                restoredResume: nil
+            )
+        )
+    }
+
+    func testRecreatedOmpSurfaceDeliversPersistedResumeHintExactlyOnce() async {
+        var deliveredTexts: [String] = []
+        var deliveryProxies: [SessionDelegateProxy] = []
+        let center = TerminalCenter(textDelivery: { view, text in
+            deliveredTexts.append(text)
+            deliveryProxies.append(view.delegate as! SessionDelegateProxy)
+        })
+        let sessionID = "recreated"
+        let hostView = NSView()
+        let oldView = center.terminalView(
+            for: sessionID,
+            workingDirectory: "/tmp",
+            restoredResume: nil
+        )!
+        hostView.addSubview(oldView)
+        let oldProxy = oldView.delegate as! SessionDelegateProxy
+        var exitedIDs: [String] = []
+        center.onProcessExit = { exitedIDs.append($0) }
+
+        await center.quiesceSessions(Set([sessionID]))
+        XCTAssertNil(oldView.controller)
+
+        center.resumeSessions(Set([sessionID]))
+        let metadata = SessionResumeMetadata(
+            agent: "omp",
+            sessionID: "omp-recreated",
+            title: "Repair recreation",
+            prompt: nil
+        )
+        let recreatedView = center.terminalView(
+            for: sessionID,
+            workingDirectory: "/tmp",
+            restoredResume: metadata
+        )!
+        let recreatedProxy = recreatedView.delegate as! SessionDelegateProxy
+        hostView.addSubview(recreatedView)
+
+        oldProxy.terminalDidClose(processAlive: false)
+
+        XCTAssertTrue(exitedIDs.isEmpty)
+        XCTAssertTrue(recreatedView === oldView)
+        XCTAssertFalse(recreatedProxy === oldProxy)
+        XCTAssertTrue(
+            center.terminalView(
+                for: sessionID,
+                workingDirectory: "/tmp",
+                restoredResume: metadata
+            ) === recreatedView
+        )
+        XCTAssertTrue(deliveredTexts.isEmpty)
+
+        center.showResumeHintIfNeeded(for: sessionID)
+        center.showResumeHintIfNeeded(for: sessionID)
+        await drainMainQueue()
+
+        center.showResumeHintIfNeeded(for: sessionID)
+        await drainMainQueue()
+
+        XCTAssertEqual(
+            deliveredTexts,
+            ["printf '%s\\n' 'Last OMP session: Repair recreation' 'Resume last session: omp --resume omp-recreated'\n"]
+        )
+        XCTAssertEqual(deliveryProxies.count, 1)
+        XCTAssertTrue(deliveryProxies[0] === recreatedProxy)
+        XCTAssertFalse(deliveryProxies[0] === oldProxy)
+    }
+
+    private func drainMainQueue() async {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.main.async {
+                continuation.resume()
+            }
+        }
     }
 }

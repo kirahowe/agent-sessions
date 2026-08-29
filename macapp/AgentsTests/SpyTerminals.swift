@@ -17,8 +17,22 @@ final class SpyTerminals: SessionTerminating {
     var onTitleChange: ((String, String) -> Void)?
     var onAgentSessionEvent: ((String, AgentSessionEvent) -> Void)?
     private(set) var closedIDs: [String] = []
+    private(set) var quiesceCalls: [Set<String>] = []
+    private(set) var resumeCalls: [Set<String>] = []
+    var onCloseSession: ((String) -> Void)?
+    var quiesceSessionsHandler: ((Set<String>) async -> Void)?
 
     func closeSession(_ id: String) {
+        onCloseSession?(id)
         closedIDs.append(id)
+    }
+
+    func quiesceSessions(_ ids: Set<String>) async {
+        quiesceCalls.append(ids)
+        await quiesceSessionsHandler?(ids)
+    }
+
+    func resumeSessions(_ ids: Set<String>) {
+        resumeCalls.append(ids)
     }
 }

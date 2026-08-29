@@ -31,4 +31,9 @@ protocol SessionTerminating: AnyObject {
     /// title, but forwards only successfully decoded envelopes here.
     var onAgentSessionEvent: ((String, AgentSessionEvent) -> Void)? { get set }
     func closeSession(_ id: String)
+    /// Stops every target terminal and returns only after its Ghostty surface
+    /// has been explicitly freed. Session rows remain owned by AppStore.
+    func quiesceSessions(_ ids: Set<String>) async
+    /// Makes refused or failed close operations eligible for lazy recreation.
+    func resumeSessions(_ ids: Set<String>)
 }
