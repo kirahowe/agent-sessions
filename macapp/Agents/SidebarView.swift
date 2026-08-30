@@ -5,95 +5,99 @@ struct SidebarView: View {
     @Environment(\.appActions) private var actions
 
     var body: some View {
-        List(selection: $store.selection) {
-            ForEach(store.projects) { project in
-                Section {
-                    ForEach(store.sessions.filter { $0.target == .root(projectPath: project.path) }) { session in
-                        SessionRowView(store: store, session: session, activity: store.attention[session.id]?.activity)
-                    }
-                    .onMove { offsets, destination in
-                        store.moveSessions(
-                            in: .root(projectPath: project.path),
-                            fromOffsets: offsets,
-                            toOffset: destination
-                        )
-                    }
-
-                    ForEach(store.workspaces.filter { $0.projectPath == project.path }) { workspace in
-                        WorkspaceRowView(store: store, workspace: workspace)
-
-                        ForEach(sessions(in: workspace)) { session in
-                            SessionRowView(store: store, session: session, activity: store.attention[session.id]?.activity, indent: 16)
+        VStack(spacing: 0) {
+            List(selection: $store.selection) {
+                ForEach(store.projects) { project in
+                    Section {
+                        ForEach(store.sessions.filter { $0.target == .root(projectPath: project.path) }) { session in
+                            SessionRowView(store: store, session: session, activity: store.attention[session.id]?.activity)
                         }
                         .onMove { offsets, destination in
                             store.moveSessions(
-                                in: .workspace(projectPath: workspace.projectPath, name: workspace.name),
+                                in: .root(projectPath: project.path),
                                 fromOffsets: offsets,
                                 toOffset: destination
                             )
                         }
-                    }
-                } header: {
-                    HStack {
-                        Text(project.name)
-                            .font(.subheadline)
-                            .fontWeight(.semibold)
-                        if store.projectWorkingCopyAttention.contains(project.path) {
-                            Image(systemName: "exclamationmark.triangle.fill")
-                                .imageScale(.small)
-                                .foregroundStyle(.orange)
-                                .help("The project's workspace hasn't caught up with the latest project progress. If an update conflicted, resolve the marked conflicts there, then refresh it from the project menu.")
-                                .accessibilityLabel("Project workspace hasn't followed the latest project progress")
+
+                        ForEach(store.workspaces.filter { $0.projectPath == project.path }) { workspace in
+                            WorkspaceRowView(store: store, workspace: workspace)
+
+                            ForEach(sessions(in: workspace)) { session in
+                                SessionRowView(store: store, session: session, activity: store.attention[session.id]?.activity, indent: 16)
+                            }
+                            .onMove { offsets, destination in
+                                store.moveSessions(
+                                    in: .workspace(projectPath: workspace.projectPath, name: workspace.name),
+                                    fromOffsets: offsets,
+                                    toOffset: destination
+                                )
+                            }
                         }
-                        Spacer()
-                        Menu {
+                    } header: {
+                        HStack {
+                            Text(project.name)
+                                .font(.subheadline)
+                                .fontWeight(.semibold)
+                            if store.projectWorkingCopyAttention.contains(project.path) {
+                                Image(systemName: "exclamationmark.triangle.fill")
+                                    .imageScale(.small)
+                                    .foregroundStyle(.orange)
+                                    .help("The project's workspace hasn't caught up with the latest project progress. If an update conflicted, resolve the marked conflicts there, then refresh it from the project menu.")
+                                    .accessibilityLabel("Project workspace hasn't followed the latest project progress")
+                            }
+                            Spacer()
+                            Menu {
+                                projectHeaderMenuItems(project)
+                            } label: {
+                                Image(systemName: "ellipsis.circle")
+                                    .imageScale(.small)
+                                    .foregroundStyle(.secondary)
+                            }
+                            .menuStyle(.borderlessButton)
+                            .menuIndicator(.hidden)
+                            .fixedSize()
+                            .accessibilityLabel("More Actions")
+                            // Direct store call, not actions.perform: this targets
+                            // the specific project this header belongs to, not the app's
+                            // global selection (see comment on the row context menu below).
+                            Button {
+                                store.newSession(in: project)
+                            } label: {
+                                Image(systemName: "plus")
+                            }
+                            .buttonStyle(.borderless)
+                        }
+                        .padding(.vertical, 6)
+                        .padding(.trailing, 4)
+                        .contextMenu {
                             projectHeaderMenuItems(project)
-                        } label: {
-                            Image(systemName: "ellipsis.circle")
-                                .imageScale(.small)
-                                .foregroundStyle(.secondary)
                         }
-                        .menuStyle(.borderlessButton)
-                        .menuIndicator(.hidden)
-                        .fixedSize()
-                        .accessibilityLabel("More Actions")
-                        // Direct store call, not actions.perform: this targets
-                        // the specific project this header belongs to, not the app's
-                        // global selection (see comment on the row context menu below).
-                        Button {
-                            store.newSession(in: project)
-                        } label: {
-                            Image(systemName: "plus")
-                        }
-                        .buttonStyle(.borderless)
-                    }
-                    .padding(.vertical, 6)
-                    .padding(.trailing, 4)
-                    .contextMenu {
-                        projectHeaderMenuItems(project)
                     }
                 }
             }
-        }
-        .listStyle(.sidebar)
-        .environment(\.defaultMinListRowHeight, 28)
-        // Declared here, on the sidebar column's content, rather than in
-        // RootView's `.toolbar`: items on the split view itself land in the
-        // detail column's section of the unified toolbar (where the Agent
-        // Dashboard toggle lives), while items declared inside the sidebar
-        // column land in that column's own section. `.navigation` is the
-        // placement SwiftUI groups with its own sidebar toggle, so the two
-        // render side by side (verified on macOS 26: toggle first, then this
-        // button, both at the sidebar section's trailing end).
-        .toolbar {
-            ToolbarItem(placement: .navigation) {
+            .listStyle(.sidebar)
+            .environment(\.defaultMinListRowHeight, 28)
+
+            // Bottom-left, borderless, and secondary-styled on purpose: a
+            // full-width footer bar here read as too heavy for the panel,
+            // and putting this in the window toolbar instead made it look
+            // like it belonged to the terminal window, not the project list.
+            // Living inside the sidebar panel keeps it scoped to what it acts on.
+            HStack {
                 Button {
                     actions?.perform(.addProject)
                 } label: {
-                    Label("Add Project…", systemImage: "plus")
+                    Label("Add Project", systemImage: "plus")
+                        .font(.callout)
                 }
+                .buttonStyle(.borderless)
+                .foregroundStyle(.secondary)
                 .help("Add Project…")
+                Spacer()
             }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 8)
         }
     }
 
