@@ -23,27 +23,41 @@ The generated `macapp/Agents.xcodeproj` and build output under `macapp/.build`
 are gitignored — `bb gen` regenerates the project from `macapp/project.yml`
 whenever you need it.
 
-## Resuming OMP sessions after a restart
+## Resuming agent sessions after a restart
 
-The app remembers the last OMP session associated with each terminal. After
-relaunching Agents, opening a restored terminal starts a fresh shell and prints
-the remembered session title, an optional prompt preview, and an explicit
-resume command:
+The app remembers the last agent session associated with each terminal,
+whichever harness it was running. After relaunching Agents, opening a
+restored terminal starts a fresh shell and prints the remembered session
+title, an optional prompt preview, and the resume command for that harness:
 
 ```text
-OMP session: Add optional OMP session resume
-Prompt: Persist the last session for each terminal
-Resume: omp --resume 01a03bbc-0713-729c-a74b-b66f49ddeddd
+Last Claude Code session: Make the resume hint harness agnostic
+Prompt: I want the terminal to print a resume command on boot
+Resume last session: claude --resume 01a03bbc-0713-729c-a74b-b66f49ddeddd
 ```
 
 Agents never runs that command automatically. Resuming can rebuild provider
 caches and spend tokens, so the decision stays with you.
 
-This integration currently supports OMP's default profile. It needs no hook or
-OMP configuration: terminals spawned by Agents opt into OMP's built-in
-CLI-agent protocol, then persist the session metadata OMP reports. Named OMP
-profiles are not included in that protocol yet, so Agents cannot construct a
-profile-qualified resume command for them.
+How the app learns the session id depends on the harness:
+
+| Harness     | Session announced by                            | Resume command         |
+|-------------|-------------------------------------------------|------------------------|
+| Claude Code | `hooks/agents-status.sh` (see below)            | `claude --resume <id>` |
+| Codex CLI   | `hooks/agents-status.sh` (see below)            | `codex resume <id>`    |
+| OMP         | OMP's built-in Warp CLI-agent protocol, no setup | `omp --resume <id>`    |
+
+Claude Code and Codex announce their session through the same hook that
+reports status (see "With the hook, for real agent state"). The hook
+announces the session from whichever registered event fires first, so even a
+partial registration works — but the prompt preview comes only from
+`UserPromptSubmit`, and a session that never calls a tool is only announced by
+`SessionStart`, so register both if you want the hint to be reliable.
+
+OMP needs no hook: terminals spawned by Agents opt into OMP's built-in
+CLI-agent protocol, and the app persists what OMP reports. Only OMP's default
+profile is covered — named profiles are not part of that protocol yet, so the
+app cannot construct a profile-qualified resume command for them.
 
 ## Agent dashboard
 
@@ -114,6 +128,12 @@ pop one for real.
 It also emits only when the state actually changes, so a long agent turn
 writes nothing down the pty after the first escape.
 
+The same script also announces the agent's session id — and, on each prompt,
+a short preview of what you asked — so the app can print the resume hint
+described in "Resuming agent sessions after a restart". It tells Claude Code
+and Codex apart by looking at the process that invoked it, so nothing needs
+configuring per harness.
+
 #### Claude Code
 
 Wire it up in `settings.json` under Claude Code's config directory. That is
@@ -157,8 +177,11 @@ rather than replacing it:
 `Stop` and `Notification` raise the indicator; the rest clear it.
 `PreToolUse`/`PostToolUse` are what clear the red after you approve a
 permission prompt — approving isn't a `UserPromptSubmit`, so nothing else
-would. `SessionStart` is not strictly required; it just resyncs a fresh
-session so the first real event is guaranteed to be sent.
+would. `SessionStart` resyncs a fresh session so the first real event is
+guaranteed to be sent, and together with `UserPromptSubmit` it is what makes
+the resume hint reliable: the session is announced from whichever event fires
+first, but only `UserPromptSubmit` carries the prompt preview, and only
+`SessionStart` catches a session that never calls a tool.
 
 #### Codex
 
