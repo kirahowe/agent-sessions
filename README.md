@@ -123,14 +123,17 @@ app cannot construct a profile-qualified resume command for them.
 
 ## Agent dashboard
 
-The right-side Agent Dashboard is an attention-first overview of every open
-session. Blocked sessions appear first, then sessions waiting for you, followed
-by sessions with no attention signal. Selecting a row opens that terminal. Use
-the trailing-sidebar toolbar button to collapse or reopen the pane.
+The right-side Agent Dashboard shows only the sessions that need you: blocked
+sessions first, then sessions waiting for you. Sessions with no attention
+signal are hidden rather than listed at the bottom. The summary line above the
+list still counts every open session, so the difference is how many are
+hidden. When sessions are open but none need attention, the pane says so.
+Selecting a row opens that terminal. Use the trailing-sidebar toolbar button to
+collapse or reopen the pane.
 
-“No attention needed” intentionally does not claim the agent is working:
-without a structured status signal, the app cannot distinguish a running agent
-from an idle shell.
+The all-quiet state says the hidden sessions are “working or idle” rather than
+“working” on purpose: without a structured status signal, the app cannot
+distinguish a running agent from an idle shell.
 
 ## Waiting indicators
 

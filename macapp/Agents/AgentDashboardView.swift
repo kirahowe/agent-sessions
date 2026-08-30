@@ -1,23 +1,23 @@
 import SwiftUI
 
-/// A compact, live overview of all active sessions, ordered by attention.
+/// A compact, live view of only the sessions that need you: blocked
+/// sessions first, then sessions waiting for you. Quiet sessions — no
+/// attention signal at all — are hidden from this list entirely, not shown
+/// at the bottom; the summary line above still counts every open session so
+/// you can tell how many are hidden.
 struct AgentDashboardView: View {
     @ObservedObject var store: AppStore
 
-    private var orderedSessions: [SessionRow] {
-        store.sessions.enumerated().sorted { lhs, rhs in
-            let left = attentionRank(for: lhs.element)
-            let right = attentionRank(for: rhs.element)
-            return left == right ? lhs.offset < rhs.offset : left < right
-        }.map(\.element)
+    private var entries: [AgentDashboardEntry] {
+        AgentDashboard.entries(sessions: store.sessions, attention: store.attention)
     }
 
     private var blockedCount: Int {
-        store.sessions.filter { store.attention[$0.id]?.activity == .blocked }.count
+        entries.filter { $0.activity == .blocked }.count
     }
 
     private var yourTurnCount: Int {
-        store.sessions.filter { store.attention[$0.id]?.activity == .yourTurn }.count
+        entries.filter { $0.activity == .yourTurn }.count
     }
 
     var body: some View {
@@ -34,15 +34,22 @@ struct AgentDashboardView: View {
                 .padding(.horizontal)
                 .padding(.top, 4)
 
-            if orderedSessions.isEmpty {
+            if store.sessions.isEmpty {
                 ContentUnavailableView("No active sessions", systemImage: "rectangle.stack")
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if entries.isEmpty {
+                ContentUnavailableView(
+                    "Nothing needs your attention",
+                    systemImage: "checkmark.circle",
+                    description: Text(quietDescription)
+                )
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
-                List(orderedSessions) { session in
+                List(entries) { entry in
                     Button {
-                        store.selection = session.id
+                        store.selection = entry.session.id
                     } label: {
-                        SessionDashboardRow(store: store, session: session)
+                        SessionDashboardRow(store: store, entry: entry)
                     }
                     .buttonStyle(.plain)
                     .listRowInsets(EdgeInsets(top: 7, leading: 12, bottom: 7, trailing: 12))
@@ -60,28 +67,24 @@ struct AgentDashboardView: View {
         return "\(total) active session\(total == 1 ? "" : "s") · \(needingAttention) needing attention"
     }
 
-    private func attentionRank(for session: SessionRow) -> Int {
-        switch store.attention[session.id]?.activity {
-        case .blocked: return 0
-        case .yourTurn: return 1
-        case nil: return 2
-        }
+    /// Wording for the all-quiet state, matching the README: no signal means
+    /// the agent may be working or idle, never a claim that it's running.
+    private var quietDescription: String {
+        let total = store.sessions.count
+        return "\(total) session\(total == 1 ? "" : "s") \(total == 1 ? "is" : "are") working or idle"
     }
 }
 
 private struct SessionDashboardRow: View {
     @ObservedObject var store: AppStore
-    let session: SessionRow
+    let entry: AgentDashboardEntry
 
-    private var activity: SessionActivity? {
-        store.attention[session.id]?.activity
-    }
+    private var session: SessionRow { entry.session }
 
     private var statusText: String {
-        switch activity {
+        switch entry.activity {
         case .blocked: return "Blocked on you"
         case .yourTurn: return "Waiting for you"
-        case nil: return "No attention needed"
         }
     }
 
@@ -124,9 +127,7 @@ private struct SessionDashboardRow: View {
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
                 HStack(spacing: 5) {
-                    if let activity {
-                        SessionActivityIndicator(activity: activity)
-                    }
+                    SessionActivityIndicator(activity: entry.activity)
                     Text(statusText)
                         .font(.caption)
                         .foregroundStyle(.secondary)
