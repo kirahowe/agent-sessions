@@ -15,14 +15,19 @@ project. The other remains a valid draft. It reconciles with the latest project
 state automatically when it is eventually closed. Open agent workspaces must
 not be eagerly rewritten underneath running sessions.
 
-An overlap is the exceptional case. The operation changes nothing, preserves
-the workspace, and explains that its changes need attention.
+An overlap is the exceptional case. The project keeps its current progress,
+the workspace stays open with the overlap left in it to resolve, and the
+explanation says so.
 
 ## Invariants
 
 1. A workspace can add only changes owned by that workspace.
-2. Adding changes is atomic: every change reaches project progress, or nothing
-   changes and the workspace remains open.
+2. A close either advances project progress and removes the workspace, or
+   leaves the workspace open with an explanation of why. Project progress
+   never advances halfway. When the rebase onto the latest progress conflicts,
+   that conflicted rebase is left in the workspace to resolve rather than
+   discarded, and the project is untouched. Nothing is copied aside first: the
+   version control system's own operation log is the record, and the way back.
 3. Active workspaces retain stable files and history while sibling workspaces
    close.
 4. Reconciliation with newer project progress is automatic and lazy.
@@ -33,8 +38,8 @@ the workspace, and explains that its changes need attention.
    is flagged for attention and the user brings it up to date from the project
    menu. Neither a deferral nor an overlap retroactively turns a successful
    close into a failure.
-6. Concurrent repository activity must not be lost by speculative previews or
-   rollback of unrelated operations.
+6. Concurrent repository activity must not be lost. A preview only reads;
+   only an add writes.
 7. Every terminal rooted in the workspace is stopped before the engine begins
    a land or forget operation. Stopping ends the process, so the sheet states
    that cost before the user commits to it, and a refused operation brings each
@@ -72,15 +77,17 @@ which establishes the project's starting progress from these changes. The
 trunk name the engine creates for that (`main`) is an engine default the sheet
 never shows.
 
-If changes overlap newer project progress, the attempted add changes nothing
-and leaves the workspace open. The result explains that the changes need
-attention and offers **Return to Workspace** plus the separately destructive
-**Close Without Adding…** path. It never offers an add action known to fail.
+If a preview predicts that the changes overlap newer project progress, nothing
+is attempted: the result explains that the changes need attention and offers
+**Return to Workspace** plus the separately destructive **Close Without
+Adding…** path. It never offers an add action known to fail.
 
-If new work reaches the workspace while its changes are being added, the
-changes are still added but the workspace stays open: the sheet says so and
-offers **Return to Workspace**, and closing it again reviews only the newer
-work.
+If the overlap only appears once the add is under way, the workspace has been
+moved onto the latest project progress with the conflicts marked, the project
+is unchanged, and the workspace stays open. The sheet says that, shows the
+engine's own account of the conflict, and offers the same two paths. Resolving
+the conflicts in the workspace and closing again completes the close; undoing
+the move in the workspace backs it out.
 
 The sheet remains present while preparing, adding, and closing. Success reports
 the number of changes added and any follow-up notice, and dismisses on
@@ -117,20 +124,20 @@ workspace creation, listing, forgetting, previewing, and landing to
 `workstream-manager`, adding only app-specific defaults such as the `agents`
 namespace if the library does not already provide them.
 
-Every successful land payload includes a required workspace_retained boolean.
-The app removes sessions and rows only when it is false; when it is true, the
-workspace remains open and its terminals are recreated with their resume hints.
-Every successful preview also carries an opaque snapshot of the exact target and
-preferred project progress used to compute its change list. The application
-retains that value with the prepared sheet without presenting it to the user.
-Before any land, the app frees the workspace's terminal surfaces, supplies the
-manager's explicit quiesced-finalization flag, and round-trips the preview
-snapshot. The manager rechecks that exact state after quiescence and before its
-first mutation. If either workspace or preferred project progress changed, it
-refuses the stale application; Agents preserves all rows and persistence,
-resumes the sessions with their saved OMP metadata, clears any summary written
-for the stale preview, and immediately prepares the current project-oriented
-change list.
+The CLI is a plain sequential wrapper over jj and git: it holds no tokens,
+copies nothing aside, and performs no compensating rollbacks. A preview
+predicts conflicts read-only (under jj, by rebasing in an operation that is
+never integrated); a land performs the rebase and reports what it actually
+did, including the conflicts it left behind.
+
+A successful land therefore has exactly one meaning — project progress advanced
+and the workspace is deregistered — so Agents always removes the row, its
+sessions, and its persisted state, and moves the leftover directory to the Bin.
+A failure to move that directory is a notice, never a lifecycle signal. The one
+in-between outcome the engine reports separately is a land that advanced the
+trunk but could not deregister the workspace; the app presents the engine's own
+message for it and leaves the workspace in place, where closing again finds
+nothing left to add.
 
 A no-changes preview is advisory rather than deletion authorization. After
 quiescing terminals, the app asks the manager to forget only if the workspace is
@@ -139,13 +146,6 @@ sessions, and refreshes the sheet with the new changes. Only the separately
 confirmed **Close Without Adding** path uses an explicitly destructive forget.
 Any forget failure leaves all live and persisted app state intact, while local
 folder cleanup after manager success is only a non-fatal notice.
-
-Speculative Jujutsu conflict checks must not perform a repository-wide
-`jj op restore` after temporarily integrating a rebase. Use an unintegrated
-operation and inspect it with `--at-operation`, or an equivalent targeted
-transaction supplied by `workstream-manager`. Actual application must recheck
-current state and remain the enforcement point because project progress can
-change after a preview.
 
 Other agent workspaces are not rebased after a successful close; their future
 land operation already reconciles them with current project progress. The
@@ -159,11 +159,11 @@ attention while the workspace close itself remains successful.
 
 1. Replace the duplicated workspace script with the local
    `workstream-manager` dependency while preserving the app's JSON contract.
-2. Harden Jujutsu preview/application transactions for concurrent operations.
+2. Keep previews read-only, so only an add ever writes to the repository.
 3. Unify keep/delete affordances into the close-workspace sheet and remove
    branch-oriented language and the post-land rebase prompt.
 4. Add contract and behavioral coverage for clean close, close without adding,
-   no changes, automatic reconciliation, overlap rollback, and concurrent
+   no changes, automatic reconciliation, overlap attention, and concurrent
    repository activity.
 5. Review the complete diff in the main loop, delegate repairs, run focused
    CLI and macOS verification, then complete interactive RevDiff review.

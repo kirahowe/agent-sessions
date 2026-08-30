@@ -52,15 +52,14 @@ sheet that covers every outcome:
 - If some of those changes are undescribed, the sheet asks for a one-line
   summary before it will add them.
 - With nothing to add, it just offers **Close Workspace** and **Cancel**.
-- If the changes overlap newer project progress, the sheet changes nothing.
-  It says the changes need attention and offers **Return to Workspace** or
-  **Close Without Adding…** — it never offers an add it already knows would
-  fail.
+- If the changes overlap newer project progress, the sheet says so and offers
+  **Return to Workspace** or **Close Without Adding…** — it never offers an add
+  it can predict would conflict. If a conflict only turns up once the add is
+  under way, the changes are moved onto the latest project progress with the
+  conflicts marked and the workspace stays open: resolve them there and close
+  it again, or back out with `jj undo` (`git rebase --abort`).
 - If the project has no shared progress yet — a brand-new repo — the sheet
   offers to set the project up with these changes as its starting point.
-- Rarely, the app adds the changes but new work arrives in the workspace
-  while it's closing, so it keeps the workspace open and says so; close it
-  again once you're ready.
 
 Closing stops every session in that workspace before anything changes, because
 the workspace's files are about to be rewritten out from under them. The sheet
@@ -80,10 +79,14 @@ progress on its own, the next time it closes.
 
 For the curious: adding changes means, under jj, rebasing the workspace's
 commits onto trunk and moving the trunk bookmark; under git, rebasing the
-`agents/<name>` branch and fast-forwarding trunk. Closing without adding just
-deregisters the workspace and moves its folder to the Bin — the commits stay
-in the repository's history (jj) or on the `agents/<name>` branch (git), so
-they're recoverable by hand.
+`agents/<name>` branch, fast-forwarding trunk, and deleting the now-merged
+branch. Either way the workspace is deregistered afterwards. Nothing is
+copied aside first: the version control system's own record — jj's operation
+log, git's reflog — is the safety net if an add ever needs unwinding by
+hand. Closing without adding just deregisters the
+workspace and moves its folder to the Bin — the commits stay in the
+repository's history (jj) or on the `agents/<name>` branch (git), so they're
+recoverable by hand.
 
 ## Resuming agent sessions after a restart
 
