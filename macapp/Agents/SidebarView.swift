@@ -77,26 +77,23 @@ struct SidebarView: View {
         }
         .listStyle(.sidebar)
         .environment(\.defaultMinListRowHeight, 28)
-        // `spacing: 0` plus an opaque bar behind the whole inset: without a
-        // background the List scrolls *through* the button, and a long session
-        // list ends up rendering rows on top of the label. The Divider is the
-        // usual macOS bottom-bar hairline marking where scrollable content ends.
-        .safeAreaInset(edge: .bottom, spacing: 0) {
-            VStack(spacing: 0) {
-                Divider()
+        // Declared here, on the sidebar column's content, rather than in
+        // RootView's `.toolbar`: items on the split view itself land in the
+        // detail column's section of the unified toolbar (where the Agent
+        // Dashboard toggle lives), while items declared inside the sidebar
+        // column land in that column's own section. `.navigation` is the
+        // placement SwiftUI groups with its own sidebar toggle, so the two
+        // render side by side (verified on macOS 26: toggle first, then this
+        // button, both at the sidebar section's trailing end).
+        .toolbar {
+            ToolbarItem(placement: .navigation) {
                 Button {
                     actions?.perform(.addProject)
                 } label: {
                     Label("Add Project…", systemImage: "plus")
-                        .frame(maxWidth: .infinity)
                 }
-                // Explicit, because a Button inside a `.sidebar` List otherwise
-                // inherits a borderless style and renders as bare accent text.
-                .buttonStyle(.bordered)
-                .controlSize(.large)
-                .padding(12)
+                .help("Add Project…")
             }
-            .background(.bar)
         }
     }
 
