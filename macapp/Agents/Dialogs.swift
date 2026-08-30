@@ -68,7 +68,10 @@ enum Dialogs {
         alert.addButton(withTitle: "Cancel")
 
         let duplicateNameCounts = Dictionary(grouping: projects, by: \.name).mapValues(\.count)
-        let projectPicker = NSPopUpButton(frame: .zero, pullsDown: false)
+        // KeyboardPopUpButton rather than NSPopUpButton so the picker is in
+        // the Tab loop and steppable with the arrow keys without Full
+        // Keyboard Access — see that class for why a stock pop-up isn't.
+        let projectPicker = KeyboardPopUpButton(frame: .zero, pullsDown: false)
         projectPicker.addItems(withTitles: projects.map { project in
             duplicateNameCounts[project.name, default: 0] > 1 ? project.path : project.name
         })
