@@ -258,6 +258,15 @@ final class ControlServer: @unchecked Sendable {
     private func acceptOne() {
         let client = accept(listenFD, nil, nil)
         guard client >= 0 else { return }
+        // A launcher can vanish mid-review — its `nc` gets Ctrl-C'd, its
+        // shell exits out from under it — and the next write(2) to that dead
+        // peer would otherwise raise SIGPIPE with the default disposition,
+        // which terminates the whole app rather than just failing this one
+        // write. SO_NOSIGPIPE turns that into an ordinary EPIPE return, which
+        // `reply(to:...)`'s `n <= 0` check below already treats as "stop
+        // writing, the peer is gone."
+        var noSigPipe: Int32 = 1
+        setsockopt(client, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, socklen_t(MemoryLayout<Int32>.size))
         // Each connection is served off the accept queue: a request blocks
         // for as long as its review is open, which would otherwise stall
         // every later connection behind it.
