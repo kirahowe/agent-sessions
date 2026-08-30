@@ -1,4 +1,5 @@
 import AppKit
+import Darwin
 import GhosttyTerminal
 import XCTest
 @testable import Agents
@@ -99,13 +100,25 @@ final class OverlayCenterTests: XCTestCase {
     }
 
     /// The socket path is what makes a Debug build and a Release build — which
-    /// differ *only* by bundle id — reachable independently. If this ever
-    /// collapsed to a fixed name, a review fired from one build could open in
-    /// the other, which is precisely the failure a URL scheme was rejected for.
+    /// differ *only* by bundle id — reachable independently, AND what makes
+    /// two launches of the very same build reachable independently too. That
+    /// second half is not cosmetic: AgentsTests runs with its TEST_HOST set to
+    /// the app bundle, so every test invocation boots the real
+    /// `AgentsApp.init` and, without a pid in the path, would bind straight
+    /// over a running app's socket file out from under it — leaving that app
+    /// listening on an unlinked inode and every subsequent review request
+    /// getting ECONNREFUSED. If the path ever collapsed to a fixed name, a
+    /// review fired from one build could open in another, or a test run could
+    /// silently kill a real app's control channel — both are the class of
+    /// failure a URL scheme was rejected for.
     func testControlSocketPathIsScopedToTheBundle() {
         let path = ControlServer.socketPath
         let bundleID = Bundle(for: OverlayCenterTests.self).bundleIdentifier
-        XCTAssertTrue(path.hasSuffix(".control.sock"), "unexpected socket path: \(path)")
+        let pid = ProcessInfo.processInfo.processIdentifier
+        XCTAssertTrue(
+            path.hasSuffix(".control.\(pid).sock"),
+            "the control socket path must carry this process's pid so a test-host launch (or any other second launch of the same build) cannot contend with a running instance's endpoint — unexpected socket path: \(path)"
+        )
         XCTAssertTrue(
             path.contains("com.kirahowe.agents"),
             "the control socket path must carry the bundle id so Debug and Release builds cannot collide on one endpoint (got \(path), test bundle \(bundleID ?? "nil"))"
@@ -115,6 +128,96 @@ final class OverlayCenterTests: XCTestCase {
             104,
             "sockaddr_un.sun_path is 104 bytes on Darwin — a longer path fails to bind at runtime, silently leaving the app with no control channel"
         )
+    }
+
+    /// A crashed instance (or a test-host launch that boots the app and then
+    /// exits, see the test above) leaves its per-pid socket file on disk with
+    /// nothing listening on it any more. The sweep in `bindAndListen` is what
+    /// keeps those from accumulating forever; this exercises it directly
+    /// against a temp directory rather than the real Application Support one,
+    /// so it can plant a genuinely dead socket without needing an actual crash.
+    func testSweepDeadSocketsRemovesOnlyDeadMatchingSockets() throws {
+        // Deliberately not FileManager's `temporaryDirectory`: on this
+        // machine it resolves under `/var/folders/...`, which alone is
+        // already close to the 104-byte `sockaddr_un.sun_path` limit, and a
+        // UUID-named subdirectory on top of it would push a socket path over
+        // that ceiling before the sweep logic under test ever runs. `/tmp`
+        // stays short as the literal string bind(2) sees, even though it is
+        // itself a symlink.
+        let directory = "/tmp/ctrlsweep-\(ProcessInfo.processInfo.processIdentifier)-\(Int(Date().timeIntervalSince1970 * 1000))"
+        try FileManager.default.createDirectory(atPath: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: directory) }
+
+        let prefix = "com.kirahowe.agents.control."
+        let deadPath = "\(directory)/\(prefix)111.sock"
+        let livePath = "\(directory)/\(prefix)222.sock"
+        let unrelatedPath = "\(directory)/not-a-control-socket.txt"
+        FileManager.default.createFile(atPath: unrelatedPath, contents: Data("hello".utf8))
+
+        // A dead socket: bind it, then close the fd WITHOUT unlinking. That
+        // leaves exactly what a crash leaves — a file at the path with no
+        // process on the other end to accept a connection.
+        let deadFD = try bindUnixSocket(at: deadPath)
+        close(deadFD)
+
+        // A live socket: bind, listen, and keep the fd open for the life of
+        // the test so the sweep finds a real listener.
+        let liveFD = try bindUnixSocket(at: livePath)
+        XCTAssertEqual(listen(liveFD, 1), 0, "failed to listen on the live test socket")
+        defer { close(liveFD) }
+
+        ControlServer.sweepDeadSockets(in: directory, prefix: prefix, ownPath: "/nonexistent-own-path")
+
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: deadPath),
+            "a socket file with nothing listening on it must be removed by the sweep"
+        )
+        XCTAssertTrue(
+            FileManager.default.fileExists(atPath: livePath),
+            "a socket with a live listener must never be removed by the sweep"
+        )
+        XCTAssertTrue(
+            FileManager.default.fileExists(atPath: unrelatedPath),
+            "a file that doesn't match the control-socket naming scheme must never be touched by the sweep"
+        )
+    }
+
+    /// Binds (but does not listen on) an AF_UNIX SOCK_STREAM socket at
+    /// `path`, returning the bound file descriptor. Shared setup for the
+    /// sweep test's dead- and live-socket fixtures.
+    private func bindUnixSocket(at path: String) throws -> Int32 {
+        struct SocketSetupError: Error, CustomStringConvertible {
+            let description: String
+        }
+
+        let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+        guard fd >= 0 else {
+            throw SocketSetupError(description: "socket() failed: \(String(cString: strerror(errno)))")
+        }
+
+        var addr = sockaddr_un()
+        addr.sun_family = sa_family_t(AF_UNIX)
+        let pathBytes = Array(path.utf8)
+        guard pathBytes.count < MemoryLayout.size(ofValue: addr.sun_path) else {
+            throw SocketSetupError(description: "test socket path too long: \(path)")
+        }
+        withUnsafeMutableBytes(of: &addr.sun_path) { raw in
+            raw.copyBytes(from: pathBytes)
+        }
+        let size = socklen_t(MemoryLayout<sockaddr_un>.size)
+        // Qualified as `Darwin.bind`: unqualified `bind` inside an NSObject
+        // subclass (XCTestCase, here) resolves to Cocoa Bindings'
+        // `NSObject.bind(_:to:withKeyPath:options:)` instead of the libc
+        // syscall, since member lookup wins over the global function.
+        let bound = withUnsafePointer(to: &addr) { pointer in
+            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                Darwin.bind(fd, sa, size)
+            }
+        }
+        guard bound == 0 else {
+            throw SocketSetupError(description: "bind() failed: \(String(cString: strerror(errno)))")
+        }
+        return fd
     }
 
     /// Without this key in the environment, a process inside a session has no

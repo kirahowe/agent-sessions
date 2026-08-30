@@ -1,3 +1,4 @@
+import AppKit
 import Darwin
 import Foundation
 
@@ -24,21 +25,27 @@ import Foundation
 ///   also fire-and-forget, with no way to report completion.
 ///
 /// The socket path carries the bundle id, so each build gets its own endpoint,
-/// and the path is stamped into every session's environment as
-/// `AGENTS_CONTROL_SOCK` (see `TerminalCenter.sessionEnvVars`). A client
-/// therefore always reaches the app instance that owns the very terminal it is
-/// running in, with no discovery, no guessing, and no cross-build mixups.
+/// AND the pid of the process that bound it, so two launches of the same
+/// binary can never contend for one endpoint either — including a test-host
+/// launch, which boots this same `AgentsApp.init` (see `AgentsApp`) and would
+/// otherwise steal the running app's socket file for the seconds it takes to
+/// run and exit, leaving the real app listening on an unlinked inode with no
+/// way back in. The path is stamped into every session's environment as
+/// `AGENTS_CONTROL_SOCK` (see `TerminalCenter.sessionEnvVars`), so a client
+/// always finds its own instance directly — no discovery, no guessing, no
+/// cross-build mixups, and no cross-instance contention.
 ///
 /// The connection is the completion signal: the server holds it open for the
 /// life of the overlay and writes its reply only once the command has exited.
 /// A caller blocks on a socket read instead of polling for a sentinel file,
 /// and a caller that dies takes nothing with it.
 final class ControlServer: @unchecked Sendable {
-    /// Absolute path of this build's socket.
+    /// Absolute path of this process's socket.
     ///
     /// `sockaddr_un.sun_path` is 104 bytes on Darwin, which is the real
     /// constraint on where this can live; Application Support keeps it well
-    /// inside that with room for the longest bundle id in use.
+    /// inside that with room for the longest bundle id in use, and the pid
+    /// suffix only ever adds another five to seven digits on top.
     static let socketPath: String = {
         let base = FileManager.default.urls(
             for: .applicationSupportDirectory,
@@ -50,8 +57,25 @@ final class ControlServer: @unchecked Sendable {
             withIntermediateDirectories: true
         )
         let bundleID = Bundle.main.bundleIdentifier ?? "com.kirahowe.agents"
-        return directory.appendingPathComponent("\(bundleID).control.sock").path
+        let pid = ProcessInfo.processInfo.processIdentifier
+        return directory.appendingPathComponent("\(bundleID).control.\(pid).sock").path
     }()
+
+    /// Directory holding every build's control sockets, live or dead —
+    /// `socketPath` with its last component removed. Shared by the startup
+    /// sweep, which has to look at siblings this instance did not create.
+    private static var socketDirectory: String {
+        (socketPath as NSString).deletingLastPathComponent
+    }
+
+    /// Prefix shared by every socket file this bundle id could ever have
+    /// created, at any pid, past or present: `<bundleid>.control.`. Scoping
+    /// the sweep to this prefix is what keeps a dev build from ever touching
+    /// a release build's socket, or vice versa.
+    private static var socketPrefix: String {
+        let bundleID = Bundle.main.bundleIdentifier ?? "com.kirahowe.agents"
+        return "\(bundleID).control."
+    }
 
     private struct Request: Decodable {
         let cmd: String
@@ -80,15 +104,51 @@ final class ControlServer: @unchecked Sendable {
             self?.completePending(ok: true, error: nil)
         }
         queue.async { [weak self] in self?.bindAndListen() }
+
+        // A clean quit is the one shutdown path worth handling explicitly: it
+        // is the only one where something is still around to act. A crash or
+        // a force-quit leaves the socket file behind regardless, which is
+        // exactly what the startup sweep below exists to clean up on the
+        // next launch, so there is no need to duplicate that recovery here —
+        // just don't litter the disk on the ordinary path.
+        NotificationCenter.default.addObserver(
+            forName: NSApplication.willTerminateNotification,
+            object: nil,
+            queue: nil
+        ) { [weak self] _ in
+            self?.shutdown()
+        }
+    }
+
+    private func shutdown() {
+        // Synchronous on purpose: termination does not drain dispatch queues,
+        // so an async hop here would race exit(2) and lose often enough to
+        // make this cleanup decorative. The control queue cannot deadlock a
+        // sync call — bindAndListen has long since finished, accepts only run
+        // when the listen fd is readable, and requests are served off-queue.
+        queue.sync { [weak self] in
+            guard let self else { return }
+            if let acceptSource = self.acceptSource {
+                acceptSource.cancel()
+                self.acceptSource = nil
+            }
+            if self.listenFD >= 0 {
+                close(self.listenFD)
+                self.listenFD = -1
+            }
+            unlink(Self.socketPath)
+        }
     }
 
     // MARK: - Socket setup
 
     private func bindAndListen() {
         let path = Self.socketPath
-        // A socket file outlives a crash, and bind(2) will not reuse one, so
-        // clearing a stale entry here is what makes the app restartable
-        // without the user ever seeing "address already in use".
+        // Two different processes can never collide on this exact path — it
+        // is scoped to our own pid — but pids do wrap and get reused across
+        // reboots, so on the small chance a stale file already sits here from
+        // some earlier life of this same pid, clear it before bind(2)
+        // refuses to reuse it.
         unlink(path)
 
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
@@ -136,6 +196,63 @@ final class ControlServer: @unchecked Sendable {
         source.setEventHandler { [weak self] in self?.acceptOne() }
         source.resume()
         acceptSource = source
+
+        // Now that our own endpoint exists (and is therefore excluded by
+        // path), sweep the rest of the directory for anything this bundle id
+        // left behind that nobody is listening on any more — see
+        // `sweepDeadSockets` for why a crash or a test-host launch produces
+        // exactly that kind of leftover.
+        Self.sweepDeadSockets(in: Self.socketDirectory, prefix: Self.socketPrefix, ownPath: path)
+    }
+
+    /// Removes control sockets under `directory` whose name starts with
+    /// `prefix` and ends in `.sock`, other than `ownPath`, provided nothing
+    /// is listening on them any more.
+    ///
+    /// A crashed instance's per-pid socket file has nobody left to unlink it
+    /// — the process that would have done so is gone — and the pre-per-instance
+    /// fixed-name file can be orphaned the exact same way by an older build.
+    /// `stat` cannot tell a dead file from a live one; they look identical on
+    /// disk. Attempting a `connect()` can: a live listener accepts it (the
+    /// probe then closes without sending a line, which `serve` already treats
+    /// as a no-op, so this never disturbs whatever session is using that
+    /// endpoint), while a dead file refuses the connection and is safe to
+    /// unlink. Scoping to `prefix` keeps a Debug build's sweep from ever
+    /// touching a Release build's socket, and excluding `ownPath` keeps an
+    /// instance from probing — let alone removing — the endpoint it just
+    /// bound. Free-standing so it can be exercised directly in tests without
+    /// standing up a whole `ControlServer`.
+    static func sweepDeadSockets(in directory: String, prefix: String, ownPath: String) {
+        guard let names = try? FileManager.default.contentsOfDirectory(atPath: directory) else { return }
+        for name in names {
+            guard name.hasPrefix(prefix), name.hasSuffix(".sock") else { continue }
+            let path = "\(directory)/\(name)"
+            guard path != ownPath, !isSocketLive(at: path) else { continue }
+            unlink(path)
+        }
+    }
+
+    /// Whether some process is listening on the AF_UNIX socket at `path`,
+    /// determined the only reliable way: trying to connect to it.
+    private static func isSocketLive(at path: String) -> Bool {
+        let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+        guard fd >= 0 else { return true } // can't probe — assume live and leave it alone
+        defer { close(fd) }
+
+        var addr = sockaddr_un()
+        addr.sun_family = sa_family_t(AF_UNIX)
+        let pathBytes = Array(path.utf8)
+        guard pathBytes.count < MemoryLayout.size(ofValue: addr.sun_path) else { return true }
+        withUnsafeMutableBytes(of: &addr.sun_path) { raw in
+            raw.copyBytes(from: pathBytes)
+        }
+        let size = socklen_t(MemoryLayout<sockaddr_un>.size)
+        let result = withUnsafePointer(to: &addr) { pointer in
+            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                connect(fd, sa, size)
+            }
+        }
+        return result == 0
     }
 
     private func acceptOne() {

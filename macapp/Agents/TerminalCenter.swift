@@ -83,12 +83,14 @@ final class TerminalCenter: ObservableObject, SessionTerminating {
     static let sessionEnvVars: [String: String] = [
         "AGENTS_APP": "1",
         "WARP_CLI_AGENT_PROTOCOL_VERSION": "1",
-        // Where to reach this build's control socket. A process running in
+        // Where to reach this instance's control socket. A process running in
         // this surface can then ask the app for a full-pane overlay without
         // discovering anything: not which app hosts it, and — since the path
-        // carries the bundle id — not which build either, so a review fired
-        // from the dev build can never surface in the release app. See
-        // ControlServer for the protocol and why it isn't AppleScript.
+        // carries both the bundle id and the pid that bound it — not which
+        // build either, nor which launch of that build, so a review can never
+        // surface in another build's app or contend with another instance of
+        // this same build. See ControlServer for the protocol and why it
+        // isn't AppleScript.
         "AGENTS_CONTROL_SOCK": ControlServer.socketPath,
     ]
 
