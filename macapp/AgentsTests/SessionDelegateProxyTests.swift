@@ -28,7 +28,7 @@ final class SessionDelegateProxyTests: XCTestCase {
     private var center: TerminalCenter!
     private var proxy: SessionDelegateProxy!
     private var received: [(id: String, signal: AttentionSignal)] = []
-    private var receivedOmpEvents: [(id: String, event: OmpSessionEvent)] = []
+    private var receivedAgentEvents: [(id: String, event: AgentSessionEvent)] = []
 
     override func setUp() async throws {
         try await super.setUp()
@@ -36,8 +36,8 @@ final class SessionDelegateProxyTests: XCTestCase {
         center.onSessionSignal = { [weak self] id, signal in
             self?.received.append((id, signal))
         }
-        center.onOmpSessionEvent = { [weak self] id, event in
-            self?.receivedOmpEvents.append((id, event))
+        center.onAgentSessionEvent = { [weak self] id, event in
+            self?.receivedAgentEvents.append((id, event))
         }
         self.center = center
         proxy = SessionDelegateProxy(sessionID: sessionID, center: center)
@@ -47,7 +47,7 @@ final class SessionDelegateProxyTests: XCTestCase {
         proxy = nil
         center = nil
         received = []
-        receivedOmpEvents = []
+        receivedAgentEvents = []
         try await super.tearDown()
     }
 
@@ -147,33 +147,77 @@ final class SessionDelegateProxyTests: XCTestCase {
         }
     }
 
-    // MARK: - OMP Warp CLI-agent protocol
+    // MARK: - Session-resume protocol (Warp CLI-agent title and the app's own hook title)
 
-    func testValidOmpNotificationUsesDistinctCallbackAndNeverBecomesAttentionSignal() {
+    func testValidWarpTitleOmpNotificationUsesDistinctCallbackAndNeverBecomesAttentionSignal() {
         proxy.terminalDidRequestDesktopNotification(
-            title: OmpSessionEvent.notificationTitle,
+            title: AgentSessionEvent.warpNotificationTitle,
             body: #"{"event":"prompt_submit","v":1,"agent":"omp","session_id":"omp-123","query":"Fix it"}"#
         )
 
         XCTAssertTrue(received.isEmpty)
-        XCTAssertEqual(receivedOmpEvents.map(\.id), [sessionID])
-        XCTAssertEqual(receivedOmpEvents.first?.event.sessionID, "omp-123")
-        XCTAssertEqual(receivedOmpEvents.first?.event.query, "Fix it")
+        XCTAssertEqual(receivedAgentEvents.map(\.id), [sessionID])
+        XCTAssertEqual(receivedAgentEvents.first?.event.agent, "omp")
+        XCTAssertEqual(receivedAgentEvents.first?.event.sessionID, "omp-123")
+        XCTAssertEqual(receivedAgentEvents.first?.event.query, "Fix it")
     }
 
     func testMalformedOrUnsupportedWarpNotificationIsConsumed() {
         for body in [
             "not json",
             #"{"event":"stop","v":2,"agent":"omp","session_id":"omp-123"}"#,
-            #"{"event":"stop","v":1,"agent":"other","session_id":"omp-123"}"#,
+            #"{"event":"stop","v":1,"agent":"  ","session_id":"omp-123"}"#,
         ] {
             proxy.terminalDidRequestDesktopNotification(
-                title: OmpSessionEvent.notificationTitle,
+                title: AgentSessionEvent.warpNotificationTitle,
                 body: body
             )
         }
 
         XCTAssertTrue(received.isEmpty)
-        XCTAssertTrue(receivedOmpEvents.isEmpty)
+        XCTAssertTrue(receivedAgentEvents.isEmpty)
+    }
+
+    func testValidHookTitleClaudeNotificationReachesAgentEventCallbackAndRaisesNoAttention() {
+        proxy.terminalDidRequestDesktopNotification(
+            title: AgentSessionEvent.hookNotificationTitle,
+            body: #"{"event":"session_start","v":1,"agent":"claude","session_id":"c-1"}"#
+        )
+
+        XCTAssertTrue(
+            received.isEmpty,
+            "hooks/agents-status.sh will emit agents:session on every prompt — if this ever leaked to the attention path it would raise a bogus gold dot each time"
+        )
+        XCTAssertEqual(receivedAgentEvents.map(\.id), [sessionID])
+        XCTAssertEqual(receivedAgentEvents.first?.event.agent, "claude")
+        XCTAssertEqual(receivedAgentEvents.first?.event.sessionID, "c-1")
+    }
+
+    func testMalformedHookTitleNotificationIsConsumedNotClassified() {
+        for body in [
+            "not json",
+            #"{"event":"stop","v":1,"agent":"","session_id":"c-1"}"#,
+        ] {
+            proxy.terminalDidRequestDesktopNotification(
+                title: AgentSessionEvent.hookNotificationTitle,
+                body: body
+            )
+        }
+
+        XCTAssertTrue(
+            received.isEmpty,
+            "a malformed agents:session envelope must never fall through to keyword classification — the hook's own title must never accidentally become a free-text attention signal"
+        )
+        XCTAssertTrue(receivedAgentEvents.isEmpty)
+    }
+
+    func testAgentsStatusNotificationStillProducesStructuredSignal() {
+        // Regression guard: gating on isSessionNotification(title:) must not
+        // swallow the unrelated agents:status protocol that AttentionSignal
+        // relies on.
+        proxy.terminalDidRequestDesktopNotification(title: "agents:status", body: "blocked")
+
+        XCTAssertEqual(received.map(\.signal), [.structured(.set(.blocked))])
+        XCTAssertTrue(receivedAgentEvents.isEmpty)
     }
 }

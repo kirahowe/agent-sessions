@@ -154,8 +154,8 @@ final class AppStore: ObservableObject {
         terminals.onTitleChange = { [weak self] id, title in
             self?.setSessionTitle(title, for: id)
         }
-        terminals.onOmpSessionEvent = { [weak self] id, event in
-            self?.handleOmpSessionEvent(event, for: id)
+        terminals.onAgentSessionEvent = { [weak self] id, event in
+            self?.handleAgentSessionEvent(event, for: id)
         }
         load()
         seedSessionCounters()
@@ -659,30 +659,35 @@ final class AppStore: ObservableObject {
             sessions[index].agentTitle = trimmed
             changed = true
         }
-        if var resume = sessions[index].ompResume,
-           let cleanTitle = OmpSessionResumeMetadata.normalizedDecoratedTitle(trimmed),
+        if var resume = sessions[index].resume,
+           let cleanTitle = SessionResumeMetadata.normalizedTitle(trimmed, agent: resume.agent),
            resume.title != cleanTitle
         {
             resume.title = cleanTitle
-            sessions[index].ompResume = resume
+            sessions[index].resume = resume
             changed = true
         }
         guard changed else { return }
         save()
     }
 
-    /// Persists the resumable OMP session announced for one terminal row.
-    /// A changed OMP session id replaces the prior snapshot; subsequent
-    /// events for the same id only fill or update the title/prompt fields.
-    func handleOmpSessionEvent(_ event: OmpSessionEvent, for sessionID: String) {
+    /// Persists the resumable agent session announced for one terminal row,
+    /// whichever harness announced it. "Same session" now means the same
+    /// (agent, session id) pair: a changed id, or a changed harness
+    /// entirely (e.g. Claude Code taking over a row OMP last ran in),
+    /// replaces the prior snapshot; subsequent events for the same pair
+    /// only fill or update the title/prompt fields.
+    func handleAgentSessionEvent(_ event: AgentSessionEvent, for sessionID: String) {
         guard let index = sessions.firstIndex(where: { $0.id == sessionID }) else { return }
 
         let rawTitle = sessions[index].agentTitle
         let currentDecoratedTitle = rawTitle.flatMap {
-            OmpSessionResumeMetadata.normalizedDecoratedTitle($0)
+            SessionResumeMetadata.normalizedTitle($0, agent: event.agent)
         }
-        var next: OmpSessionResumeMetadata
-        if let existing = sessions[index].ompResume, existing.sessionID == event.sessionID {
+        var next: SessionResumeMetadata
+        if let existing = sessions[index].resume,
+           existing.agent == event.agent, existing.sessionID == event.sessionID
+        {
             next = existing
             if next.title == nil {
                 next.title = currentDecoratedTitle
@@ -691,15 +696,16 @@ final class AppStore: ObservableObject {
                 next.prompt = query
             }
         } else {
-            next = OmpSessionResumeMetadata(
+            next = SessionResumeMetadata(
+                agent: event.agent,
                 sessionID: event.sessionID,
                 title: currentDecoratedTitle,
                 prompt: event.query
             )
         }
 
-        guard sessions[index].ompResume != next else { return }
-        sessions[index].ompResume = next
+        guard sessions[index].resume != next else { return }
+        sessions[index].resume = next
         save()
     }
 

@@ -24,9 +24,11 @@ protocol SessionTerminating: AnyObject {
     /// downstream (see AppStore.setSessionTitle): "remember the last title"
     /// means a shell clearing its title keeps the last real one.
     var onTitleChange: ((String, String) -> Void)? { get set }
-    /// Fired for a valid version-1 OMP Warp CLI-agent notification. The
-    /// terminal bridge consumes all notifications carrying Warp's magic
-    /// title, but forwards only successfully decoded OMP envelopes here.
-    var onOmpSessionEvent: ((String, OmpSessionEvent) -> Void)? { get set }
+    /// Fired for a valid version-1 session-resume notification — either
+    /// Warp's CLI-agent title (which OMP speaks natively) or the app's own
+    /// hook title (`agents:session`, for Claude Code and Codex). The
+    /// terminal bridge consumes every notification carrying either magic
+    /// title, but forwards only successfully decoded envelopes here.
+    var onAgentSessionEvent: ((String, AgentSessionEvent) -> Void)? { get set }
     func closeSession(_ id: String)
 }

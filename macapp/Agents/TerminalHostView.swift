@@ -32,7 +32,7 @@ struct TerminalHostView: NSViewRepresentable {
         let terminalView = center.terminalView(
             for: selectedID,
             workingDirectory: store.workingDirectory(for: row),
-            restoredOmpResume: row.ompResume
+            restoredResume: row.resume
         )
 
         if terminalView.superview !== containerView {

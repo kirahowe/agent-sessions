@@ -565,7 +565,7 @@ final class AppStoreTests: XCTestCase {
     // MARK: - 21b
 
     // The upgrade path for existing users: an older v2 state.json omits
-    // `customName`, `agentTitle`, and `ompResume`. Decoding must treat them as
+    // `customName`, `agentTitle`, and `resume`. Decoding must treat them as
     // nil rather than throwing — a throw would move the file aside as
     // "corrupt" and silently wipe the user's projects/sessions on the very
     // first launch after the update.
@@ -584,10 +584,52 @@ final class AppStoreTests: XCTestCase {
         let session = store.sessions.first { $0.id == "s-1" }!
         XCTAssertNil(session.customName)
         XCTAssertNil(session.agentTitle)
-        XCTAssertNil(session.ompResume)
+        XCTAssertNil(session.resume)
         // With neither present the display name falls back to the auto label.
         XCTAssertEqual(session.displayName, "Session 1")
         XCTAssertNil(session.subtitle)
+    }
+
+    // MARK: - 21c
+
+    // The narrower upgrade path this refactor itself introduces: a v2
+    // state.json written by the pre-refactor app carries the row's resume
+    // metadata under the old key `ompResume`, with no `agent` field (every
+    // session that key could ever describe was necessarily OMP's, the only
+    // harness that spoke the protocol at the time). Decoding must recover
+    // that as `agent == "omp"`, and every subsequent save must persist it
+    // under the new `resume` key (with `agent`) and drop `ompResume`
+    // entirely — never write both, and never keep writing the old key.
+    func test21c_legacyOmpResumeKeyDecodesAsOmpAgentAndSavesUnderNewKey() throws {
+        let url = TestSupport.freshStateURL()
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+
+        let legacyResumeJSON = """
+        {"version":2,"projects":["/tmp/proj-A"],"sessions":[{"id":"s-1","target":{"root":{"projectPath":"/tmp/proj-A"}},"name":"Session 1","ompResume":{"sessionID":"omp-9","title":"Old task","prompt":"P"}}],"workspaces":[],"selection":"s-1"}
+        """
+        try Data(legacyResumeJSON.utf8).write(to: url)
+
+        let spy = SpyTerminals()
+        let store = AppStore(terminals: spy, stateURL: url)
+
+        let expected = SessionResumeMetadata(agent: "omp", sessionID: "omp-9", title: "Old task", prompt: "P")
+        XCTAssertEqual(
+            store.sessions.first { $0.id == "s-1" }?.resume, expected,
+            "a legacy ompResume payload has no agent field because it predates the concept — every row it could describe ran OMP, so decoding must fill that in rather than leaving the row unresumable"
+        )
+
+        // Trigger a save (renameSession always saves) and confirm the
+        // on-disk shape has fully migrated: new key present with an agent,
+        // old key gone for good.
+        store.renameSession("s-1", to: "Renamed")
+
+        let raw = try String(contentsOf: url, encoding: .utf8)
+        XCTAssertTrue(raw.contains("\"resume\""), "a fresh save must write the resume key: \(raw)")
+        XCTAssertTrue(raw.contains("\"agent\":\"omp\""), "a fresh save must persist which harness this snapshot belongs to: \(raw)")
+        XCTAssertFalse(raw.contains("\"ompResume\""), "a fresh save must never re-write the retired key, or every future load would keep needing this same migration: \(raw)")
+
+        let restored = AppStore(terminals: SpyTerminals(), stateURL: url, engine: FakeWorkspaceEngine())
+        XCTAssertEqual(restored.sessions.first { $0.id == "s-1" }?.resume, expected)
     }
 
     // MARK: - 22
@@ -2011,22 +2053,23 @@ final class AppStoreTests: XCTestCase {
         )
     }
 
-    // MARK: - OMP session resume
+    // MARK: - Agent session resume
 
-    func test87_ompCallbackPersistsAndEnrichesResumeMetadataWithoutRaisingAttention() {
+    func test87_agentCallbackPersistsAndEnrichesResumeMetadataWithoutRaisingAttention() {
         let (store, spy, url) = TestSupport.makeStore()
         store.addProject(path: "/tmp/proj-A")
         let sessionID = store.sessions.first!.id
 
         spy.onTitleChange?(sessionID, "π ⠙ Repair persistence")
-        spy.onOmpSessionEvent?(
+        spy.onAgentSessionEvent?(
             sessionID,
-            OmpSessionEvent(name: "session_start", sessionID: "omp-1", query: nil)
+            AgentSessionEvent(agent: "omp", name: "session_start", sessionID: "omp-1", query: nil)
         )
 
         XCTAssertEqual(
-            store.sessions.first?.ompResume,
-            OmpSessionResumeMetadata(
+            store.sessions.first?.resume,
+            SessionResumeMetadata(
+                agent: "omp",
                 sessionID: "omp-1",
                 title: "Repair persistence",
                 prompt: nil
@@ -2034,17 +2077,17 @@ final class AppStoreTests: XCTestCase {
         )
         XCTAssertNil(store.attention[sessionID])
 
-        spy.onOmpSessionEvent?(
+        spy.onAgentSessionEvent?(
             sessionID,
-            OmpSessionEvent(name: "prompt_submit", sessionID: "omp-1", query: "Make it durable")
+            AgentSessionEvent(agent: "omp", name: "prompt_submit", sessionID: "omp-1", query: "Make it durable")
         )
         spy.onTitleChange?(sessionID, "zsh: /tmp/proj-A")
 
-        XCTAssertEqual(store.sessions.first?.ompResume?.title, "Repair persistence")
-        XCTAssertEqual(store.sessions.first?.ompResume?.prompt, "Make it durable")
+        XCTAssertEqual(store.sessions.first?.resume?.title, "Repair persistence")
+        XCTAssertEqual(store.sessions.first?.resume?.prompt, "Make it durable")
 
         let restored = AppStore(terminals: SpyTerminals(), stateURL: url, engine: FakeWorkspaceEngine())
-        XCTAssertEqual(restored.sessions.first?.ompResume, store.sessions.first?.ompResume)
+        XCTAssertEqual(restored.sessions.first?.resume, store.sessions.first?.resume)
     }
 
     func test88_newOmpSessionIDReplacesPriorMetadataAndLaterDecoratedTitleEnrichesIt() {
@@ -2053,23 +2096,23 @@ final class AppStoreTests: XCTestCase {
         let sessionID = store.sessions.first!.id
 
         spy.onTitleChange?(sessionID, "π > Old task")
-        spy.onOmpSessionEvent?(
+        spy.onAgentSessionEvent?(
             sessionID,
-            OmpSessionEvent(name: "prompt_submit", sessionID: "omp-old", query: "Old prompt")
+            AgentSessionEvent(agent: "omp", name: "prompt_submit", sessionID: "omp-old", query: "Old prompt")
         )
         spy.onTitleChange?(sessionID, "π > New task")
-        spy.onOmpSessionEvent?(
+        spy.onAgentSessionEvent?(
             sessionID,
-            OmpSessionEvent(name: "session_start", sessionID: "omp-new", query: nil)
+            AgentSessionEvent(agent: "omp", name: "session_start", sessionID: "omp-new", query: nil)
         )
 
         XCTAssertEqual(
-            store.sessions.first?.ompResume,
-            OmpSessionResumeMetadata(sessionID: "omp-new", title: "New task", prompt: nil)
+            store.sessions.first?.resume,
+            SessionResumeMetadata(agent: "omp", sessionID: "omp-new", title: "New task", prompt: nil)
         )
 
         spy.onTitleChange?(sessionID, "π ! New task needs input")
-        XCTAssertEqual(store.sessions.first?.ompResume?.title, "New task needs input")
+        XCTAssertEqual(store.sessions.first?.resume?.title, "New task needs input")
     }
 
     func test89_shellTitleDoesNotEnrichOrClearExistingOmpResumeMetadata() {
@@ -2078,19 +2121,114 @@ final class AppStoreTests: XCTestCase {
         let sessionID = store.sessions.first!.id
 
         spy.onTitleChange?(sessionID, "zsh: /tmp/proj-A")
-        spy.onOmpSessionEvent?(
+        spy.onAgentSessionEvent?(
             sessionID,
-            OmpSessionEvent(name: "session_start", sessionID: "omp-1", query: nil)
+            AgentSessionEvent(agent: "omp", name: "session_start", sessionID: "omp-1", query: nil)
         )
-        spy.onOmpSessionEvent?(
+        spy.onAgentSessionEvent?(
             sessionID,
-            OmpSessionEvent(name: "tool_complete", sessionID: "omp-1", query: nil)
+            AgentSessionEvent(agent: "omp", name: "tool_complete", sessionID: "omp-1", query: nil)
         )
 
-        XCTAssertNil(store.sessions.first?.ompResume?.title)
-        XCTAssertEqual(store.sessions.first?.ompResume?.sessionID, "omp-1")
+        XCTAssertNil(store.sessions.first?.resume?.title)
+        XCTAssertEqual(store.sessions.first?.resume?.sessionID, "omp-1")
 
         spy.onTitleChange?(sessionID, "π > Recognized OMP task")
-        XCTAssertEqual(store.sessions.first?.ompResume?.title, "Recognized OMP task")
+        XCTAssertEqual(store.sessions.first?.resume?.title, "Recognized OMP task")
+    }
+
+    // MARK: - 90
+
+    func test90_claudeCodeSessionFlowPersistsAcrossReloadWithoutRaisingAttention() {
+        let (store, spy, url) = TestSupport.makeStore()
+        store.addProject(path: "/tmp/proj-A")
+        let sessionID = store.sessions.first!.id
+
+        spy.onTitleChange?(sessionID, "◐ Fix the parser")
+        spy.onAgentSessionEvent?(
+            sessionID,
+            AgentSessionEvent(agent: "claude", name: "SessionStart", sessionID: "c-1", query: nil)
+        )
+
+        XCTAssertEqual(
+            store.sessions.first?.resume,
+            SessionResumeMetadata(agent: "claude", sessionID: "c-1", title: "Fix the parser", prompt: nil),
+            "a Claude Code spinner-decorated title present at session-start time must seed the resume snapshot's title immediately, the same way an OMP π title does"
+        )
+        XCTAssertNil(store.attention[sessionID], "a session-resume envelope must never itself raise attention — only agents:status/notifications/bell do that")
+
+        spy.onAgentSessionEvent?(
+            sessionID,
+            AgentSessionEvent(agent: "claude", name: "UserPromptSubmit", sessionID: "c-1", query: "Make it durable")
+        )
+        XCTAssertEqual(store.sessions.first?.resume?.prompt, "Make it durable")
+
+        spy.onTitleChange?(sessionID, "✳ Fix the parser")
+        XCTAssertEqual(
+            store.sessions.first?.resume?.title, "Fix the parser",
+            "Claude Code's idle glyph ✳ is a recognized decoration too, not just the spinner frames, and must keep enriching the same snapshot"
+        )
+
+        spy.onTitleChange?(sessionID, "kira@Mac:~/code")
+        XCTAssertEqual(
+            store.sessions.first?.resume?.title, "Fix the parser",
+            "a plain shell prompt taking over the title (agent exited) must not be read as a Claude Code decoration and must not wipe the remembered title"
+        )
+
+        let restored = AppStore(terminals: SpyTerminals(), stateURL: url, engine: FakeWorkspaceEngine())
+        XCTAssertEqual(
+            restored.sessions.first?.resume,
+            store.sessions.first?.resume,
+            "the agent identifier itself must round-trip through save/reload identically to title/prompt"
+        )
+        XCTAssertEqual(restored.sessions.first?.resume?.agent, "claude")
+    }
+
+    // MARK: - 91
+
+    func test91_switchingHarnessOnOneRowReplacesTheResumeSnapshot() {
+        let (store, spy, _) = TestSupport.makeStore()
+        store.addProject(path: "/tmp/proj-A")
+        let sessionID = store.sessions.first!.id
+
+        spy.onAgentSessionEvent?(
+            sessionID,
+            AgentSessionEvent(agent: "omp", name: "prompt_submit", sessionID: "omp-1", query: "old")
+        )
+        XCTAssertEqual(store.sessions.first?.resume?.agent, "omp")
+
+        spy.onAgentSessionEvent?(
+            sessionID,
+            AgentSessionEvent(agent: "claude", name: "SessionStart", sessionID: "c-1", query: nil)
+        )
+
+        XCTAssertEqual(
+            store.sessions.first?.resume,
+            SessionResumeMetadata(agent: "claude", sessionID: "c-1", title: nil, prompt: nil),
+            "a different harness announcing a session on the same row must replace the prior snapshot wholesale, including dropping OMP's leftover prompt — carrying OMP's prompt text into a Claude Code snapshot would misattribute it"
+        )
+
+        // Same session id string reused under a different agent must also
+        // replace, not merge — session ids are only unique within a single
+        // harness's own id space, so a collision across harnesses is
+        // coincidence, not continuity.
+        spy.onAgentSessionEvent?(
+            sessionID,
+            AgentSessionEvent(agent: "claude", name: "UserPromptSubmit", sessionID: "same", query: "a claude prompt")
+        )
+        XCTAssertEqual(store.sessions.first?.resume?.sessionID, "same")
+        XCTAssertEqual(store.sessions.first?.resume?.prompt, "a claude prompt")
+
+        spy.onAgentSessionEvent?(
+            sessionID,
+            AgentSessionEvent(agent: "codex", name: "session_start", sessionID: "same", query: nil)
+        )
+
+        XCTAssertEqual(store.sessions.first?.resume?.agent, "codex")
+        XCTAssertEqual(store.sessions.first?.resume?.sessionID, "same")
+        XCTAssertNil(
+            store.sessions.first?.resume?.prompt,
+            "codex's own event carried no query, and the prior snapshot belonged to a different agent entirely, so nothing should have carried over"
+        )
     }
 }

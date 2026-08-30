@@ -11,7 +11,7 @@ final class TerminalCenter: SessionTerminating {
         let view: TerminalView
         let controller: TerminalController
         let delegateProxy: SessionDelegateProxy
-        let restoredOmpResume: OmpSessionResumeMetadata?
+        let restoredResume: SessionResumeMetadata?
         var resumeHintScheduled = false
         var didShowResumeHint = false
     }
@@ -87,10 +87,12 @@ final class TerminalCenter: SessionTerminating {
     /// `SessionDelegateProxy.terminalDidChangeTitle`.
     var onTitleChange: ((String, String) -> Void)?
 
-    /// Invoked with a decoded OMP Warp CLI-agent event. Notifications with
-    /// the Warp title that fail decoding are consumed by the delegate proxy
-    /// and never arrive here or at the attention classifier.
-    var onOmpSessionEvent: ((String, OmpSessionEvent) -> Void)?
+    /// Invoked with a decoded agent session event, either Warp's CLI-agent
+    /// protocol (OMP) or the app's own hook title (Claude Code, Codex).
+    /// Notifications with either magic title that fail decoding are
+    /// consumed by the delegate proxy and never arrive here or at the
+    /// attention classifier.
+    var onAgentSessionEvent: ((String, AgentSessionEvent) -> Void)?
 
     /// Lazily creates (on first call) or returns the cached `TerminalView`
     /// for a session, spawning the user's login shell rooted at
@@ -98,7 +100,7 @@ final class TerminalCenter: SessionTerminating {
     func terminalView(
         for sessionID: String,
         workingDirectory: String,
-        restoredOmpResume: OmpSessionResumeMetadata?
+        restoredResume: SessionResumeMetadata?
     ) -> TerminalView {
         if let entry = entries[sessionID] {
             return entry.view
@@ -130,21 +132,21 @@ final class TerminalCenter: SessionTerminating {
             view: view,
             controller: controller,
             delegateProxy: proxy,
-            restoredOmpResume: restoredOmpResume
+            restoredResume: restoredResume
         )
         return view
     }
 
     /// Prints a resume hint exactly once, and only when metadata was already
-    /// present when this live surface was created. Metadata learned from OMP
-    /// running in the current surface is intentionally never injected back
-    /// into that active session.
+    /// present when this live surface was created. Metadata learned from an
+    /// agent running in the current surface is intentionally never injected
+    /// back into that active session.
     func showResumeHintIfNeeded(for sessionID: String) {
         guard var entry = entries[sessionID],
               entry.view.superview != nil,
               !entry.resumeHintScheduled,
               !entry.didShowResumeHint,
-              entry.restoredOmpResume != nil
+              entry.restoredResume != nil
         else { return }
 
         // Give AppKit one run-loop turn to create the Ghostty surface after
@@ -161,12 +163,12 @@ final class TerminalCenter: SessionTerminating {
         guard var entry = entries[sessionID],
               entry.resumeHintScheduled,
               !entry.didShowResumeHint,
-              let metadata = entry.restoredOmpResume
+              let metadata = entry.restoredResume
         else { return }
 
         entry.didShowResumeHint = true
         entries[sessionID] = entry
-        entry.view.sendText(OmpSessionResumeMetadata.resumeHintCommand(for: metadata))
+        entry.view.sendText(SessionResumeMetadata.resumeHintCommand(for: metadata))
     }
 
     /// Tears down a session's terminal: removes the view from its superview
@@ -199,8 +201,8 @@ final class TerminalCenter: SessionTerminating {
         onTitleChange?(sessionID, title)
     }
 
-    func handleOmpSessionEvent(sessionID: String, event: OmpSessionEvent) {
-        onOmpSessionEvent?(sessionID, event)
+    func handleAgentSessionEvent(sessionID: String, event: AgentSessionEvent) {
+        onAgentSessionEvent?(sessionID, event)
     }
 }
 
@@ -243,18 +245,23 @@ final class SessionDelegateProxy:
     /// all the registration this proxy needs — nothing else has to opt it
     /// in.
     ///
-    /// Warp CLI-agent notifications take a separate route: valid version-1
-    /// OMP envelopes are forwarded as OMP events, while every malformed or
-    /// unsupported notification carrying Warp's magic title is consumed.
-    /// Neither kind is allowed to fall through to fuzzy attention.
+    /// Session-resume notifications take a separate route: valid version-1
+    /// envelopes under either Warp's CLI-agent title (OMP) or the app's own
+    /// hook title (Claude Code, Codex, via `agents:session`) are forwarded
+    /// as agent session events, while every malformed or unsupported
+    /// notification carrying either magic title is consumed. Neither kind
+    /// is allowed to fall through to fuzzy attention — the hook emits
+    /// `agents:session` on every prompt, and letting a malformed one fall
+    /// through to keyword classification would raise a bogus gold dot each
+    /// time.
     ///
     /// Other notifications are split between the structured `agents:status`
     /// protocol and free text for `AttentionClassifier`; all attention-state
     /// decisions remain in `SessionAttention.reduce`.
     func terminalDidRequestDesktopNotification(title: String, body: String) {
-        if title == OmpSessionEvent.notificationTitle {
-            if let event = OmpSessionEvent.parseNotification(title: title, body: body) {
-                center?.handleOmpSessionEvent(sessionID: sessionID, event: event)
+        if AgentSessionEvent.isSessionNotification(title: title) {
+            if let event = AgentSessionEvent.parseNotification(title: title, body: body) {
+                center?.handleAgentSessionEvent(sessionID: sessionID, event: event)
             }
             return
         }

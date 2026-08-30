@@ -15,7 +15,7 @@ final class SpyTerminals: SessionTerminating {
     /// simulate a terminal reporting an OSC title change, the same way
     /// `onSessionSignal` simulates an attention signal.
     var onTitleChange: ((String, String) -> Void)?
-    var onOmpSessionEvent: ((String, OmpSessionEvent) -> Void)?
+    var onAgentSessionEvent: ((String, AgentSessionEvent) -> Void)?
     private(set) var closedIDs: [String] = []
 
     func closeSession(_ id: String) {

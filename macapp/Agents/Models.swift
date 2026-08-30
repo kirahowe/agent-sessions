@@ -61,9 +61,13 @@ struct SessionRow: Identifiable, Codable, Hashable {
     // AppStore.setSessionTitle): a shell quietly clearing its title must not
     // wipe the remembered one.
     var agentTitle: String? = nil
-    // Resume information announced by OMP's Warp CLI-agent protocol.
-    // Optional for backward-compatible decoding of existing v2 state files.
-    var ompResume: OmpSessionResumeMetadata? = nil
+    // Resume information for this row's most recent agent session,
+    // announced either natively (OMP speaking Warp's CLI-agent protocol) or
+    // via the app's own hook (hooks/agents-status.sh, for Claude Code and
+    // Codex). Optional for backward-compatible decoding of existing v2
+    // state files. See the SessionRow init(from:) extension below for the
+    // legacy `ompResume` decode compatibility this field requires.
+    var resume: SessionResumeMetadata? = nil
 
     var projectPath: String { target.projectPath }
 
@@ -79,6 +83,59 @@ struct SessionRow: Identifiable, Codable, Hashable {
     var subtitle: String? {
         guard let agentTitle, agentTitle != displayName else { return nil }
         return agentTitle
+    }
+}
+
+extension SessionRow {
+    private enum CodingKeys: String, CodingKey {
+        case id, target, name, customName, agentTitle, resume
+    }
+
+    /// Pre-refactor state.json files persisted this row's session-resume
+    /// metadata under the key `ompResume`, shaped like today's `resume` but
+    /// without an `agent` field — every entry from that era was necessarily
+    /// OMP's, the only harness that spoke the protocol at the time. Decoding
+    /// must keep reading that key, as `agent == "omp"`, so existing users
+    /// don't lose a row's resume metadata on first launch after the update.
+    /// Every new save writes `resume` (with `agent`) and never `ompResume`
+    /// again — this custom `init(from:)` lives in an extension, rather than
+    /// the struct body, specifically so the compiler still synthesizes
+    /// `encode(to:)` (which only ever writes `resume`) and still generates
+    /// `SessionRow`'s memberwise initializer, which `PersistedState`'s v1
+    /// migration and `AppStore` both rely on.
+    private enum LegacyCodingKeys: String, CodingKey {
+        case ompResume
+    }
+
+    private struct LegacyResumeMetadata: Decodable {
+        let sessionID: String
+        let title: String?
+        let prompt: String?
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        target = try container.decode(TargetRef.self, forKey: .target)
+        name = try container.decode(String.self, forKey: .name)
+        customName = try container.decodeIfPresent(String.self, forKey: .customName)
+        agentTitle = try container.decodeIfPresent(String.self, forKey: .agentTitle)
+
+        if let resume = try container.decodeIfPresent(SessionResumeMetadata.self, forKey: .resume) {
+            self.resume = resume
+        } else {
+            let legacyContainer = try decoder.container(keyedBy: LegacyCodingKeys.self)
+            if let legacy = try legacyContainer.decodeIfPresent(LegacyResumeMetadata.self, forKey: .ompResume) {
+                self.resume = SessionResumeMetadata(
+                    agent: "omp",
+                    sessionID: legacy.sessionID,
+                    title: legacy.title,
+                    prompt: legacy.prompt
+                )
+            } else {
+                self.resume = nil
+            }
+        }
     }
 }
 
