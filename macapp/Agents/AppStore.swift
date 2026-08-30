@@ -13,10 +13,13 @@ indirect enum CloseWorkspacePhase: Equatable {
     case noChanges
     case confirmCloseWithoutAdding(returnTo: CloseWorkspacePhase)
     case applying(CloseWorkspaceProgress)
-    case conflictAttention(message: String, details: [String])
+    /// Overlap with newer project progress. `details` lists the conflicting
+    /// changes a read-only preview predicted; `engineMessage` is the engine's
+    /// own account of a conflict it hit while actually adding the changes,
+    /// shown verbatim beneath the explanation.
+    case conflictAttention(message: String, details: [String], engineMessage: String?)
     case projectSetupRequired(changes: [String], needsMessage: Bool)
     case success(addedChanges: Int?, notice: String?)
-    case workspaceRetained(addedChanges: Int?, notice: String?)
     case projectAttention(addedChanges: Int?, notice: String?)
     case failure(message: String)
 }
@@ -29,8 +32,6 @@ struct CloseWorkspacePresentation: Identifiable, Equatable {
     /// Distinguishes a replacement sheet for the same workspace across awaits.
     let presentationID = UUID()
     var summary = ""
-    /// Opaque manager state from the currently displayed preview.
-    var targetSnapshot: String? = nil
     var phase: CloseWorkspacePhase
     var id: UUID { presentationID }
 
@@ -49,7 +50,6 @@ struct CloseWorkspacePresentation: Identifiable, Equatable {
             && lhs.projectPath == rhs.projectPath
             && lhs.projectName == rhs.projectName
             && lhs.summary == rhs.summary
-            && lhs.targetSnapshot == rhs.targetSnapshot
             && lhs.phase == rhs.phase
     }
 }
@@ -79,6 +79,12 @@ final class AppStore: ObservableObject {
     /// project path so attention survives dismissal of the close sheet. Like
     /// live session attention, this is intentionally in-memory only.
     @Published private(set) var projectWorkingCopyAttention: Set<String> = []
+
+    /// Shown when the engine hit conflicts while rebasing the workspace's
+    /// changes onto the latest project progress. Unlike a predicted overlap,
+    /// this one has already moved the workspace: the rebase — conflicts and
+    /// all — is sitting in the workspace for the user to finish or undo.
+    static let landConflictMessage = "These changes overlap newer project progress. The workspace has been moved onto the latest progress with the conflicts marked — resolve them in the workspace and close it again, or back out with jj undo (git rebase --abort)."
 
     /// Shown (composed with any `cleanupWarning`) whenever a successful close
     /// left reconciliation deferred rather than reconciling automatically —
@@ -319,7 +325,6 @@ final class AppStore: ObservableObject {
         guard isCurrentWorkspaceLifecycle(workspace, token: lifecycleToken),
               isCurrentClosePresentation(workspace, presentationID: presentationID)
         else { return }
-        closeWorkspace?.targetSnapshot = nil
 
         do {
             let preview: LandPreview
@@ -344,7 +349,6 @@ final class AppStore: ObservableObject {
             guard isCurrentWorkspaceLifecycle(workspace, token: lifecycleToken),
                   isCurrentClosePresentation(workspace, presentationID: presentationID)
             else { return }
-            closeWorkspace?.targetSnapshot = preview.targetSnapshot
             closeWorkspace?.phase = closeWorkspacePhase(
                 for: preview,
                 isProjectSetup: isProjectSetup
@@ -367,8 +371,18 @@ final class AppStore: ObservableObject {
             else { return }
             closeWorkspace?.phase = .conflictAttention(
                 message: "These changes overlap newer project progress and need attention.",
-                details: []
+                details: [],
+                engineMessage: nil
             )
+        } catch EngineError.workspaceChanged(let engineMessage) {
+            // The engine refused to even look: the workspace is in a state
+            // that needs the user's hand first (a jj working copy left stale
+            // by activity elsewhere, a git rebase still in progress). Its
+            // message says exactly what to do, and nothing generic would.
+            guard isCurrentWorkspaceLifecycle(workspace, token: lifecycleToken),
+                  isCurrentClosePresentation(workspace, presentationID: presentationID)
+            else { return }
+            closeWorkspace?.phase = .failure(message: engineMessage)
         } catch {
             guard isCurrentWorkspaceLifecycle(workspace, token: lifecycleToken),
                   isCurrentClosePresentation(workspace, presentationID: presentationID)
@@ -401,7 +415,8 @@ final class AppStore: ObservableObject {
                     conflict.subject.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                         ? "Conflicting change"
                         : conflict.subject
-                }
+                },
+                engineMessage: nil
             )
         }
         if changes.isEmpty && !preview.needsMessage {
@@ -448,11 +463,10 @@ final class AppStore: ObservableObject {
 
     /// Adds the prepared changes, closes the workspace only after the engine
     /// confirms success, then silently reconciles the project working copy.
-    /// A race-time overlap changes the sheet to attention without touching the
-    /// workspace or any of its sessions.
+    /// A race-time overlap leaves the workspace open — with the conflicted
+    /// rebase in it — and changes the sheet to attention.
     func addChangesAndCloseWorkspace() async {
         guard let presentation = closeWorkspace,
-              let expectedSnapshot = presentation.targetSnapshot,
               let workspace = workspaces.first(where: { $0.id == presentation.workspaceID })
         else { return }
 
@@ -482,7 +496,6 @@ final class AppStore: ObservableObject {
             workspace,
             message: message,
             createTrunk: nil,
-            expectedSnapshot: expectedSnapshot,
             presentationID: presentation.presentationID,
             changeCount: changes.count,
             noTrunkFallback: setupPhase,
@@ -495,7 +508,6 @@ final class AppStore: ObservableObject {
     /// about establishing the project's starting progress.
     func setUpProjectAndCloseWorkspace() async {
         guard let presentation = closeWorkspace,
-              let expectedSnapshot = presentation.targetSnapshot,
               case .projectSetupRequired(let changes, let needsMessage) = presentation.phase,
               let workspace = workspaces.first(where: { $0.id == presentation.workspaceID })
         else { return }
@@ -512,7 +524,6 @@ final class AppStore: ObservableObject {
             workspace,
             message: needsMessage ? summary : nil,
             createTrunk: "main",
-            expectedSnapshot: expectedSnapshot,
             presentationID: presentation.presentationID,
             changeCount: changes.count,
             noTrunkFallback: setupPhase,
@@ -524,7 +535,6 @@ final class AppStore: ObservableObject {
         _ workspace: WorkspaceRow,
         message: String?,
         createTrunk: String?,
-        expectedSnapshot: String,
         presentationID: UUID,
         changeCount: Int?,
         noTrunkFallback: CloseWorkspacePhase,
@@ -548,8 +558,7 @@ final class AppStore: ObservableObject {
             result = try await engine.landWorkspace(
                 workspace,
                 message: trimmed?.isEmpty == false ? trimmed : nil,
-                createTrunk: createTrunk,
-                expectedSnapshot: expectedSnapshot
+                createTrunk: createTrunk
             )
         } catch EngineError.workspaceChanged {
             terminals.resumeSessions(sessionIDs)
@@ -559,7 +568,6 @@ final class AppStore: ObservableObject {
             if clearSummaryOnStale {
                 closeWorkspace?.summary = ""
             }
-            closeWorkspace?.targetSnapshot = nil
             closeWorkspace?.phase = .preparing
             await refreshCloseWorkspacePreview(
                 workspace,
@@ -574,15 +582,42 @@ final class AppStore: ObservableObject {
             else { return }
             closeWorkspace?.phase = noTrunkFallback
             return
-        } catch EngineError.landConflict, EngineError.sharedHistory {
+        } catch EngineError.landConflict(let engineMessage) {
+            // The engine rebased onto the latest progress and the result
+            // conflicts, so the conflicted rebase is sitting in the workspace
+            // now. Sessions come back and the row stays; the sheet explains
+            // what is there to resolve.
+            terminals.resumeSessions(sessionIDs)
+            guard isCurrentWorkspaceLifecycle(workspace, token: lifecycleToken),
+                  isCurrentClosePresentation(workspace, presentationID: presentationID)
+            else { return }
+            closeWorkspace?.phase = .conflictAttention(
+                message: Self.landConflictMessage,
+                details: [],
+                engineMessage: engineMessage
+            )
+            return
+        } catch EngineError.sharedHistory {
             terminals.resumeSessions(sessionIDs)
             guard isCurrentWorkspaceLifecycle(workspace, token: lifecycleToken),
                   isCurrentClosePresentation(workspace, presentationID: presentationID)
             else { return }
             closeWorkspace?.phase = .conflictAttention(
                 message: "These changes overlap newer project progress and need attention.",
-                details: []
+                details: [],
+                engineMessage: nil
             )
+            return
+        } catch EngineError.cleanupFailed(let engineMessage) {
+            // Project progress moved, but the workspace could not be
+            // deregistered — so this close failed. The engine's own account
+            // is the only accurate one; closing again will find nothing left
+            // to add and offer a plain close.
+            terminals.resumeSessions(sessionIDs)
+            guard isCurrentWorkspaceLifecycle(workspace, token: lifecycleToken),
+                  isCurrentClosePresentation(workspace, presentationID: presentationID)
+            else { return }
+            closeWorkspace?.phase = .failure(message: engineMessage)
             return
         } catch EngineError.nothingToLand {
             terminals.resumeSessions(sessionIDs)
@@ -606,11 +641,9 @@ final class AppStore: ObservableObject {
             return
         }
 
-        if result.workspaceRetained {
-            terminals.resumeSessions(sessionIDs)
-        } else {
-            tearDownClosedWorkspace(workspace)
-        }
+        // Success means the engine no longer knows this workspace, so its
+        // row, sessions, and selection always go with it.
+        tearDownClosedWorkspace(workspace)
 
         if hasLiveRootSessions(in: workspace.projectPath) {
             // The project root itself is a session target. Rewriting its
@@ -625,12 +658,7 @@ final class AppStore: ObservableObject {
             let notice = [result.cleanupWarning, Self.deferredReconciliationNotice]
                 .compactMap { $0 }
                 .joined(separator: "\n")
-            if result.workspaceRetained {
-                guard isCurrentWorkspaceLifecycle(workspace, token: lifecycleToken) else { return }
-                closeWorkspace?.phase = .workspaceRetained(addedChanges: changeCount, notice: notice)
-            } else {
-                closeWorkspace?.phase = .success(addedChanges: changeCount, notice: notice)
-            }
+            closeWorkspace?.phase = .success(addedChanges: changeCount, notice: notice)
             return
         }
 
@@ -638,23 +666,15 @@ final class AppStore: ObservableObject {
         guard projectLifecycleTokens[workspace.projectPath] == lifecycleToken,
               isCurrentClosePresentation(workspace, presentationID: presentationID)
         else { return }
-        if result.workspaceRetained {
-            guard isCurrentWorkspaceLifecycle(workspace, token: lifecycleToken) else { return }
-            closeWorkspace?.phase = .workspaceRetained(
+        closeWorkspace?.phase = reconciled
+            ? .success(
                 addedChanges: changeCount,
                 notice: result.cleanupWarning
             )
-        } else {
-            closeWorkspace?.phase = reconciled
-                ? .success(
-                    addedChanges: changeCount,
-                    notice: result.cleanupWarning
-                )
-                : .projectAttention(
-                    addedChanges: changeCount,
-                    notice: result.cleanupWarning
-                )
-        }
+            : .projectAttention(
+                addedChanges: changeCount,
+                notice: result.cleanupWarning
+            )
     }
 
     /// Retries reconciliation for a project whose working copy needs attention.
@@ -742,7 +762,6 @@ final class AppStore: ObservableObject {
             guard isCurrentWorkspaceLifecycle(workspace, token: lifecycleToken),
                   isCurrentClosePresentation(workspace, presentationID: presentationID)
             else { return }
-            closeWorkspace?.targetSnapshot = nil
             closeWorkspace?.phase = .preparing
             await refreshCloseWorkspacePreview(
                 workspace,

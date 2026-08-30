@@ -938,9 +938,7 @@ final class AppStoreTests: XCTestCase {
                 bookmarkCommit: "ignored",
                 commits: [LandCommit(id: "1", subject: "A useful change")],
                 conflicts: [],
-                needsMessage: false,
-                diverging: [],
-                targetSnapshot: "test-snapshot"
+                needsMessage: false
             )
         )
         await store.prepareCloseWorkspace(workspace.id)
@@ -1147,9 +1145,7 @@ final class AppStoreTests: XCTestCase {
                     LandCommit(id: "2", subject: "Second change"),
                 ],
                 conflicts: [],
-                needsMessage: false,
-                diverging: [],
-                targetSnapshot: "test-snapshot"
+                needsMessage: false
             )
         )
         var workspaceWasRemovedBeforeReconciliation = false
@@ -1191,9 +1187,7 @@ final class AppStoreTests: XCTestCase {
                 bookmarkCommit: "ignored",
                 commits: [LandCommit(id: "1", subject: "Change")],
                 conflicts: [],
-                needsMessage: false,
-                diverging: [],
-                targetSnapshot: "test-snapshot"
+                needsMessage: false
             )
         )
         await store.prepareCloseWorkspace(workspace.id)
@@ -1229,9 +1223,7 @@ final class AppStoreTests: XCTestCase {
                 bookmarkCommit: "ignored",
                 commits: [LandCommit(id: "1", subject: "Change")],
                 conflicts: [],
-                needsMessage: false,
-                diverging: [],
-                targetSnapshot: "test-snapshot"
+                needsMessage: false
             )
         )
         await store.prepareCloseWorkspace(workspace.id)
@@ -1244,9 +1236,57 @@ final class AppStoreTests: XCTestCase {
         XCTAssertEqual(store.sessions, sessionsBefore)
         XCTAssertTrue(store.workspaces.contains { $0.id == workspace.id })
         XCTAssertTrue(fake.rebaseOntoTrunkCalls.isEmpty)
-        guard case .conflictAttention? = store.closeWorkspace?.phase else {
-            return XCTFail("race-time overlap must become attention")
-        }
+        // The engine left the conflicted rebase in the workspace, so the
+        // sheet says that — and shows the engine's own account of it rather
+        // than swallowing the detail the user needs to resolve it.
+        XCTAssertEqual(
+            store.closeWorkspace?.phase,
+            .conflictAttention(
+                message: AppStore.landConflictMessage,
+                details: [],
+                engineMessage: "implementation detail"
+            )
+        )
+    }
+
+    /// The engine advanced the trunk but could not deregister the workspace.
+    /// The close failed, so its row and sessions stay; only the engine can
+    /// describe that half-finished state accurately, so its message is shown
+    /// verbatim.
+    func test34c_cleanupFailedDuringLandIsAFailureCarryingTheEngineMessage() async {
+        let fake = FakeWorkspaceEngine()
+        let (store, spy, _) = TestSupport.makeStore(engine: fake)
+        let workspace = await makeClosableWorkspace(store: store, fake: fake)
+        let closedIDsAfterSetup = spy.closedIDs
+        fake.nextPreviewResult = .success(
+            LandPreview(
+                bookmark: "ignored",
+                bookmarkCommit: "ignored",
+                commits: [LandCommit(id: "1", subject: "Change")],
+                conflicts: [],
+                needsMessage: false
+            )
+        )
+        await store.prepareCloseWorkspace(workspace.id)
+        let sessionsBefore = store.sessions
+        let sessionIDs = Set(sessionsBefore.filter {
+            $0.target == .workspace(projectPath: workspace.projectPath, name: workspace.name)
+        }.map(\.id))
+        fake.nextLandResult = .failure(
+            .cleanupFailed("The changes were added to main, but the workspace could not be forgotten.")
+        )
+
+        await store.addChangesAndCloseWorkspace()
+
+        XCTAssertEqual(
+            store.closeWorkspace?.phase,
+            .failure(message: "The changes were added to main, but the workspace could not be forgotten.")
+        )
+        XCTAssertEqual(spy.resumeCalls, [sessionIDs])
+        XCTAssertEqual(spy.closedIDs, closedIDsAfterSetup)
+        XCTAssertEqual(store.sessions, sessionsBefore)
+        XCTAssertTrue(store.workspaces.contains { $0.id == workspace.id })
+        XCTAssertTrue(fake.rebaseOntoTrunkCalls.isEmpty)
     }
 
     func test34b_sharedHistoryDuringLandShowsAttentionWithoutTearingDown() async {
@@ -1259,9 +1299,7 @@ final class AppStoreTests: XCTestCase {
                 bookmarkCommit: "ignored",
                 commits: [LandCommit(id: "1", subject: "Change")],
                 conflicts: [],
-                needsMessage: false,
-                diverging: [],
-                targetSnapshot: "test-snapshot"
+                needsMessage: false
             )
         )
         fake.nextLandResult = .failure(.sharedHistory("raw engine advice"))
@@ -1274,7 +1312,8 @@ final class AppStoreTests: XCTestCase {
             store.closeWorkspace?.phase,
             .conflictAttention(
                 message: "These changes overlap newer project progress and need attention.",
-                details: []
+                details: [],
+                engineMessage: nil
             )
         )
         XCTAssertEqual(store.sessions, sessionsBefore)
@@ -1292,9 +1331,7 @@ final class AppStoreTests: XCTestCase {
                 bookmarkCommit: "ignored",
                 commits: [LandCommit(id: "1", subject: "")],
                 conflicts: [],
-                needsMessage: true,
-                diverging: [],
-                targetSnapshot: "test-snapshot"
+                needsMessage: true
             )
         )
         await store.prepareCloseWorkspace(workspace.id)
@@ -1324,9 +1361,7 @@ final class AppStoreTests: XCTestCase {
                     bookmarkCommit: "",
                     commits: [LandCommit(id: "abc", subject: "Establish project progress")],
                     conflicts: [],
-                    needsMessage: false,
-                    diverging: [],
-                    targetSnapshot: "test-snapshot"
+                    needsMessage: false
                 )
             )
         ]
@@ -1363,9 +1398,7 @@ final class AppStoreTests: XCTestCase {
                     bookmarkCommit: "",
                     commits: [LandCommit(id: "dirty", subject: "")],
                     conflicts: [],
-                    needsMessage: true,
-                    diverging: [],
-                    targetSnapshot: "test-snapshot"
+                    needsMessage: true
                 )
             )
         ]
@@ -1400,9 +1433,7 @@ final class AppStoreTests: XCTestCase {
                     bookmarkCommit: "",
                     commits: [],
                     conflicts: [],
-                    needsMessage: false,
-                    diverging: [],
-                    targetSnapshot: "test-snapshot"
+                    needsMessage: false
                 )
             )
         ]
@@ -1430,7 +1461,8 @@ final class AppStoreTests: XCTestCase {
             store.closeWorkspace?.phase,
             .conflictAttention(
                 message: "These changes overlap newer project progress and need attention.",
-                details: []
+                details: [],
+                engineMessage: nil
             )
         )
         XCTAssertEqual(store.workspaces, workspacesBefore)
@@ -1449,9 +1481,7 @@ final class AppStoreTests: XCTestCase {
                 bookmarkCommit: "head",
                 commits: [LandCommit(id: "1", subject: "Reviewed change")],
                 conflicts: [],
-                needsMessage: false,
-                diverging: [],
-                targetSnapshot: "test-snapshot"
+                needsMessage: false
             )
         )
         await store.prepareCloseWorkspace(workspace.id)
@@ -1476,9 +1506,7 @@ final class AppStoreTests: XCTestCase {
                 bookmarkCommit: "head",
                 commits: [LandCommit(id: "dirty", subject: "")],
                 conflicts: [],
-                needsMessage: true,
-                diverging: [],
-                targetSnapshot: "test-snapshot"
+                needsMessage: true
             )
         )
         await store.prepareCloseWorkspace(workspace.id)
@@ -1533,9 +1561,7 @@ final class AppStoreTests: XCTestCase {
                         bookmarkCommit: "",
                         commits: [LandCommit(id: "1", subject: "Starting change")],
                         conflicts: [],
-                        needsMessage: false,
-                        diverging: [],
-                        targetSnapshot: "test-snapshot"
+                        needsMessage: false
                     )
                 )
             ]
@@ -1583,9 +1609,7 @@ final class AppStoreTests: XCTestCase {
                     bookmarkCommit: "",
                     commits: [LandCommit(id: "1", subject: "Starting change")],
                     conflicts: [],
-                    needsMessage: false,
-                    diverging: [],
-                    targetSnapshot: "test-snapshot"
+                    needsMessage: false
                 )
             )
         ]
@@ -2146,9 +2170,7 @@ final class AppStoreTests: XCTestCase {
                 bookmarkCommit: "ignored",
                 commits: [LandCommit(id: "1", subject: "Change")],
                 conflicts: [LandCommit(id: "Sources/App.swift", subject: "Sources/App.swift")],
-                needsMessage: false,
-                diverging: [],
-                targetSnapshot: "test-snapshot"
+                needsMessage: false
             )
         )
 
@@ -2158,7 +2180,8 @@ final class AppStoreTests: XCTestCase {
             store.closeWorkspace?.phase,
             .conflictAttention(
                 message: "These changes overlap newer project progress and need attention.",
-                details: ["Sources/App.swift"]
+                details: ["Sources/App.swift"],
+                engineMessage: nil
             )
         )
         await store.addChangesAndCloseWorkspace()
@@ -2204,9 +2227,7 @@ final class AppStoreTests: XCTestCase {
                 bookmarkCommit: "ignored",
                 commits: [LandCommit(id: "1", subject: "Change")],
                 conflicts: [],
-                needsMessage: false,
-                diverging: [LandCommit(id: "advisory", subject: "Ignored")],
-                targetSnapshot: "test-snapshot"
+                needsMessage: false
             )
         )
         fake.nextRebaseResult = .failure(.rebaseConflict("root overlap"))
@@ -2243,9 +2264,7 @@ final class AppStoreTests: XCTestCase {
                 bookmarkCommit: "ignored",
                 commits: [LandCommit(id: "1", subject: "Change")],
                 conflicts: [],
-                needsMessage: false,
-                diverging: [],
-                targetSnapshot: "test-snapshot"
+                needsMessage: false
             )
         )
         fake.nextRebaseResult = .failure(.rebaseConflict("root overlap"))
@@ -2289,9 +2308,7 @@ final class AppStoreTests: XCTestCase {
                 bookmarkCommit: "ignored",
                 commits: [LandCommit(id: "1", subject: "Change")],
                 conflicts: [],
-                needsMessage: false,
-                diverging: [],
-                targetSnapshot: "test-snapshot"
+                needsMessage: false
             )
         )
         fake.nextLandResult = .success(
@@ -2316,14 +2333,14 @@ final class AppStoreTests: XCTestCase {
         XCTAssertNil(store.lastError)
     }
 
-    func test70b_engineRetainedWorkspaceKeepsRowsSessionsSelectionAndPersistence() async {
+    /// A successful land always means the engine deregistered the workspace,
+    /// so the teardown is unconditional — a cleanup warning rides along as a
+    /// notice and must not hold the row, its sessions, or its persisted state
+    /// open.
+    func test70b_successfulLandAlwaysTearsDownEvenWithACleanupWarning() async {
         let fake = FakeWorkspaceEngine()
         let (store, spy, stateURL) = TestSupport.makeStore(engine: fake)
         let workspace = await makeClosableWorkspace(store: store, fake: fake)
-        // The helper already closed the project's default root session; that
-        // is setup noise, not something this test is about, so it's carried
-        // forward as a baseline rather than asserted away.
-        let closedIDsAfterSetup = spy.closedIDs
         let sessionID = store.sessions.first {
             $0.target == .workspace(projectPath: workspace.projectPath, name: workspace.name)
         }!.id
@@ -2333,33 +2350,28 @@ final class AppStoreTests: XCTestCase {
                 bookmarkCommit: "ignored",
                 commits: [LandCommit(id: "1", subject: "Change")],
                 conflicts: [],
-                needsMessage: false,
-                diverging: [],
-                targetSnapshot: "test-snapshot"
+                needsMessage: false
             )
         )
         fake.nextLandResult = .success(
             LandResult(
                 commitID: "abc",
                 bookmark: "ignored",
-                cleanupWarning: "New workspace writes arrived while project progress was added.",
-                workspaceRetained: true
+                cleanupWarning: "The workspace folder couldn't be moved to the Bin."
             )
         )
 
         await store.prepareCloseWorkspace(workspace.id)
-        let selectionBefore = store.selection
         await store.addChangesAndCloseWorkspace()
 
-        XCTAssertEqual(spy.closedIDs, closedIDsAfterSetup)
-        XCTAssertTrue(store.sessions.contains { $0.id == sessionID })
-        XCTAssertTrue(store.workspaces.contains { $0.id == workspace.id })
-        XCTAssertEqual(store.selection, selectionBefore)
+        XCTAssertTrue(spy.closedIDs.contains(sessionID))
+        XCTAssertFalse(store.sessions.contains { $0.id == sessionID })
+        XCTAssertFalse(store.workspaces.contains { $0.id == workspace.id })
         XCTAssertEqual(
             store.closeWorkspace?.phase,
-            .workspaceRetained(
+            .success(
                 addedChanges: 1,
-                notice: "New workspace writes arrived while project progress was added."
+                notice: "The workspace folder couldn't be moved to the Bin."
             )
         )
 
@@ -2368,9 +2380,8 @@ final class AppStoreTests: XCTestCase {
             stateURL: stateURL,
             engine: FakeWorkspaceEngine()
         )
-        XCTAssertTrue(restored.sessions.contains { $0.id == sessionID })
-        XCTAssertTrue(restored.workspaces.contains { $0.id == workspace.id })
-        XCTAssertEqual(restored.selection, selectionBefore)
+        XCTAssertFalse(restored.sessions.contains { $0.id == sessionID })
+        XCTAssertFalse(restored.workspaces.contains { $0.id == workspace.id })
     }
 
     func test71_prepareFailureStaysInSheetWithoutTearingDownWorkspace() async {
@@ -2390,7 +2401,8 @@ final class AppStoreTests: XCTestCase {
             store.closeWorkspace?.phase,
             .conflictAttention(
                 message: "These changes overlap newer project progress and need attention.",
-                details: []
+                details: [],
+                engineMessage: nil
             )
         )
         XCTAssertEqual(spy.closedIDs, closedIDsAfterSetup)
@@ -2416,7 +2428,8 @@ final class AppStoreTests: XCTestCase {
             store.closeWorkspace?.phase,
             .conflictAttention(
                 message: "These changes overlap newer project progress and need attention.",
-                details: []
+                details: [],
+                engineMessage: nil
             )
         )
         XCTAssertNil(store.lastError)
@@ -2829,7 +2842,7 @@ final class AppStoreTests: XCTestCase {
         let fake = FakeWorkspaceEngine()
         let (store, _, _) = TestSupport.makeStore(engine: fake)
         let workspace = await makeClosableWorkspace(store: store, fake: fake)
-        fake.nextPreviewResult = .success(LandPreview(bookmark: "main", bookmarkCommit: "head", commits: [], conflicts: [], needsMessage: true, diverging: [], targetSnapshot: "test-snapshot"))
+        fake.nextPreviewResult = .success(LandPreview(bookmark: "main", bookmarkCommit: "head", commits: [], conflicts: [], needsMessage: true))
         await store.prepareCloseWorkspace(workspace.id)
         XCTAssertEqual(store.closeWorkspace?.phase, .summaryRequired(changes: ["Undescribed change"]))
         await store.closeWithoutAddingWorkspace()
@@ -2852,9 +2865,7 @@ final class AppStoreTests: XCTestCase {
                     LandCommit(id: "2", subject: "Second committed change")
                 ],
                 conflicts: [],
-                needsMessage: true,
-                diverging: [],
-                targetSnapshot: "test-snapshot"
+                needsMessage: true
             )
         )
 
@@ -2883,9 +2894,7 @@ final class AppStoreTests: XCTestCase {
                     bookmarkCommit: "head",
                     commits: [LandCommit(id: "1", subject: subject)],
                     conflicts: [],
-                    needsMessage: true,
-                    diverging: [],
-                    targetSnapshot: "test-snapshot"
+                    needsMessage: true
                 )
             )
 
@@ -2902,13 +2911,14 @@ final class AppStoreTests: XCTestCase {
         let fake = FakeWorkspaceEngine()
         let (store, _, _) = TestSupport.makeStore(engine: fake)
         let workspace = await makeClosableWorkspace(store: store, fake: fake)
-        fake.nextPreviewResult = .success(LandPreview(bookmark: "main", bookmarkCommit: "head", commits: [], conflicts: [LandCommit(id: "1", subject: " \n ")], needsMessage: false, diverging: [], targetSnapshot: "test-snapshot"))
+        fake.nextPreviewResult = .success(LandPreview(bookmark: "main", bookmarkCommit: "head", commits: [], conflicts: [LandCommit(id: "1", subject: " \n ")], needsMessage: false))
         await store.prepareCloseWorkspace(workspace.id)
         XCTAssertEqual(
             store.closeWorkspace?.phase,
             .conflictAttention(
                 message: "These changes overlap newer project progress and need attention.",
-                details: ["Conflicting change"]
+                details: ["Conflicting change"],
+                engineMessage: nil
             )
         )
         store.requestCloseWithoutAdding()
@@ -2937,7 +2947,7 @@ final class AppStoreTests: XCTestCase {
         let fake = FakeWorkspaceEngine()
         let (store, _, _) = TestSupport.makeStore(engine: fake)
         let workspace = await makeClosableWorkspace(store: store, fake: fake)
-        fake.nextPreviewResult = .success(LandPreview(bookmark: "main", bookmarkCommit: "head", commits: [LandCommit(id: "1", subject: "change")], conflicts: [], needsMessage: false, diverging: [], targetSnapshot: "test-snapshot"))
+        fake.nextPreviewResult = .success(LandPreview(bookmark: "main", bookmarkCommit: "head", commits: [LandCommit(id: "1", subject: "change")], conflicts: [], needsMessage: false))
         var remainedBusy = false
         fake.onLandWorkspace = {
             store.cancelCloseWorkspace()
@@ -2961,6 +2971,22 @@ final class AppStoreTests: XCTestCase {
                 message: "The workspace's changes couldn't be compared with the project. The workspace remains open. Return to it and try again."
             )
         )
+    }
+
+    /// A `workspace-changed` refusal is the engine saying the workspace needs
+    /// the user's hand before it can even be previewed -- a stale jj working
+    /// copy, a git rebase still in progress -- and its message is the only
+    /// thing that says what to do, so it is shown verbatim rather than the
+    /// generic recovery copy.
+    func test33b2_workspaceChangedPreviewSurfacesTheEngineMessage() async {
+        let fake = FakeWorkspaceEngine()
+        let (store, _, _) = TestSupport.makeStore(engine: fake)
+        let workspace = await makeClosableWorkspace(store: store, fake: fake)
+        let engineMessage = "The working copy in /tmp/ws is stale: run `jj workspace update-stale` in that directory, then try again."
+        fake.nextPreviewResult = .failure(.workspaceChanged(engineMessage))
+        await store.prepareCloseWorkspace(workspace.id)
+        XCTAssertEqual(store.closeWorkspace?.phase, .failure(message: engineMessage))
+        XCTAssertTrue(store.workspaces.contains { $0.id == workspace.id })
     }
 
     func test33c_unknownPreviewFailureUsesStableProjectRecoveryCopy() async {
@@ -3006,16 +3032,14 @@ final class AppStoreTests: XCTestCase {
                 bookmarkCommit: "head",
                 commits: [LandCommit(id: "1", subject: "Change")],
                 conflicts: [],
-                needsMessage: false,
-                diverging: [],
-                targetSnapshot: "test-snapshot"
+                needsMessage: false
             )
         )
         await store.prepareCloseWorkspace(workspace.id)
 
         let landStarted = expectation(description: "land reached suspension")
         var landContinuation: CheckedContinuation<LandResult, Error>?
-        fake.landWorkspaceHandler = { _, _, _, _ in
+        fake.landWorkspaceHandler = { _, _, _ in
             try await withCheckedThrowingContinuation { continuation in
                 landContinuation = continuation
                 landStarted.fulfill()
@@ -3053,9 +3077,7 @@ final class AppStoreTests: XCTestCase {
                 bookmarkCommit: "head",
                 commits: [LandCommit(id: "1", subject: "Change")],
                 conflicts: [],
-                needsMessage: false,
-                diverging: [],
-                targetSnapshot: "test-snapshot"
+                needsMessage: false
             )
         )
         await store.prepareCloseWorkspace(workspace.id)
@@ -3211,16 +3233,14 @@ final class AppStoreTests: XCTestCase {
             bookmarkCommit: "head",
             commits: [LandCommit(id: "1", subject: "New lifecycle change")],
             conflicts: [],
-            needsMessage: false,
-            diverging: [],
-            targetSnapshot: "test-snapshot"
+            needsMessage: false
         )
         fake.nextPreviewResult = .success(preview)
         await store.prepareCloseWorkspace(workspace.id)
 
         let landStarted = expectation(description: "old land reached suspension")
         var continuation: CheckedContinuation<LandResult, Error>?
-        fake.landWorkspaceHandler = { _, _, _, _ in
+        fake.landWorkspaceHandler = { _, _, _ in
             try await withCheckedThrowingContinuation { suspended in
                 continuation = suspended
                 landStarted.fulfill()
@@ -3290,9 +3310,7 @@ final class AppStoreTests: XCTestCase {
             bookmarkCommit: "head",
             commits: [LandCommit(id: "1", subject: "New preview")],
             conflicts: [],
-            needsMessage: false,
-            diverging: [],
-            targetSnapshot: "test-snapshot"
+            needsMessage: false
         )
         let previewStarted = expectation(description: "old preview reached suspension")
         var continuation: CheckedContinuation<LandPreview, Error>?
@@ -3449,9 +3467,7 @@ final class AppStoreTests: XCTestCase {
                 bookmarkCommit: "abc",
                 commits: [LandCommit(id: "late", subject: "Late terminal change")],
                 conflicts: [],
-                needsMessage: false,
-                diverging: [],
-                targetSnapshot: "test-snapshot"
+                needsMessage: false
             )
         )
 
@@ -3479,9 +3495,7 @@ final class AppStoreTests: XCTestCase {
                 bookmarkCommit: "abc",
                 commits: [LandCommit(id: "1", subject: "Change")],
                 conflicts: [],
-                needsMessage: false,
-                diverging: [],
-                targetSnapshot: "test-snapshot"
+                needsMessage: false
             )
         )
         await store.prepareCloseWorkspace(workspace.id)
@@ -3526,13 +3540,11 @@ final class AppStoreTests: XCTestCase {
                 bookmarkCommit: "abc",
                 commits: [LandCommit(id: "1", subject: "Change")],
                 conflicts: [],
-                needsMessage: false,
-                diverging: [],
-                targetSnapshot: "test-snapshot"
+                needsMessage: false
             )
         )
         await store.prepareCloseWorkspace(workspace.id)
-        fake.landWorkspaceHandler = { _, _, _, _ in
+        fake.landWorkspaceHandler = { _, _, _ in
             throw NSError(domain: "raw manager/VCS/storage/token diagnostic", code: 18)
         }
 
@@ -3576,9 +3588,7 @@ final class AppStoreTests: XCTestCase {
                 bookmarkCommit: "abc",
                 commits: [LandCommit(id: "1", subject: "Change")],
                 conflicts: [],
-                needsMessage: false,
-                diverging: [],
-                targetSnapshot: "test-snapshot"
+                needsMessage: false
             )
         )
         await store.prepareCloseWorkspace(workspace.id)
@@ -3597,23 +3607,16 @@ final class AppStoreTests: XCTestCase {
         // The helper already closed the project's default root session; that
         // is setup noise, not something this test is about, so it's carried
         // forward as a baseline rather than asserted away.
-        let closedIDsAfterSetup = spy.closedIDs
+        let workspaceSessionIDs = Set(store.sessions.filter {
+            $0.target == .workspace(projectPath: workspace.projectPath, name: workspace.name)
+        }.map(\.id))
         fake.nextPreviewResult = .success(
             LandPreview(
                 bookmark: "main",
                 bookmarkCommit: "abc",
                 commits: [LandCommit(id: "1", subject: "Change")],
                 conflicts: [],
-                needsMessage: false,
-                diverging: [],
-                targetSnapshot: "test-snapshot"
-            )
-        )
-        fake.nextLandResult = .success(
-            LandResult(
-                commitID: "abc",
-                bookmark: "main",
-                workspaceRetained: true
+                needsMessage: false
             )
         )
         await store.prepareCloseWorkspace(workspace.id)
@@ -3635,10 +3638,14 @@ final class AppStoreTests: XCTestCase {
         await closeTask.value
 
         XCTAssertEqual(fake.landCalls.count, 1)
-        XCTAssertEqual(spy.resumeCalls, spy.quiesceCalls)
-        XCTAssertEqual(spy.closedIDs, closedIDsAfterSetup)
+        XCTAssertEqual(spy.quiesceCalls, [workspaceSessionIDs])
+        // The land succeeded, so the quiesced sessions are closed with the
+        // workspace rather than resumed.
+        XCTAssertTrue(spy.resumeCalls.isEmpty)
+        XCTAssertTrue(Set(spy.closedIDs).isSuperset(of: workspaceSessionIDs))
+        XCTAssertFalse(store.workspaces.contains { $0.id == workspace.id })
     }
-    func test77_targetChangeAfterPreviewRestartsSessionsAndRefreshesPreparedChanges() async {
+    func test77_workspaceChangedDuringLandRestartsSessionsAndRefreshesPreparedChanges() async {
         let fake = FakeWorkspaceEngine()
         let (store, spy, stateURL) = TestSupport.makeStore(engine: fake)
         let workspace = await makeClosableWorkspace(store: store, fake: fake)
@@ -3660,23 +3667,22 @@ final class AppStoreTests: XCTestCase {
         fake.previewResults = [
             .success(LandPreview(
                 bookmark: "main", bookmarkCommit: "old", commits: [LandCommit(id: "old", subject: "Old target change")],
-                conflicts: [], needsMessage: false, diverging: [], targetSnapshot: "target-old"
+                conflicts: [], needsMessage: false
             )),
             .success(LandPreview(
                 bookmark: "main", bookmarkCommit: "new", commits: [LandCommit(id: "new", subject: "Current target change")],
-                conflicts: [], needsMessage: false, diverging: [], targetSnapshot: "target-current"
+                conflicts: [], needsMessage: false
             )),
         ]
-        fake.landWorkspaceHandler = { _, _, _, expectedSnapshot in
-            XCTAssertEqual(expectedSnapshot, "target-old")
-            throw EngineError.workspaceChanged("target changed")
+        fake.landWorkspaceHandler = { _, _, _ in
+            throw EngineError.workspaceChanged("a rebase is already in progress in this worktree")
         }
 
         await store.prepareCloseWorkspace(workspace.id)
-        XCTAssertEqual(store.closeWorkspace?.targetSnapshot, "target-old")
+        XCTAssertEqual(store.closeWorkspace?.phase, .ready(changes: ["Old target change"]))
         await store.addChangesAndCloseWorkspace()
 
-        XCTAssertEqual(fake.landCalls.map(\.expectedSnapshot), ["target-old"])
+        XCTAssertEqual(fake.landCalls.count, 1)
         XCTAssertEqual(spy.quiesceCalls, [sessionIDs])
         XCTAssertEqual(spy.resumeCalls, [sessionIDs])
         XCTAssertEqual(spy.closedIDs, closedIDsAfterSetup)
@@ -3685,7 +3691,6 @@ final class AppStoreTests: XCTestCase {
         XCTAssertEqual(try! Data(contentsOf: stateURL), persistedBefore)
         XCTAssertEqual(store.sessions.first { $0.id == session.id }?.resume, sessionsBefore.first { $0.id == session.id }?.resume)
         XCTAssertEqual(store.closeWorkspace?.phase, .ready(changes: ["Current target change"]))
-        XCTAssertEqual(store.closeWorkspace?.targetSnapshot, "target-current")
     }
 
     func test78_projectProgressChangeAfterSummaryPreviewClearsStaleSummaryAndRefreshes() async {
@@ -3698,16 +3703,15 @@ final class AppStoreTests: XCTestCase {
         fake.previewResults = [
             .success(LandPreview(
                 bookmark: "main", bookmarkCommit: "old-project", commits: [LandCommit(id: "dirty", subject: "")],
-                conflicts: [], needsMessage: true, diverging: [], targetSnapshot: "project-old"
+                conflicts: [], needsMessage: true
             )),
             .success(LandPreview(
                 bookmark: "main", bookmarkCommit: "new-project", commits: [LandCommit(id: "new", subject: "Preferred project progress")],
-                conflicts: [], needsMessage: false, diverging: [], targetSnapshot: "project-current"
+                conflicts: [], needsMessage: false
             )),
         ]
-        fake.landWorkspaceHandler = { _, _, _, expectedSnapshot in
-            XCTAssertEqual(expectedSnapshot, "project-old")
-            throw EngineError.workspaceChanged("preferred progress changed")
+        fake.landWorkspaceHandler = { _, _, _ in
+            throw EngineError.workspaceChanged("the workspace changed")
         }
 
         await store.prepareCloseWorkspace(workspace.id)
@@ -3717,10 +3721,9 @@ final class AppStoreTests: XCTestCase {
         XCTAssertEqual(spy.resumeCalls, [sessionIDs])
         XCTAssertEqual(store.closeWorkspace?.summary, "")
         XCTAssertEqual(store.closeWorkspace?.phase, .ready(changes: ["Preferred project progress"]))
-        XCTAssertEqual(store.closeWorkspace?.targetSnapshot, "project-current")
     }
 
-    func test79_projectSetupRoundTripsTokenAndRecoversStaleApplication() async {
+    func test79_projectSetupRecoversFromAWorkspaceChangedRefusal() async {
         let fake = FakeWorkspaceEngine()
         let (store, spy, _) = TestSupport.makeStore(engine: fake)
         let workspace = await makeClosableWorkspace(store: store, fake: fake)
@@ -3735,30 +3738,28 @@ final class AppStoreTests: XCTestCase {
             .failure(.noTrunk("no trunk")),
             .success(LandPreview(
                 bookmark: "main", bookmarkCommit: "", commits: [LandCommit(id: "old", subject: "Initial setup")],
-                conflicts: [], needsMessage: false, diverging: [], targetSnapshot: "setup-old"
+                conflicts: [], needsMessage: false
             )),
             .failure(.noTrunk("still no trunk")),
             .success(LandPreview(
                 bookmark: "main", bookmarkCommit: "", commits: [LandCommit(id: "new", subject: "Current setup")],
-                conflicts: [], needsMessage: false, diverging: [], targetSnapshot: "setup-current"
+                conflicts: [], needsMessage: false
             )),
         ]
-        fake.landWorkspaceHandler = { _, _, createTrunk, expectedSnapshot in
+        fake.landWorkspaceHandler = { _, _, createTrunk in
             XCTAssertEqual(createTrunk, "main")
-            XCTAssertEqual(expectedSnapshot, "setup-old")
-            throw EngineError.workspaceChanged("setup changed")
+            throw EngineError.workspaceChanged("the workspace changed")
         }
 
         await store.prepareCloseWorkspace(workspace.id)
         await store.setUpProjectAndCloseWorkspace()
 
-        XCTAssertEqual(fake.landCalls.map(\.expectedSnapshot), ["setup-old"])
+        XCTAssertEqual(fake.landCalls.map(\.createTrunk), ["main"])
         XCTAssertEqual(spy.resumeCalls, [sessionIDs])
         XCTAssertEqual(spy.closedIDs, closedIDsAfterSetup)
         XCTAssertTrue(store.workspaces.contains { $0.id == workspace.id })
         XCTAssertEqual(fake.previewLandCalls.map(\.createTrunk), [nil, "main", nil, "main"])
         XCTAssertEqual(store.closeWorkspace?.phase, .projectSetupRequired(changes: ["Current setup"], needsMessage: false))
-        XCTAssertEqual(store.closeWorkspace?.targetSnapshot, "setup-current")
     }
     func test80_staleRefreshCannotOverwriteReplacementSheetForSameWorkspace() async {
         let fake = FakeWorkspaceEngine()
@@ -3766,10 +3767,10 @@ final class AppStoreTests: XCTestCase {
         let workspace = await makeClosableWorkspace(store: store, fake: fake)
         fake.nextPreviewResult = .success(LandPreview(
             bookmark: "main", bookmarkCommit: "old", commits: [LandCommit(id: "old", subject: "Old change")],
-            conflicts: [], needsMessage: false, diverging: [], targetSnapshot: "old-snapshot"
+            conflicts: [], needsMessage: false
         ))
         await store.prepareCloseWorkspace(workspace.id)
-        fake.landWorkspaceHandler = { _, _, _, _ in
+        fake.landWorkspaceHandler = { _, _, _ in
             throw EngineError.workspaceChanged("changed")
         }
         let refreshStarted = expectation(description: "stale refresh suspended")
@@ -3783,18 +3784,17 @@ final class AppStoreTests: XCTestCase {
 
         let staleClose = Task { await store.addChangesAndCloseWorkspace() }
         await fulfillment(of: [refreshStarted], timeout: 2)
-        var replacement = CloseWorkspacePresentation(
+        let replacement = CloseWorkspacePresentation(
             workspaceID: workspace.id,
             workspaceName: workspace.displayName,
             projectPath: workspace.projectPath,
             projectName: "Replacement",
             phase: .ready(changes: ["Replacement change"])
         )
-        replacement.targetSnapshot = "replacement-snapshot"
         store.closeWorkspace = replacement
         continuation!.resume(returning: LandPreview(
             bookmark: "main", bookmarkCommit: "stale", commits: [LandCommit(id: "stale", subject: "Stale result")],
-            conflicts: [], needsMessage: false, diverging: [], targetSnapshot: "stale-snapshot"
+            conflicts: [], needsMessage: false
         ))
         await staleClose.value
 
@@ -3826,9 +3826,7 @@ final class AppStoreTests: XCTestCase {
                 bookmarkCommit: "ignored",
                 commits: [LandCommit(id: "1", subject: "Change")],
                 conflicts: [],
-                needsMessage: false,
-                diverging: [],
-                targetSnapshot: "test-snapshot"
+                needsMessage: false
             )
         )
 
@@ -3853,10 +3851,10 @@ final class AppStoreTests: XCTestCase {
         )
     }
 
-    func test90b_retainedLandWithLiveRootSessionDefersAndComposesNotice() async {
+    func test90b_deferredReconciliationComposesTheCleanupWarningIntoOneNotice() async {
         let fake = FakeWorkspaceEngine()
         let (store, spy, _) = TestSupport.makeStore(engine: fake)
-        let path = "/tmp/proj-live-root-retained"
+        let path = "/tmp/proj-live-root-warning"
         let workspace = await makeClosableWorkspace(store: store, fake: fake, path: path)
         store.newSession(in: .root(projectPath: path))
         let workspaceSessionID = store.sessions.first {
@@ -3868,17 +3866,14 @@ final class AppStoreTests: XCTestCase {
                 bookmarkCommit: "ignored",
                 commits: [LandCommit(id: "1", subject: "Change")],
                 conflicts: [],
-                needsMessage: false,
-                diverging: [],
-                targetSnapshot: "test-snapshot"
+                needsMessage: false
             )
         )
         fake.nextLandResult = .success(
             LandResult(
                 commitID: "abc",
                 bookmark: "main",
-                cleanupWarning: "Registration warning.",
-                workspaceRetained: true
+                cleanupWarning: "The workspace folder couldn't be moved to the Bin."
             )
         )
 
@@ -3889,14 +3884,17 @@ final class AppStoreTests: XCTestCase {
         XCTAssertTrue(store.projectWorkingCopyAttention.contains(path))
         XCTAssertEqual(
             store.closeWorkspace?.phase,
-            .workspaceRetained(
+            .success(
                 addedChanges: 1,
-                notice: "Registration warning.\n" + AppStore.deferredReconciliationNotice
+                notice: "The workspace folder couldn't be moved to the Bin.\n"
+                    + AppStore.deferredReconciliationNotice
             )
         )
-        XCTAssertTrue(store.workspaces.contains { $0.id == workspace.id })
-        XCTAssertTrue(store.sessions.contains { $0.id == workspaceSessionID })
-        XCTAssertFalse(spy.closedIDs.contains(workspaceSessionID))
+        // The deferral is about the PROJECT's working copy; the workspace
+        // itself is still gone.
+        XCTAssertFalse(store.workspaces.contains { $0.id == workspace.id })
+        XCTAssertFalse(store.sessions.contains { $0.id == workspaceSessionID })
+        XCTAssertTrue(spy.closedIDs.contains(workspaceSessionID))
     }
 
     func test90c_manualRefreshStaysUngatedWithLiveRootSession() async {
@@ -3911,9 +3909,7 @@ final class AppStoreTests: XCTestCase {
                 bookmarkCommit: "ignored",
                 commits: [LandCommit(id: "1", subject: "Change")],
                 conflicts: [],
-                needsMessage: false,
-                diverging: [],
-                targetSnapshot: "test-snapshot"
+                needsMessage: false
             )
         )
 

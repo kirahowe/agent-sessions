@@ -339,9 +339,7 @@ final class AppActionsTests: XCTestCase {
                 bookmarkCommit: "abc",
                 commits: [LandCommit(id: "def", subject: "Ship it")],
                 conflicts: [],
-                needsMessage: false,
-                diverging: [],
-                targetSnapshot: "test-snapshot"
+                needsMessage: false
             )
         )
         await store.createWorkspace(in: "/tmp/proj-A", label: "Draft")
@@ -357,7 +355,6 @@ final class AppActionsTests: XCTestCase {
                 workspaceName: "Draft",
                 projectPath: "/tmp/proj-A",
                 projectName: "proj-A",
-                targetSnapshot: "test-snapshot",
                 phase: .ready(changes: ["Ship it"])
             )
         )

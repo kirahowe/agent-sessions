@@ -268,13 +268,22 @@ private struct CloseWorkspaceView: View {
                     : "Closing workspace…"
             )
 
-        case .conflictAttention(let message, let details):
+        case .conflictAttention(let message, let details, let engineMessage):
             Label("Changes Need Attention", systemImage: "exclamationmark.triangle.fill")
                 .font(.headline)
                 .foregroundStyle(.orange)
             Text(message)
             if !details.isEmpty {
                 changeList(details)
+            }
+            // The engine's own account of the conflict it left behind —
+            // exact file and revision detail the sentence above deliberately
+            // keeps out of the headline.
+            if let engineMessage {
+                Text(engineMessage)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
             }
             sessionStopNotice(count: store.closeWorkspaceSessionCount)
             HStack {
@@ -334,34 +343,10 @@ private struct CloseWorkspaceView: View {
             }
             doneButton()
 
-        case .workspaceRetained(let addedChanges, let notice):
-            Label(
-                addedChanges.map {
-                    $0 == 1
-                        ? "1 change added. Workspace remains open."
-                        : "\($0) changes added. Workspace remains open."
-                } ?? "Changes added. Workspace remains open.",
-                systemImage: "exclamationmark.triangle.fill"
-            )
-            .font(.headline)
-            .foregroundStyle(.orange)
-            Text("This workspace needs attention before it can close.")
-            if let notice {
-                Text(notice)
-                    .foregroundStyle(.secondary)
-            }
-            HStack {
-                Spacer()
-                Button("Return to Workspace") {
-                    store.cancelCloseWorkspace()
-                }
-                .keyboardShortcut(.defaultAction)
-            }
-
         case .projectAttention(let addedChanges, let notice):
             successSummary(addedChanges: addedChanges)
             Label(
-                "The project workspace needs attention before it can follow the latest project progress.",
+                "The project's own workspace couldn't follow the latest project progress automatically. If the update conflicted, the conflicts are marked in the project workspace — resolve them there, then refresh it from the project menu.",
                 systemImage: "exclamationmark.triangle.fill"
             )
             .foregroundStyle(.orange)

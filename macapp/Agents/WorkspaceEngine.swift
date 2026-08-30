@@ -10,6 +10,11 @@ enum EngineError: Error, Equatable {
     case nothingToLand(String)
     case sharedHistory(String)
     case workspaceChanged(String)
+    /// The changes reached project progress, but the engine could not
+    /// deregister the workspace afterwards. The close failed even though the
+    /// project moved on: the workspace stays, and closing it again will find
+    /// nothing left to add.
+    case cleanupFailed(String)
     // Thrown by rebase-onto-trunk when reconciling the project working copy
     // after a successful close. This is follow-up attention, not a failure
     // of the close that already completed.
@@ -19,24 +24,26 @@ enum EngineError: Error, Equatable {
         switch self {
         case .notARepo(let m), .nameConflict(let m), .destExists(let m), .failed(let m),
              .noTrunk(let m), .landConflict(let m), .nothingToLand(let m), .sharedHistory(let m),
-             .workspaceChanged(let m), .rebaseConflict(let m):
+             .workspaceChanged(let m), .cleanupFailed(let m), .rebaseConflict(let m):
             return m
         }
     }
 }
 
-/// The result of successfully adding a workspace's changes to its project.
-/// The identifiers are retained for the subprocess contract but are not
-/// presented in the close-workspace experience.
+/// The result of successfully adding a workspace's changes to its project:
+/// the engine rebased them onto the project's trunk, advanced the trunk, and
+/// deregistered the workspace. Success always means the workspace is gone
+/// from the engine, so the app always tears its row down; the directory left
+/// on disk is the app's to move to the Bin. The identifiers are retained for
+/// the subprocess contract but are not presented in the close-workspace
+/// experience.
 struct LandResult: Equatable {
     let commitID: String
     let bookmark: String
-    /// Non-nil when project progress was published but final cleanup left a
-    /// follow-up the user should know about.
+    /// Non-nil when project progress was published but a follow-up remains —
+    /// the engine's own non-fatal warning, a workspace folder that couldn't
+    /// be moved to the Bin, or both.
     var cleanupWarning: String? = nil
-    /// True only when the engine still has a live workspace registration.
-    /// AppStore must preserve its row, sessions, path, and selection.
-    var workspaceRetained = false
 }
 
 /// Result of an irreversible workspace forget. Once this value is returned,
@@ -53,9 +60,11 @@ struct LandCommit: Equatable {
     let subject: String
 }
 
-/// A preview of the changes a workspace can add to its project. Storage
-/// details remain in the subprocess contract for compatibility, but the
-/// close-workspace UI intentionally presents only summaries and conflicts.
+/// A preview of the changes a workspace can add to its project, computed
+/// read-only: it predicts whether the rebase onto trunk would conflict but
+/// never touches the repository. Storage details remain in the subprocess
+/// contract for compatibility, but the close-workspace UI intentionally
+/// presents only summaries and conflicts.
 struct LandPreview: Equatable {
     let bookmark: String
     let bookmarkCommit: String
@@ -64,11 +73,6 @@ struct LandPreview: Equatable {
     /// conflicted file path; for Jujutsu previews it is the change summary.
     let conflicts: [LandCommit]
     let needsMessage: Bool
-    /// Advisory compatibility data. The close UI ignores it and project-root
-    /// reconciliation is requested automatically after every successful add.
-    let diverging: [LandCommit]
-    /// Opaque manager state captured with this exact preview.
-    let targetSnapshot: String
 }
 
 @MainActor
@@ -81,8 +85,7 @@ protocol WorkspaceEngineProviding: AnyObject {
     func landWorkspace(
         _ workspace: WorkspaceRow,
         message: String?,
-        createTrunk: String?,
-        expectedSnapshot: String
+        createTrunk: String?
     ) async throws -> LandResult
     func previewLand(_ workspace: WorkspaceRow, createTrunk: String?) async throws -> LandPreview
     /// Reconciles the project working copy after a successful close.
@@ -149,9 +152,6 @@ final class WorkspaceEngineCLI: WorkspaceEngineProviding {
         let commit_id: String
         let bookmark: String
         let workspace: String
-        // Required on every success: silently defaulting a missing field to
-        // false could destroy a workspace retained by the engine.
-        let workspace_retained: Bool
     }
 
     /// Change entries use `id`/`subject`. Git conflict entries instead use
@@ -169,8 +169,6 @@ final class WorkspaceEngineCLI: WorkspaceEngineProviding {
         let commits: [LandCommitPayload]
         let conflicts: [LandCommitPayload]
         let needs_message: Bool
-        let diverging: [LandCommitPayload]
-        let target_snapshot: String
     }
 
     private struct RebasedPayload: Decodable {
@@ -190,6 +188,7 @@ final class WorkspaceEngineCLI: WorkspaceEngineProviding {
         case "dest-exists": return .destExists(payload.message)
         case "no-trunk": return .noTrunk(payload.message)
         case "land-conflict": return .landConflict(payload.message)
+        case "cleanup-failed": return .cleanupFailed(payload.message)
         case "nothing-to-land": return .nothingToLand(payload.message)
         case "shared-history": return .sharedHistory(payload.message)
         case "workspace-changed": return .workspaceChanged(payload.message)
@@ -424,18 +423,12 @@ final class WorkspaceEngineCLI: WorkspaceEngineProviding {
     func landWorkspace(
         _ workspace: WorkspaceRow,
         message: String?,
-        createTrunk: String?,
-        expectedSnapshot: String
+        createTrunk: String?
     ) async throws -> LandResult {
         var args = [
             "--project", workspace.projectPath,
             "--name", workspace.name,
-            "--finalize-quiesced",
         ]
-        guard !expectedSnapshot.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            throw EngineError.failed("Expected workspace snapshot cannot be blank")
-        }
-        args += ["--expected-snapshot", expectedSnapshot]
         // `--message` is OMITTED entirely for a nil (or blank) message —
         // never sent as `--message ""`. agents-cli's own flag validation
         // treats a blank flag VALUE as though the flag were never passed at
@@ -464,17 +457,13 @@ final class WorkspaceEngineCLI: WorkspaceEngineProviding {
             throw EngineError.failed("agents-cli workspace-land returned ok with no landed payload")
         }
 
-        // By this point project progress has been published. The required
-        // workspace_retained field distinguishes a live registered workspace
-        // from ordinary cleanup warnings; never infer lifecycle from text.
+        // By this point project progress has been published and the engine
+        // has deregistered the workspace — success carries no lifecycle
+        // caveat any more, only the leftover directory this app moves to the
+        // Bin. A failure to do so is a notice, never a reason to retry the
+        // land.
         var cleanupWarnings = envelope.warning.map { [$0] } ?? []
-        if payload.workspace_retained {
-            if cleanupWarnings.isEmpty {
-                cleanupWarnings.append(
-                    "Changes were added, but the workspace remains open at \(workspace.path)."
-                )
-            }
-        } else if FileManager.default.fileExists(atPath: workspace.path) {
+        if FileManager.default.fileExists(atPath: workspace.path) {
             do {
                 try trashWorkspaceDirectory(URL(fileURLWithPath: workspace.path))
             } catch {
@@ -489,8 +478,7 @@ final class WorkspaceEngineCLI: WorkspaceEngineProviding {
             bookmark: payload.bookmark,
             cleanupWarning: cleanupWarnings.isEmpty
                 ? nil
-                : cleanupWarnings.joined(separator: "\n"),
-            workspaceRetained: payload.workspace_retained
+                : cleanupWarnings.joined(separator: "\n")
         )
     }
 
@@ -515,18 +503,12 @@ final class WorkspaceEngineCLI: WorkspaceEngineProviding {
                 )
             }
         }
-        let targetSnapshot = payload.target_snapshot
-        guard !targetSnapshot.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            throw EngineError.failed("agents-cli workspace-land-preview returned a blank target_snapshot")
-        }
         return LandPreview(
             bookmark: payload.bookmark,
             bookmarkCommit: payload.bookmark_commit,
             commits: commits(payload.commits),
             conflicts: commits(payload.conflicts),
-            needsMessage: payload.needs_message,
-            diverging: commits(payload.diverging),
-            targetSnapshot: targetSnapshot
+            needsMessage: payload.needs_message
         )
     }
 

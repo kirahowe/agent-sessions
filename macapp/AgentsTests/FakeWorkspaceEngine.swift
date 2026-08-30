@@ -14,18 +14,16 @@ final class FakeWorkspaceEngine: WorkspaceEngineProviding {
     var nextLandResult: Result<LandResult, EngineError> = .success(
         LandResult(commitID: "unset", bookmark: "main")
     )
-    /// Defaults to a no-conflicts, no-message-needed, non-diverging
-    /// preview — the "boring" case most tests that don't care about
-    /// previewLand's content should get for free.
+    /// Defaults to a no-conflicts, no-message-needed preview — the "boring"
+    /// case most tests that don't care about previewLand's content should get
+    /// for free.
     var nextPreviewResult: Result<LandPreview, EngineError> = .success(
         LandPreview(
             bookmark: "main",
             bookmarkCommit: "unset",
             commits: [],
             conflicts: [],
-            needsMessage: false,
-            diverging: [],
-            targetSnapshot: "test-snapshot"
+            needsMessage: false
         )
     )
     /// Results consumed in order before falling back to nextPreviewResult.
@@ -41,8 +39,7 @@ final class FakeWorkspaceEngine: WorkspaceEngineProviding {
     private(set) var landCalls: [(
         workspace: WorkspaceRow,
         message: String?,
-        createTrunk: String?,
-        expectedSnapshot: String
+        createTrunk: String?
     )] = []
     private(set) var previewLandCalls: [(workspace: WorkspaceRow, createTrunk: String?)] = []
     private(set) var rebaseOntoTrunkCalls: [String] = []
@@ -50,7 +47,7 @@ final class FakeWorkspaceEngine: WorkspaceEngineProviding {
     var createWorkspaceHandler: ((String) async throws -> WorkspaceRow)?
     var previewLandHandler: ((WorkspaceRow, String?) async throws -> LandPreview)?
     var rebaseOntoTrunkHandler: ((String) async throws -> Int)?
-    var landWorkspaceHandler: ((WorkspaceRow, String?, String?, String) async throws -> LandResult)?
+    var landWorkspaceHandler: ((WorkspaceRow, String?, String?) async throws -> LandResult)?
     var deleteWorkspaceHandler: ((WorkspaceRow, Bool) async throws -> DeleteResult)?
     var onLandWorkspace: (() -> Void)?
     var onDeleteWorkspace: (() -> Void)?
@@ -80,17 +77,15 @@ final class FakeWorkspaceEngine: WorkspaceEngineProviding {
     func landWorkspace(
         _ workspace: WorkspaceRow,
         message: String?,
-        createTrunk: String?,
-        expectedSnapshot: String
+        createTrunk: String?
     ) async throws -> LandResult {
         landCalls.append((
             workspace: workspace,
             message: message,
-            createTrunk: createTrunk,
-            expectedSnapshot: expectedSnapshot
+            createTrunk: createTrunk
         ))
         if let landWorkspaceHandler {
-            return try await landWorkspaceHandler(workspace, message, createTrunk, expectedSnapshot)
+            return try await landWorkspaceHandler(workspace, message, createTrunk)
         }
         onLandWorkspace?()
         return try nextLandResult.get()

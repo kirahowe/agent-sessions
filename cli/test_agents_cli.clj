@@ -238,21 +238,17 @@
                  "workspace-land-preview jj consumer"
                  (run-cli! "workspace-land-preview" "--project" project
                            "--name" "jj-consumer"))
-                preview (:preview preview-json)
-                target-snapshot (:target_snapshot preview)]
+                preview (:preview preview-json)]
             (is (= 0 preview-exit))
             (is (= "jj" (:vcs preview)))
             (is (= ["jj consumer change"] (mapv :subject (:commits preview))))
             (is (= [] (:conflicts preview)))
             (is (false? (:needs_message preview)))
-            (is (seq target-snapshot))
             (let [{land-exit :exit land-json :json}
                   (require-cli-success
                    "workspace-land jj consumer"
                    (run-cli! "workspace-land" "--project" project
-                             "--name" "jj-consumer"
-                             "--expected-snapshot" target-snapshot
-                             "--finalize-quiesced"))
+                             "--name" "jj-consumer"))
                   rebase-result
                   (require-cli-success "rebase-onto-trunk jj consumer"
                                        (run-cli! "rebase-onto-trunk" "--project" project))
@@ -263,14 +259,17 @@
                   shown (:out (require-success "jj show landed file" show-result))
                   workspace-list-out
                   (:out (require-success
-                         "jj workspace list after finalized land"
+                         "jj workspace list after land"
                          (run-process! ["jj" "--ignore-working-copy" "--no-pager"
                                         "-R" project "workspace" "list"])))]
               (is (= 0 land-exit))
               (is (= 0 (:exit rebase-result)))
               (is (= 0 (get-in rebase-result [:json :rebased :count])))
               (is (true? (:ok land-json)))
-              (is (false? (get-in land-json [:landed :workspace_retained])))
+              (is (= "main" (get-in land-json [:landed :bookmark])))
+              ;; A successful land always deregisters the workspace: nothing
+              ;; is left for the app to reason about beyond the directory it
+              ;; moves to the Bin.
               (is (not (str/includes? workspace-list-out "agents/jj-consumer")))
               (is (= "jj consumer\n" shown)))))
         (finally
@@ -301,37 +300,35 @@
                  "workspace-land-preview git consumer"
                  (run-cli! "workspace-land-preview" "--project" project
                            "--name" "git-consumer"))
-                preview (:preview preview-json)
-                target-snapshot (:target_snapshot preview)]
+                preview (:preview preview-json)]
             (is (= 0 preview-exit))
             (is (= "git" (:vcs preview)))
             (is (= ["git consumer change"] (mapv :subject (:commits preview))))
             (is (= [] (:conflicts preview)))
             (is (false? (:needs_message preview)))
-            (is (seq target-snapshot))
             (let [{land-exit :exit land-json :json}
                   (require-cli-success
                    "workspace-land git consumer"
                    (run-cli! "workspace-land" "--project" project
-                             "--name" "git-consumer"
-                             "--expected-snapshot" target-snapshot
-                             "--finalize-quiesced"))
+                             "--name" "git-consumer"))
                   rebase-result
                   (require-cli-success "rebase-onto-trunk git consumer"
                                        (run-cli! "rebase-onto-trunk" "--project" project))
                   worktree-list-out
                   (:out (require-success
-                         "git worktree list after finalized land"
+                         "git worktree list after land"
                          (run-git! project "worktree" "list" "--porcelain")))
                   branch-list-out
                   (:out (require-success
-                         "git branch list after finalized land"
+                         "git branch list after land"
                          (run-git! project "branch" "--list" "agents/git-consumer")))]
               (is (= 0 land-exit))
               (is (= 0 (:exit rebase-result)))
               (is (= 0 (get-in rebase-result [:json :rebased :count])))
               (is (true? (:ok land-json)))
-              (is (false? (get-in land-json [:landed :workspace_retained])))
+              (is (= "main" (get-in land-json [:landed :bookmark])))
+              ;; A successful land always deregisters the workspace: the
+              ;; worktree is gone and its merged branch with it.
               (is (not (str/includes? worktree-list-out workspace-dir)))
               (is (str/blank? branch-list-out))
               (is (= (get-in land-json [:landed :commit_id])
@@ -464,24 +461,21 @@
         (finally
           (cleanup! root))))))
 
-(deftest-with-manager jj-stale-snapshot-land-refused-then-recovers-test
-  (testing "workspace-land refuses a stale --expected-snapshot then succeeds with a fresh one"
+(deftest-with-manager land-rejects-retired-flags-test
+  (testing "workspace-land refuses the retired snapshot/quiesce flags"
+    ;; The app used to round-trip a preview token and announce quiesced
+    ;; finalization. Both flags are gone, and the CLI rejects unknown options
+    ;; outright -- so sending either one would turn every close into a
+    ;; bad-args failure. Pin the refusal here, next to the flows that prove
+    ;; the supported argument list still works.
     (let [{:keys [root project]} (fresh-jj-project!)]
       (try
         (let [{:keys [json]}
               (require-cli-success
-               "workspace-add jj stale-snapshot"
+               "workspace-add jj retired-flags"
                (run-cli! "workspace-add" "--project" project
-                         "--name" "jj-stale"))
+                         "--name" "jj-retired-flags"))
               workspace-dir (get-in json [:workspace :path])
-              main-commit-id
-              (fn []
-                (str/trim
-                 (:out (require-success
-                        "jj main commit id"
-                        (run-process! ["jj" "--ignore-working-copy" "--no-pager"
-                                       "-R" project "log" "--no-graph" "-r" "main"
-                                       "-T" "commit_id"])))))
               workspace-listed?
               (fn []
                 (str/includes?
@@ -489,135 +483,21 @@
                         "jj workspace list"
                         (run-process! ["jj" "--ignore-working-copy" "--no-pager"
                                        "-R" project "workspace" "list"])))
-                 "agents/jj-stale"))]
-          (spit (str (fs/path workspace-dir "first.txt")) "first change\n")
-          (require-success "jj first commit"
+                 "agents/jj-retired-flags"))]
+          (spit (str (fs/path workspace-dir "retired.txt")) "retired flags\n")
+          (require-success "jj retired-flags commit"
                            (run-process! ["jj" "-R" workspace-dir "commit"
-                                          "-m" "first change"]))
-          (let [old-token
-                (get-in (require-cli-success
-                         "workspace-land-preview jj stale (before)"
-                         (run-cli! "workspace-land-preview" "--project" project
-                                   "--name" "jj-stale"))
-                        [:json :preview :target_snapshot])
-                before-commit-id (main-commit-id)]
-            (is (seq old-token))
-            (spit (str (fs/path workspace-dir "second.txt")) "second change\n")
-            (require-success "jj second commit"
-                             (run-process! ["jj" "-R" workspace-dir "commit"
-                                            "-m" "second change"]))
-            (let [{:keys [exit json]}
-                  (run-cli! "workspace-land" "--project" project
-                            "--name" "jj-stale"
-                            "--expected-snapshot" old-token
-                            "--finalize-quiesced")]
-              (is (= 1 exit))
-              (is (false? (:ok json)))
-              (is (= "workspace-changed" (get-in json [:error :code])))
-              (is (= before-commit-id (main-commit-id)))
-              (is (workspace-listed?)))
-            (let [{:keys [exit json]}
-                  (require-cli-success
-                   "workspace-land-preview jj stale (after)"
-                   (run-cli! "workspace-land-preview" "--project" project
-                             "--name" "jj-stale"))
-                  preview (:preview json)
-                  new-token (:target_snapshot preview)]
-              (is (= 0 exit))
-              (is (seq new-token))
-              (is (not= old-token new-token))
-              (is (= #{"first change" "second change"}
-                     (set (mapv :subject (:commits preview)))))
-              (let [{land-exit :exit land-json :json}
-                    (require-cli-success
-                     "workspace-land jj stale"
-                     (run-cli! "workspace-land" "--project" project
-                               "--name" "jj-stale"
-                               "--expected-snapshot" new-token
-                               "--finalize-quiesced"))]
-                (is (= 0 land-exit))
-                (is (true? (:ok land-json)))
-                (is (false? (get-in land-json [:landed :workspace_retained])))
-                (doseq [[file content] [["first.txt" "first change\n"]
-                                        ["second.txt" "second change\n"]]]
-                  (is (= content
-                         (:out (require-success
-                                (str "jj show landed " file)
-                                (run-process!
-                                 ["jj" "--ignore-working-copy" "--no-pager" "-R" project
-                                  "file" "show" "-r" "main"
-                                  (str "root:\"" file "\"")]))))))))))
-        (finally
-          (cleanup! root))))))
-
-(deftest-with-manager git-stale-snapshot-land-refused-then-recovers-test
-  (testing "workspace-land refuses a stale --expected-snapshot then succeeds with a fresh one (git)"
-    (let [{:keys [root project]} (fresh-git-project!)]
-      (try
-        (let [{:keys [json]}
-              (require-cli-success
-               "workspace-add git stale-snapshot"
-               (run-cli! "workspace-add" "--project" project
-                         "--name" "git-stale"))
-              workspace-dir (get-in json [:workspace :path])]
-          (spit (str (fs/path workspace-dir "first.txt")) "first change\n")
-          (require-success "git add first change" (run-git! workspace-dir "add" "-A"))
-          (require-success "git first commit"
-                           (run-git! workspace-dir "commit" "-q" "-m" "first change"))
-          (let [old-token
-                (get-in (require-cli-success
-                         "workspace-land-preview git stale (before)"
-                         (run-cli! "workspace-land-preview" "--project" project
-                                   "--name" "git-stale"))
-                        [:json :preview :target_snapshot])
-                before-main (git-line! project "rev-parse" "main")]
-            (is (seq old-token))
-            (spit (str (fs/path workspace-dir "second.txt")) "second change\n")
-            (require-success "git add second change" (run-git! workspace-dir "add" "-A"))
-            (require-success "git second commit"
-                             (run-git! workspace-dir "commit" "-q" "-m" "second change"))
-            (let [{:keys [exit json]}
-                  (run-cli! "workspace-land" "--project" project
-                            "--name" "git-stale"
-                            "--expected-snapshot" old-token
-                            "--finalize-quiesced")]
-              (is (= 1 exit))
-              (is (false? (:ok json)))
-              (is (= "workspace-changed" (get-in json [:error :code])))
-              (is (= before-main (git-line! project "rev-parse" "main")))
-              (is (str/includes?
-                   (:out (require-success
-                          "git worktree list after refused land"
-                          (run-git! project "worktree" "list" "--porcelain")))
-                   workspace-dir)))
-            (let [{:keys [exit json]}
-                  (require-cli-success
-                   "workspace-land-preview git stale (after)"
-                   (run-cli! "workspace-land-preview" "--project" project
-                             "--name" "git-stale"))
-                  preview (:preview json)
-                  new-token (:target_snapshot preview)]
-              (is (= 0 exit))
-              (is (seq new-token))
-              (is (not= old-token new-token))
-              (is (= #{"first change" "second change"}
-                     (set (mapv :subject (:commits preview)))))
-              (let [{land-exit :exit land-json :json}
-                    (require-cli-success
-                     "workspace-land git stale"
-                     (run-cli! "workspace-land" "--project" project
-                               "--name" "git-stale"
-                               "--expected-snapshot" new-token
-                               "--finalize-quiesced"))]
-                (is (= 0 land-exit))
-                (is (true? (:ok land-json)))
-                (is (false? (get-in land-json [:landed :workspace_retained])))
-                (doseq [[file content] [["first.txt" "first change\n"]
-                                        ["second.txt" "second change\n"]]]
-                  (is (= content
-                         (:out (require-success
-                                (str "git show landed " file)
-                                (run-git! project "show" (str "main:" file)))))))))))
+                                          "-m" "retired flags change"]))
+          (doseq [extra-args [["--expected-snapshot" "opaque-preview-token"]
+                              ["--finalize-quiesced"]]]
+            (testing (str/join " " extra-args)
+              (let [{:keys [exit json]}
+                    (apply run-cli! "workspace-land" "--project" project
+                           "--name" "jj-retired-flags" extra-args)]
+                (is (= 1 exit))
+                (is (false? (:ok json)))
+                (is (= "bad-args" (get-in json [:error :code])))
+                (is (workspace-listed?))))))
         (finally
           (cleanup! root))))))
 

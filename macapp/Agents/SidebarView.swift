@@ -42,7 +42,7 @@ struct SidebarView: View {
                             Image(systemName: "exclamationmark.triangle.fill")
                                 .imageScale(.small)
                                 .foregroundStyle(.orange)
-                                .help("Project workspace hasn't followed the latest project progress yet. Refresh it from the project menu.")
+                                .help("The project's workspace hasn't caught up with the latest project progress. If an update conflicted, resolve the marked conflicts there, then refresh it from the project menu.")
                                 .accessibilityLabel("Project workspace hasn't followed the latest project progress")
                         }
                         Spacer()
