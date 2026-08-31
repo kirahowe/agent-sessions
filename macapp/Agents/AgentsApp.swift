@@ -32,6 +32,25 @@ struct AgentsApp: App {
     @StateObject private var store: AppStore
     @AppStorage(AppearanceMode.defaultsKey) private var appearanceMode: AppearanceMode = .system
 
+    /// True when this process is an XCTest TEST_HOST launch rather than the
+    /// user actually running the app. AgentsTests sets the app as its test
+    /// host, so every `bb test` boots this same `AgentsApp.init` — and an
+    /// unguarded init in that context touches the REAL user's world: it
+    /// loads (and can save) the live state.json, binds a control socket in
+    /// the shared socket directory, and installs an event monitor, all in a
+    /// throwaway process running beside the app the user is looking at.
+    /// That's not hypothetical — a test run doing exactly this alongside a
+    /// live instance is what prompted the guard. Checked via the environment
+    /// the test runner stamps at launch (the env is present from the first
+    /// instruction, unlike the XCTest classes, which may not be injected yet
+    /// when this init runs).
+    static let isTestHost: Bool = {
+        let env = ProcessInfo.processInfo.environment
+        return env["XCTestConfigurationFilePath"] != nil
+            || env["XCTestBundlePath"] != nil
+            || env["XCTestSessionIdentifier"] != nil
+    }()
+
     init() {
         let center = TerminalCenter()
         self.center = center
@@ -42,12 +61,27 @@ struct AgentsApp: App {
         // exist before the window is on screen (restored rows spawn eagerly).
         // Binding later — in RootView's .task, say — would leave a window
         // where the launcher finds no socket and reports the app as absent.
+        //
+        // Except under test: a test host must never listen on this build's
+        // socket namespace (see `isTestHost`) — tests that need a server
+        // construct their own against private paths.
         let overlays = OverlayCenter()
         self.overlays = overlays
         let controlServer = ControlServer(overlays: overlays)
         self.controlServer = controlServer
-        controlServer.start()
-        let store = AppStore(terminals: center, stateURL: AppStore.defaultStateURL)
+        if !Self.isTestHost {
+            controlServer.start()
+        }
+
+        // A test host gets a throwaway per-pid state path: it must neither
+        // read the user's real rows (restored rows spawn real login shells)
+        // nor ever write over live state the running app is maintaining.
+        let stateURL = Self.isTestHost
+            ? FileManager.default.temporaryDirectory.appendingPathComponent(
+                "agents-testhost-\(ProcessInfo.processInfo.processIdentifier)-state.json"
+            )
+            : AppStore.defaultStateURL
+        let store = AppStore(terminals: center, stateURL: stateURL)
         _store = StateObject(wrappedValue: store)
 
         // A review request must name a live session row; anything else is

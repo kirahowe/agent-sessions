@@ -1,5 +1,6 @@
 macapp/Agents.xcodeproj/
 macapp/.build/
+macapp/.build-tests/
 macapp/Info-Agents.plist
 .DS_Store
 xcuserdata/
