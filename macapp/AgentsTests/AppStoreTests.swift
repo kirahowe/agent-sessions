@@ -1,6 +1,14 @@
 import XCTest
 @testable import Agents
 
+/// The pane id used wherever a test drives `store.apply` directly and only
+/// cares about session-level behavior: one shared id keeps every such test
+/// on a single reduction stream per session (matching a real single-pane
+/// session), and sharing it ACROSS sessions is harmless because pane states
+/// are keyed session-first. Tests about multi-pane folding pass their own
+/// explicit pane ids instead — see the 51b section.
+private let testPane = UUID()
+
 /// Each numbered comment corresponds to the behavior list in the refactor
 /// spec. Every test builds its store state through AppStore's real public
 /// API (never by poking `store.projects`/`store.sessions` directly) and uses
@@ -1768,7 +1776,7 @@ final class AppStoreTests: XCTestCase {
         store.addProject(path: "/tmp/proj-A")
         let session = store.sessions.first!
 
-        store.apply(.structured(.set(.blocked)), to: session.id)
+        store.apply(.structured(.set(.blocked)), toSession: session.id, pane: testPane)
 
         XCTAssertEqual(store.attention[session.id]?.activity, .blocked)
     }
@@ -1779,9 +1787,9 @@ final class AppStoreTests: XCTestCase {
         let (store, _, _) = TestSupport.makeStore()
         store.addProject(path: "/tmp/proj-A")
         let session = store.sessions.first!
-        store.apply(.structured(.set(.yourTurn)), to: session.id)
+        store.apply(.structured(.set(.yourTurn)), toSession: session.id, pane: testPane)
 
-        store.apply(.structured(.clear), to: session.id)
+        store.apply(.structured(.clear), toSession: session.id, pane: testPane)
 
         XCTAssertNil(store.attention[session.id]?.activity)
         // Unlike the old setSessionActivity(nil:) API, a structured clear
@@ -1802,7 +1810,7 @@ final class AppStoreTests: XCTestCase {
         let (store, _, _) = TestSupport.makeStore()
         store.addProject(path: "/tmp/proj-A")
 
-        store.apply(.structured(.set(.blocked)), to: "not-a-real-id")
+        store.apply(.structured(.set(.blocked)), toSession: "not-a-real-id", pane: testPane)
 
         XCTAssertTrue(store.attention.isEmpty)
     }
@@ -1813,7 +1821,7 @@ final class AppStoreTests: XCTestCase {
         let (store, _, _) = TestSupport.makeStore()
         store.addProject(path: "/tmp/proj-A")
         let session = store.sessions.first!
-        store.apply(.structured(.set(.blocked)), to: session.id)
+        store.apply(.structured(.set(.blocked)), toSession: session.id, pane: testPane)
 
         store.closeSession(session.id)
 
@@ -1829,7 +1837,7 @@ final class AppStoreTests: XCTestCase {
         store.newSession(in: store.projects.first!)
         let sessions = store.sessions.filter { $0.projectPath == path }
         for session in sessions {
-            store.apply(.structured(.set(.yourTurn)), to: session.id)
+            store.apply(.structured(.set(.yourTurn)), toSession: session.id, pane: testPane)
         }
         XCTAssertEqual(store.attention.count, sessions.count)
 
@@ -1846,7 +1854,7 @@ final class AppStoreTests: XCTestCase {
         let store1 = AppStore(terminals: spy1, stateURL: url)
         store1.addProject(path: "/tmp/proj-A")
         let session = store1.sessions.first!
-        store1.apply(.structured(.set(.blocked)), to: session.id)
+        store1.apply(.structured(.set(.blocked)), toSession: session.id, pane: testPane)
         XCTAssertFalse(store1.attention.isEmpty)
 
         let spy2 = SpyTerminals()
@@ -1862,9 +1870,67 @@ final class AppStoreTests: XCTestCase {
         store.addProject(path: "/tmp/proj-A")
         let session = store.sessions.first!
 
-        spy.onSessionSignal?(session.id, .structured(.set(.blocked)))
+        spy.emitSignal(session.id, .structured(.set(.blocked)))
 
         XCTAssertEqual(store.attention[session.id]?.activity, .blocked)
+    }
+
+    // MARK: - 51b: per-pane attention aggregation
+
+    func test51b_onePaneClearingMustNotEraseAnotherPanesBlockedState() {
+        let (store, spy, _) = TestSupport.makeStore()
+        store.addProject(path: "/tmp/proj-A")
+        let session = store.sessions.first!
+        let paneA = UUID()
+        let paneB = UUID()
+
+        spy.emitSignal(session.id, pane: paneA, .structured(.set(.blocked)))
+        spy.emitSignal(session.id, pane: paneB, .structured(.set(.yourTurn)))
+        spy.emitSignal(session.id, pane: paneB, .structured(.clear))
+
+        XCTAssertEqual(
+            store.attention[session.id]?.activity, .blocked,
+            "pane B finishing must not clear the row while pane A's agent is still blocked — the fold is a severity max over panes, and a last-writer-wins session state here would hide an agent actively burning the user's time"
+        )
+    }
+
+    func test51b_structuredLatchIsPerPane_notSessionWide() {
+        let (store, spy, _) = TestSupport.makeStore()
+        store.addProject(path: "/tmp/proj-A")
+        let session = store.sessions.first!
+        let hooked = UUID()
+        let hookless = UUID()
+
+        spy.emitSignal(session.id, pane: hooked, .structured(.clear))
+        spy.emitSignal(session.id, pane: hookless, .bell)
+
+        XCTAssertEqual(
+            store.attention[session.id]?.activity, .yourTurn,
+            "one pane speaking the structured protocol must not latch its SIBLINGS out of the classifier path — the hookless pane's bell is its agent's only voice, and a session-wide latch would silence it"
+        )
+    }
+
+    func test51b_closedPanesContributionIsDropped() {
+        let (store, spy, _) = TestSupport.makeStore()
+        store.addProject(path: "/tmp/proj-A")
+        let session = store.sessions.first!
+        let paneA = UUID()
+        let paneB = UUID()
+
+        spy.emitSignal(session.id, pane: paneA, .structured(.set(.blocked)))
+        spy.emitSignal(session.id, pane: paneB, .structured(.set(.yourTurn)))
+        spy.emitPaneClosed(session.id, pane: paneA)
+
+        XCTAssertEqual(
+            store.attention[session.id]?.activity, .yourTurn,
+            "a closed pane's state must leave the fold — a pane that exits while blocked would otherwise keep the row red forever, with no live process behind the indicator"
+        )
+
+        spy.emitPaneClosed(session.id, pane: paneB)
+        XCTAssertNil(
+            store.attention[session.id]?.activity,
+            "with every contributing pane closed nothing is waiting on the user — the indicator must go dark"
+        )
     }
 
     // MARK: - 52
@@ -1874,7 +1940,7 @@ final class AppStoreTests: XCTestCase {
         store.addProject(path: "/tmp/proj-A")
         let session = store.sessions.first!
 
-        spy.onTitleChange?(session.id, "building the widget")
+        spy.emitTitle(session.id, "building the widget")
 
         let row = store.sessions.first { $0.id == session.id }!
         XCTAssertEqual(row.agentTitle, "building the widget")
@@ -2075,7 +2141,7 @@ final class AppStoreTests: XCTestCase {
         store.newSession(in: project)
         store.newSession(in: project)
         for session in store.sessions {
-            store.apply(.structured(.set(.yourTurn)), to: session.id)
+            store.apply(.structured(.set(.yourTurn)), toSession: session.id, pane: testPane)
         }
 
         XCTAssertEqual(
@@ -2093,9 +2159,9 @@ final class AppStoreTests: XCTestCase {
         store.newSession(in: project)
         store.newSession(in: project)
         let sessions = store.sessions
-        store.apply(.structured(.set(.blocked)), to: sessions[0].id)
-        store.apply(.structured(.set(.yourTurn)), to: sessions[1].id)
-        store.apply(.structured(.set(.blocked)), to: sessions[2].id)
+        store.apply(.structured(.set(.blocked)), toSession: sessions[0].id, pane: testPane)
+        store.apply(.structured(.set(.yourTurn)), toSession: sessions[1].id, pane: testPane)
+        store.apply(.structured(.set(.blocked)), toSession: sessions[2].id, pane: testPane)
 
         XCTAssertEqual(
             store.blockedSessionCount, 2,
@@ -2112,7 +2178,7 @@ final class AppStoreTests: XCTestCase {
         store.newSession(in: project)
         store.newSession(in: project)
         for session in store.sessions {
-            store.apply(.structured(.set(.blocked)), to: session.id)
+            store.apply(.structured(.set(.blocked)), toSession: session.id, pane: testPane)
         }
 
         XCTAssertEqual(
@@ -2129,8 +2195,8 @@ final class AppStoreTests: XCTestCase {
         let project = store.projects.first!
         store.newSession(in: project)
         let sessions = store.sessions
-        store.apply(.structured(.set(.blocked)), to: sessions[0].id)
-        store.apply(.structured(.set(.blocked)), to: sessions[1].id)
+        store.apply(.structured(.set(.blocked)), toSession: sessions[0].id, pane: testPane)
+        store.apply(.structured(.set(.blocked)), toSession: sessions[1].id, pane: testPane)
         XCTAssertEqual(store.blockedSessionCount, 2)
 
         store.closeSession(sessions[0].id)
@@ -2449,7 +2515,7 @@ final class AppStoreTests: XCTestCase {
         store.addProject(path: "/tmp/proj-A")
         let session = store.sessions.first!
 
-        spy.onSessionSignal?(session.id, .notification(title: "Claude Code", body: "Claude needs your permission to use Bash"))
+        spy.emitSignal(session.id, .notification(title: "Claude Code", body: "Claude needs your permission to use Bash"))
 
         XCTAssertEqual(
             store.attention[session.id]?.activity, .blocked,
@@ -2463,7 +2529,7 @@ final class AppStoreTests: XCTestCase {
         let (store, spy, _) = TestSupport.makeStore()
         store.addProject(path: "/tmp/proj-A")
 
-        spy.onSessionSignal?("not-a-real-id", .notification(title: "Claude Code", body: "Claude is waiting for your input"))
+        spy.emitSignal("not-a-real-id", .notification(title: "Claude Code", body: "Claude is waiting for your input"))
 
         XCTAssertTrue(
             store.attention.isEmpty,
@@ -2478,7 +2544,7 @@ final class AppStoreTests: XCTestCase {
         store.addProject(path: "/tmp/proj-A")
         let session = store.sessions.first!
 
-        spy.onSessionSignal?(session.id, .notification(title: "Claude Code", body: "Claude needs your permission to use Bash"))
+        spy.emitSignal(session.id, .notification(title: "Claude Code", body: "Claude needs your permission to use Bash"))
 
         XCTAssertEqual(
             store.blockedSessionCount, 1,
@@ -2497,7 +2563,7 @@ final class AppStoreTests: XCTestCase {
         XCTAssertEqual(store.selection, other.id)
         store.setAppActive(true)
 
-        spy.onSessionSignal?(target.id, .notification(title: "Claude Code", body: "Claude is waiting for your input"))
+        spy.emitSignal(target.id, .notification(title: "Claude Code", body: "Claude is waiting for your input"))
         XCTAssertEqual(store.attention[target.id]?.activity, .yourTurn, "the setup must actually raise the indicator before this test can prove selecting it clears one")
 
         store.selection = target.id
@@ -2519,7 +2585,7 @@ final class AppStoreTests: XCTestCase {
         XCTAssertEqual(store.selection, other.id)
         store.setAppActive(true)
 
-        store.apply(.structured(.set(.blocked)), to: target.id)
+        store.apply(.structured(.set(.blocked)), toSession: target.id, pane: testPane)
 
         store.selection = target.id
 
@@ -2538,7 +2604,7 @@ final class AppStoreTests: XCTestCase {
         store.setAppActive(true)
         XCTAssertEqual(store.attention[session.id]?.isAttended, true)
 
-        spy.onSessionSignal?(session.id, .notification(title: "Claude Code", body: "Claude needs your permission to use Bash"))
+        spy.emitSignal(session.id, .notification(title: "Claude Code", body: "Claude needs your permission to use Bash"))
 
         XCTAssertNil(
             store.attention[session.id]?.activity,
@@ -2556,7 +2622,7 @@ final class AppStoreTests: XCTestCase {
         // selected but the user has switched to another app entirely, which
         // is exactly the case they need the indicator for.
 
-        spy.onSessionSignal?(session.id, .notification(title: "Claude Code", body: "Claude is waiting for your input"))
+        spy.emitSignal(session.id, .notification(title: "Claude Code", body: "Claude is waiting for your input"))
 
         XCTAssertEqual(
             store.attention[session.id]?.activity, .yourTurn,
@@ -2581,7 +2647,7 @@ final class AppStoreTests: XCTestCase {
 
         store.setAppActive(false)
 
-        spy.onSessionSignal?(session.id, .notification(title: "Claude Code", body: "Claude is waiting for your input"))
+        spy.emitSignal(session.id, .notification(title: "Claude Code", body: "Claude is waiting for your input"))
 
         XCTAssertEqual(
             store.attention[session.id]?.activity, .yourTurn,
@@ -2603,7 +2669,7 @@ final class AppStoreTests: XCTestCase {
         store.newSession(in: store.projects.first!)
         XCTAssertNotEqual(store.selection, sessionA.id)
 
-        spy.onSessionSignal?(sessionA.id, .notification(title: "Claude Code", body: "Claude is waiting for your input"))
+        spy.emitSignal(sessionA.id, .notification(title: "Claude Code", body: "Claude is waiting for your input"))
 
         XCTAssertEqual(
             store.attention[sessionA.id]?.activity, .yourTurn,
@@ -2631,7 +2697,7 @@ final class AppStoreTests: XCTestCase {
         store.setAppActive(true)
         XCTAssertEqual(store.attention[sessionA.id]?.isAttended, true)
 
-        spy.onSessionSignal?(sessionB.id, .notification(title: "Claude Code", body: "Claude needs your permission to use Bash"))
+        spy.emitSignal(sessionB.id, .notification(title: "Claude Code", body: "Claude needs your permission to use Bash"))
 
         XCTAssertEqual(
             store.attention[sessionB.id]?.activity, .blocked,
@@ -2651,7 +2717,7 @@ final class AppStoreTests: XCTestCase {
         // (`store.setAppActive(NSApp.isActive)`) never ran.
         store.selection = sessionA.id
 
-        spy.onSessionSignal?(sessionA.id, .notification(title: "Claude Code", body: "Claude is waiting for your input"))
+        spy.emitSignal(sessionA.id, .notification(title: "Claude Code", body: "Claude is waiting for your input"))
 
         XCTAssertEqual(
             store.attention[sessionA.id]?.activity, .yourTurn,
@@ -2666,8 +2732,8 @@ final class AppStoreTests: XCTestCase {
         store.addProject(path: "/tmp/proj-A")
         let sessionID = store.sessions.first!.id
 
-        spy.onTitleChange?(sessionID, "π ⠙ Repair persistence")
-        spy.onAgentSessionEvent?(
+        spy.emitTitle(sessionID, "π ⠙ Repair persistence")
+        spy.emitAgentEvent(
             sessionID,
             AgentSessionEvent(agent: "omp", name: "session_start", sessionID: "omp-1", query: nil)
         )
@@ -2683,11 +2749,11 @@ final class AppStoreTests: XCTestCase {
         )
         XCTAssertNil(store.attention[sessionID])
 
-        spy.onAgentSessionEvent?(
+        spy.emitAgentEvent(
             sessionID,
             AgentSessionEvent(agent: "omp", name: "prompt_submit", sessionID: "omp-1", query: "Make it durable")
         )
-        spy.onTitleChange?(sessionID, "zsh: /tmp/proj-A")
+        spy.emitTitle(sessionID, "zsh: /tmp/proj-A")
 
         XCTAssertEqual(store.sessions.first?.resume?.title, "Repair persistence")
         XCTAssertEqual(store.sessions.first?.resume?.prompt, "Make it durable")
@@ -2701,13 +2767,13 @@ final class AppStoreTests: XCTestCase {
         store.addProject(path: "/tmp/proj-A")
         let sessionID = store.sessions.first!.id
 
-        spy.onTitleChange?(sessionID, "π > Old task")
-        spy.onAgentSessionEvent?(
+        spy.emitTitle(sessionID, "π > Old task")
+        spy.emitAgentEvent(
             sessionID,
             AgentSessionEvent(agent: "omp", name: "prompt_submit", sessionID: "omp-old", query: "Old prompt")
         )
-        spy.onTitleChange?(sessionID, "π > New task")
-        spy.onAgentSessionEvent?(
+        spy.emitTitle(sessionID, "π > New task")
+        spy.emitAgentEvent(
             sessionID,
             AgentSessionEvent(agent: "omp", name: "session_start", sessionID: "omp-new", query: nil)
         )
@@ -2717,7 +2783,7 @@ final class AppStoreTests: XCTestCase {
             SessionResumeMetadata(agent: "omp", sessionID: "omp-new", title: "New task", prompt: nil)
         )
 
-        spy.onTitleChange?(sessionID, "π ! New task needs input")
+        spy.emitTitle(sessionID, "π ! New task needs input")
         XCTAssertEqual(store.sessions.first?.resume?.title, "New task needs input")
     }
 
@@ -2726,12 +2792,12 @@ final class AppStoreTests: XCTestCase {
         store.addProject(path: "/tmp/proj-A")
         let sessionID = store.sessions.first!.id
 
-        spy.onTitleChange?(sessionID, "zsh: /tmp/proj-A")
-        spy.onAgentSessionEvent?(
+        spy.emitTitle(sessionID, "zsh: /tmp/proj-A")
+        spy.emitAgentEvent(
             sessionID,
             AgentSessionEvent(agent: "omp", name: "session_start", sessionID: "omp-1", query: nil)
         )
-        spy.onAgentSessionEvent?(
+        spy.emitAgentEvent(
             sessionID,
             AgentSessionEvent(agent: "omp", name: "tool_complete", sessionID: "omp-1", query: nil)
         )
@@ -2739,8 +2805,77 @@ final class AppStoreTests: XCTestCase {
         XCTAssertNil(store.sessions.first?.resume?.title)
         XCTAssertEqual(store.sessions.first?.resume?.sessionID, "omp-1")
 
-        spy.onTitleChange?(sessionID, "π > Recognized OMP task")
+        spy.emitTitle(sessionID, "π > Recognized OMP task")
         XCTAssertEqual(store.sessions.first?.resume?.title, "Recognized OMP task")
+    }
+
+    // MARK: - 89b: title roles in a split
+
+    func test89b_displayOnlyTitleNamesTheRowButNeverTouchesResumeMetadata() {
+        let (store, spy, _) = TestSupport.makeStore()
+        store.addProject(path: "/tmp/proj-A")
+        let sessionID = store.sessions.first!.id
+
+        spy.emitAgentEvent(
+            sessionID,
+            AgentSessionEvent(agent: "claude", name: "SessionStart", sessionID: "c-A", query: nil)
+        )
+        spy.emitTitle(sessionID, "✳ Designate task", roles: [.resume])
+        XCTAssertEqual(store.sessions.first?.resume?.title, "Designate task")
+
+        // The focused sibling's title in a split arrives display-only.
+        spy.emitTitle(sessionID, "✳ Sibling task", roles: [.display])
+
+        XCTAssertEqual(
+            store.sessions.first?.agentTitle, "✳ Sibling task",
+            "the focused pane's title must still drive the row's display name"
+        )
+        XCTAssertEqual(
+            store.sessions.first?.resume?.title, "Designate task",
+            "a display-only title must never relabel the resume record — the record's session id belongs to the designate pane's agent, and a sibling's task name on it would advertise a resume hint that lies about what it resumes"
+        )
+    }
+
+    func test89b_resumeOnlyTitleLabelsTheMetadataWithoutRenamingTheRow() {
+        let (store, spy, _) = TestSupport.makeStore()
+        store.addProject(path: "/tmp/proj-A")
+        let sessionID = store.sessions.first!.id
+
+        spy.emitTitle(sessionID, "✳ Sibling task", roles: [.display])
+        spy.emitAgentEvent(
+            sessionID,
+            AgentSessionEvent(agent: "claude", name: "SessionStart", sessionID: "c-A", query: nil)
+        )
+
+        XCTAssertNil(
+            store.sessions.first?.resume?.title,
+            "an agent event must not seed its resume title from the row's display name — that name is the focused sibling's; with no designate title known yet the honest seed is none"
+        )
+
+        spy.emitTitle(sessionID, "✳ Designate task", roles: [.resume])
+        XCTAssertEqual(store.sessions.first?.resume?.title, "Designate task")
+        XCTAssertEqual(
+            store.sessions.first?.agentTitle, "✳ Sibling task",
+            "a resume-only title must not rename the row — the unfocused designate has no say over the display name"
+        )
+    }
+
+    func test89b_designateTitleKnownBeforeTheAgentEventSeedsTheRecord() {
+        let (store, spy, _) = TestSupport.makeStore()
+        store.addProject(path: "/tmp/proj-A")
+        let sessionID = store.sessions.first!.id
+
+        spy.emitTitle(sessionID, "✳ Sibling task", roles: [.display])
+        spy.emitTitle(sessionID, "✳ Designate task", roles: [.resume])
+        spy.emitAgentEvent(
+            sessionID,
+            AgentSessionEvent(agent: "claude", name: "SessionStart", sessionID: "c-A", query: nil)
+        )
+
+        XCTAssertEqual(
+            store.sessions.first?.resume?.title, "Designate task",
+            "the first agent event must seed its title from the DESIGNATE pane's remembered title, not from agentTitle, which the focused sibling owns"
+        )
     }
 
     // MARK: - 90
@@ -2750,8 +2885,8 @@ final class AppStoreTests: XCTestCase {
         store.addProject(path: "/tmp/proj-A")
         let sessionID = store.sessions.first!.id
 
-        spy.onTitleChange?(sessionID, "◐ Fix the parser")
-        spy.onAgentSessionEvent?(
+        spy.emitTitle(sessionID, "◐ Fix the parser")
+        spy.emitAgentEvent(
             sessionID,
             AgentSessionEvent(agent: "claude", name: "SessionStart", sessionID: "c-1", query: nil)
         )
@@ -2763,19 +2898,19 @@ final class AppStoreTests: XCTestCase {
         )
         XCTAssertNil(store.attention[sessionID], "a session-resume envelope must never itself raise attention — only agents:status/notifications/bell do that")
 
-        spy.onAgentSessionEvent?(
+        spy.emitAgentEvent(
             sessionID,
             AgentSessionEvent(agent: "claude", name: "UserPromptSubmit", sessionID: "c-1", query: "Make it durable")
         )
         XCTAssertEqual(store.sessions.first?.resume?.prompt, "Make it durable")
 
-        spy.onTitleChange?(sessionID, "✳ Fix the parser")
+        spy.emitTitle(sessionID, "✳ Fix the parser")
         XCTAssertEqual(
             store.sessions.first?.resume?.title, "Fix the parser",
             "Claude Code's idle glyph ✳ is a recognized decoration too, not just the spinner frames, and must keep enriching the same snapshot"
         )
 
-        spy.onTitleChange?(sessionID, "kira@Mac:~/code")
+        spy.emitTitle(sessionID, "kira@Mac:~/code")
         XCTAssertEqual(
             store.sessions.first?.resume?.title, "Fix the parser",
             "a plain shell prompt taking over the title (agent exited) must not be read as a Claude Code decoration and must not wipe the remembered title"
@@ -2797,13 +2932,13 @@ final class AppStoreTests: XCTestCase {
         store.addProject(path: "/tmp/proj-A")
         let sessionID = store.sessions.first!.id
 
-        spy.onAgentSessionEvent?(
+        spy.emitAgentEvent(
             sessionID,
             AgentSessionEvent(agent: "omp", name: "prompt_submit", sessionID: "omp-1", query: "old")
         )
         XCTAssertEqual(store.sessions.first?.resume?.agent, "omp")
 
-        spy.onAgentSessionEvent?(
+        spy.emitAgentEvent(
             sessionID,
             AgentSessionEvent(agent: "claude", name: "SessionStart", sessionID: "c-1", query: nil)
         )
@@ -2818,14 +2953,14 @@ final class AppStoreTests: XCTestCase {
         // replace, not merge — session ids are only unique within a single
         // harness's own id space, so a collision across harnesses is
         // coincidence, not continuity.
-        spy.onAgentSessionEvent?(
+        spy.emitAgentEvent(
             sessionID,
             AgentSessionEvent(agent: "claude", name: "UserPromptSubmit", sessionID: "same", query: "a claude prompt")
         )
         XCTAssertEqual(store.sessions.first?.resume?.sessionID, "same")
         XCTAssertEqual(store.sessions.first?.resume?.prompt, "a claude prompt")
 
-        spy.onAgentSessionEvent?(
+        spy.emitAgentEvent(
             sessionID,
             AgentSessionEvent(agent: "codex", name: "session_start", sessionID: "same", query: nil)
         )
@@ -3655,8 +3790,8 @@ final class AppStoreTests: XCTestCase {
         let closedIDsAfterSetup = spy.closedIDs
         let target = TargetRef.workspace(projectPath: workspace.projectPath, name: workspace.name)
         let session = store.sessions.first { $0.target == target }!
-        spy.onTitleChange?(session.id, "π > Preserve this session")
-        spy.onAgentSessionEvent?(
+        spy.emitTitle(session.id, "π > Preserve this session")
+        spy.emitAgentEvent(
             session.id,
             AgentSessionEvent(agent: "omp", name: "session_start", sessionID: "omp-stale-recovery", query: nil)
         )

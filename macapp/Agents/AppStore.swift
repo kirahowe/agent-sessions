@@ -64,15 +64,24 @@ final class AppStore: ObservableObject {
     }
     @Published var lastError: String?
     @Published var closeWorkspace: CloseWorkspacePresentation?
-    /// What each live session's agent is currently doing, resolved from
-    /// every signal source (structured hook payloads, classified free-text
-    /// notifications, bells, and the user's own focus) by
-    /// `SessionAttention.reduce` — see `apply(_:to:)`, the only place this
-    /// is written. Deliberately NOT part of `PersistedState`/`save()`/
-    /// `load()`: this describes a live process's current state, which has
-    /// no meaningful value to restore after a relaunch — see
-    /// `SessionActivity`'s doc comment.
+    /// What each live session's agents are currently doing, folded to one
+    /// state per session for the sidebar/dashboard/badge. Derived — only
+    /// `recombineAttention(for:)` writes it — from `paneAttention` below,
+    /// where the actual signal reduction happens per pane. Deliberately NOT
+    /// part of `PersistedState`/`save()`/`load()`: this describes live
+    /// processes' current state, which has no meaningful value to restore
+    /// after a relaunch — see `SessionActivity`'s doc comment.
     @Published private(set) var attention: [String: AttentionState] = [:]
+
+    /// The source of truth behind `attention`: one reduced `AttentionState`
+    /// per PANE, keyed session → pane. The reducer's unit is one agent's
+    /// signal stream, and with split panes that is a pane, not a session —
+    /// reducing all of a session's panes into one state would let one
+    /// pane's clear erase another pane's still-open blocked indicator, and
+    /// would let the first structured pane latch every sibling out of the
+    /// classifier path. Written only by `apply(_:toSession:pane:)`,
+    /// `setAttended`, and the pane-close pruning.
+    private var paneAttention: [String: [UUID: AttentionState]] = [:]
     /// Project working copies whose progress hasn't been reconciled — either
     /// because automatic reconciliation failed, or because it was deferred
     /// while the project root had a live session of its own — keyed by
@@ -192,14 +201,17 @@ final class AppStore: ObservableObject {
         terminals.onProcessExit = { [weak self] id in
             self?.closeSession(id)
         }
-        terminals.onSessionSignal = { [weak self] id, signal in
-            self?.apply(signal, to: id)
+        terminals.onSessionSignal = { [weak self] id, paneID, signal in
+            self?.apply(signal, toSession: id, pane: paneID)
         }
-        terminals.onTitleChange = { [weak self] id, title in
-            self?.setSessionTitle(title, for: id)
+        terminals.onPaneClosed = { [weak self] id, paneID in
+            self?.removePaneAttention(sessionID: id, pane: paneID)
         }
-        terminals.onAgentSessionEvent = { [weak self] id, event in
-            self?.handleAgentSessionEvent(event, for: id)
+        terminals.onTitleChange = { [weak self] id, title, roles in
+            self?.setSessionTitle(title, for: id, roles: roles)
+        }
+        terminals.onAgentSessionEvent = { [weak self] id, event, paneTitle in
+            self?.handleAgentSessionEvent(event, for: id, paneTitle: paneTitle)
         }
         load()
         projectLifecycleTokens = projects.reduce(into: [:]) { tokens, project in
@@ -908,15 +920,83 @@ final class AppStore: ObservableObject {
         save()
     }
 
-    /// The single funnel for every attention signal, from every source —
-    /// nothing else in the app may write `attention`. Ignores ids with no
-    /// matching row in `sessions` — a signal racing that session's own
-    /// teardown is a normal, harmless race, not an error to surface.
+    /// The single funnel for every pane attention signal, from every source
+    /// — nothing else in the app may write `paneAttention`. Ignores ids
+    /// with no matching row in `sessions` — a signal racing that session's
+    /// own teardown is a normal, harmless race, not an error to surface.
     /// Deliberately never calls `save()`: this state is not persisted (see
     /// `attention`'s doc comment).
-    func apply(_ signal: AttentionSignal, to sessionID: String) {
+    ///
+    /// A pane's very first signal seeds its state with the session's
+    /// current attended flag rather than the default `false`: `isAttended`
+    /// suppression exists so a row the user is already looking at never
+    /// raises, and a freshly split pane in the selected session is exactly
+    /// as looked-at as its siblings — its first bell must not light the row.
+    func apply(_ signal: AttentionSignal, toSession sessionID: String, pane paneID: UUID) {
         guard sessions.contains(where: { $0.id == sessionID }) else { return }
-        attention[sessionID] = SessionAttention.reduce(attention[sessionID] ?? .init(), signal)
+        let seed = AttentionState(
+            activity: nil, isStructured: false, isAttended: attendedSessionID == sessionID
+        )
+        var panes = paneAttention[sessionID] ?? [:]
+        panes[paneID] = SessionAttention.reduce(panes[paneID] ?? seed, signal)
+        paneAttention[sessionID] = panes
+        recombineAttention(for: sessionID)
+    }
+
+    /// Drops a closed pane's contribution — wired to
+    /// `SessionTerminating.onPaneClosed`. Without this, a pane closed while
+    /// blocked would keep its session's row red forever.
+    private func removePaneAttention(sessionID: String, pane paneID: UUID) {
+        guard paneAttention[sessionID]?.removeValue(forKey: paneID) != nil else { return }
+        if paneAttention[sessionID]?.isEmpty == true {
+            paneAttention.removeValue(forKey: sessionID)
+        }
+        recombineAttention(for: sessionID)
+    }
+
+    /// Folds a session's pane states into the one `attention` entry its row
+    /// renders. The fold is a pure severity max: any pane blocked → the row
+    /// is blocked; else any pane your-turn → your-turn; else nothing. The
+    /// combined `isStructured` is "any pane speaks the protocol" (only
+    /// meaningful to observers; each pane's own latch lives in its own
+    /// state), and `isAttended` restates the session-level attended fact.
+    /// With one pane — every session until its first split — this fold is
+    /// the identity, so nothing about single-pane behavior changes.
+    private func recombineAttention(for sessionID: String) {
+        let isAttended = attendedSessionID == sessionID
+        guard let states = paneAttention[sessionID].map(Array.init), !states.isEmpty else {
+            // No pane has ever signaled. Attended sessions still materialize
+            // an entry: `isAttended` must be readable the moment the user
+            // selects a row, signals or not.
+            attention[sessionID] = isAttended
+                ? AttentionState(activity: nil, isStructured: false, isAttended: true)
+                : nil
+            return
+        }
+        let activities = states.map(\.value.activity)
+        let activity: SessionActivity? = activities.contains(.blocked)
+            ? .blocked
+            : activities.contains(.yourTurn) ? .yourTurn : nil
+        attention[sessionID] = AttentionState(
+            activity: activity,
+            isStructured: states.contains { $0.value.isStructured },
+            isAttended: isAttended
+        )
+    }
+
+    /// Applies the attended/un-attended transition to every pane stream of
+    /// a session (suppression and clears happen per pane, in the reducer),
+    /// then refolds the row's entry.
+    private func setAttended(_ sessionID: String, _ isAttended: Bool) {
+        if var panes = paneAttention[sessionID] {
+            for (paneID, state) in panes {
+                panes[paneID] = SessionAttention.reduce(
+                    state, .attentionChanged(isAttended: isAttended)
+                )
+            }
+            paneAttention[sessionID] = panes
+        }
+        recombineAttention(for: sessionID)
     }
 
     /// Whether the app itself is frontmost. AppStore stays AppKit-free (only
@@ -982,12 +1062,16 @@ final class AppStore: ObservableObject {
     private func updateAttention() {
         let next = isAppActive ? selection : nil
         guard next != attendedSessionID else { return }
-        if let previous = attendedSessionID {
-            apply(.attentionChanged(isAttended: false), to: previous)
-        }
+        let previous = attendedSessionID
+        // Flag first, transitions second: `recombineAttention` (inside
+        // `setAttended`) derives each row's `isAttended` from this field,
+        // so both refolds below must already see the new attended session.
         attendedSessionID = next
+        if let previous {
+            setAttended(previous, false)
+        }
         if let next {
-            apply(.attentionChanged(isAttended: true), to: next)
+            setAttended(next, true)
         }
     }
 
@@ -1004,17 +1088,28 @@ final class AppStore: ObservableObject {
     /// so agents that re-emit the same title on every turn don't churn a
     /// state.json write each time. Ids with no matching row (a title racing
     /// that session's teardown) are a harmless no-op.
-    func setSessionTitle(_ title: String, for sessionID: String) {
+    ///
+    /// `roles` gates which facts this title may update (see
+    /// `SessionTerminating.onTitleChange`): only a `.display` title touches
+    /// `agentTitle`, and only a `.resume` title — the resume-designate
+    /// pane's — may relabel `resume.title`. In a split, the focused pane's
+    /// title arriving with `.display` alone is what keeps a sibling's task
+    /// name out of another agent's resume record. The default covers every
+    /// single-pane emit, where one pane holds both roles.
+    func setSessionTitle(
+        _ title: String, for sessionID: String, roles: SessionTitleRoles = [.display, .resume]
+    ) {
         guard let index = sessions.firstIndex(where: { $0.id == sessionID }) else { return }
         let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
 
         var changed = false
-        if sessions[index].agentTitle != trimmed {
+        if roles.contains(.display), sessions[index].agentTitle != trimmed {
             sessions[index].agentTitle = trimmed
             changed = true
         }
-        if var resume = sessions[index].resume,
+        if roles.contains(.resume),
+           var resume = sessions[index].resume,
            let cleanTitle = SessionResumeMetadata.normalizedTitle(trimmed, agent: resume.agent),
            resume.title != cleanTitle
         {
@@ -1032,11 +1127,19 @@ final class AppStore: ObservableObject {
     /// entirely (e.g. Claude Code taking over a row OMP last ran in),
     /// replaces the prior snapshot; subsequent events for the same pair
     /// only fill or update the title/prompt fields.
-    func handleAgentSessionEvent(_ event: AgentSessionEvent, for sessionID: String) {
+    func handleAgentSessionEvent(
+        _ event: AgentSessionEvent, for sessionID: String, paneTitle: String?
+    ) {
         guard let index = sessions.firstIndex(where: { $0.id == sessionID }) else { return }
 
-        let rawTitle = sessions[index].agentTitle
-        let currentDecoratedTitle = rawTitle.flatMap {
+        // Seed the label from `paneTitle` — the AUTHORING pane's own OSC
+        // title, attached to the event by TerminalCenter — and only that:
+        // `agentTitle` is the focused pane's, which in a split may be a
+        // sibling agent's task name, and a lying label is worse than none.
+        // Nil (fresh pane, or first event after a relaunch before the shell
+        // titles itself) leaves the label empty until the authoring pane's
+        // next `.resume`-role title fills it in via setSessionTitle.
+        let currentDecoratedTitle = paneTitle.flatMap {
             SessionResumeMetadata.normalizedTitle($0, agent: event.agent)
         }
         var next: SessionResumeMetadata
@@ -1068,6 +1171,7 @@ final class AppStore: ObservableObject {
     private func pruneLiveSessionState() {
         let liveIDs = Set(sessions.map(\.id))
         attention = attention.filter { liveIDs.contains($0.key) }
+        paneAttention = paneAttention.filter { liveIDs.contains($0.key) }
     }
 
     /// A manual rename writes `customName`, not `name`: it must win over —

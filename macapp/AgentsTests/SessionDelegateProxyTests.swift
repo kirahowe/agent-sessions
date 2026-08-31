@@ -33,14 +33,14 @@ final class SessionDelegateProxyTests: XCTestCase {
     override func setUp() async throws {
         try await super.setUp()
         let center = TerminalCenter()
-        center.onSessionSignal = { [weak self] id, signal in
+        center.onSessionSignal = { [weak self] id, _, signal in
             self?.received.append((id, signal))
         }
-        center.onAgentSessionEvent = { [weak self] id, event in
+        center.onAgentSessionEvent = { [weak self] id, event, _ in
             self?.receivedAgentEvents.append((id, event))
         }
         self.center = center
-        proxy = SessionDelegateProxy(sessionID: sessionID, center: center)
+        proxy = SessionDelegateProxy(sessionID: sessionID, paneID: UUID(), center: center)
     }
 
     override func tearDown() async throws {

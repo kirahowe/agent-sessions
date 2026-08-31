@@ -2,22 +2,61 @@ import AppKit
 import Combine
 import GhosttyTerminal
 
-/// Owns the lifecycle of every live TerminalView/TerminalController pair,
-/// one per session. Scoped strictly to terminal lifecycle (create/get/close);
-/// NSView container/subview/constraint/visibility/focus mechanics live in
-/// `TerminalHostView`.
+/// Owns the lifecycle of every live TerminalView/TerminalController pair.
+/// Surfaces are keyed by *pane* id and grouped by session: each session owns
+/// a `SessionPaneLayout` (see PaneLayout.swift) whose leaves are panes, with
+/// a single pane as the degenerate tree. Scoped strictly to terminal + layout
+/// lifecycle (create/split/close/focus); NSView container/subview/visibility
+/// mechanics live in `TerminalHostView`.
 @MainActor
 final class TerminalCenter: ObservableObject, SessionTerminating {
-    private struct Entry {
+    /// One live pane surface. `lastTitle` remembers the pane's most recent
+    /// OSC title so the session row can switch to it when this pane gains
+    /// focus — the focused pane's title drives the row title, and a pane
+    /// that announced its title while unfocused must not lose it.
+    private struct PaneEntry {
+        let sessionID: String
         let view: TerminalView
         var controller: TerminalController?
         var delegateProxy: SessionDelegateProxy
-        var restoredResume: SessionResumeMetadata?
-        var resumeHintScheduled = false
-        var didShowResumeHint = false
+        var lastTitle: String?
     }
 
-    private var entries: [String: Entry] = [:]
+    /// Per-session resume-hint bookkeeping. Session-scoped, not pane-scoped:
+    /// the hint prints once per restored session, and only ever into the
+    /// session's initial pane (see `SessionPaneLayout.initialPane`).
+    private struct ResumeHintState {
+        var metadata: SessionResumeMetadata?
+        var scheduled = false
+        var didShow = false
+    }
+
+    private var panes: [UUID: PaneEntry] = [:]
+    private var resumeHints: [String: ResumeHintState] = [:]
+
+    /// Who owns each session's current resume record. Distinct from the
+    /// resume DESIGNATE (who may author next): while the author lives, only
+    /// its titles may relabel the record; a record whose author is gone is
+    /// `.frozen` — it still describes that dead (or pre-relaunch) agent's
+    /// conversation, and letting the inheriting designate's title onto it
+    /// would advertise "Task B … --resume A" — until a new agent event
+    /// re-authors it. Absent means no record exists yet, the one state in
+    /// which the designate may pre-label (seed) freely.
+    private enum ResumeAuthorship {
+        /// A live pane's agent authored the record.
+        case pane(UUID)
+        /// A record exists but nothing living authored it: restored from
+        /// disk, or its author's process died (pane exit or quiesce).
+        case frozen
+    }
+
+    private var resumeAuthorship: [String: ResumeAuthorship] = [:]
+
+    /// Every session's pane arrangement, published so `TerminalHostView`
+    /// re-lays-out on split/close/focus/resize. The pane entries themselves
+    /// stay private — observers get views via `view(forPane:)`.
+    @Published private(set) var layouts: [String: SessionPaneLayout] = [:]
+
     @Published private(set) var quiescedSessionIDs: Set<String> = []
 
     private let textDelivery: @MainActor (TerminalView, String) -> Void
@@ -85,7 +124,9 @@ final class TerminalCenter: ObservableObject, SessionTerminating {
     /// what lets a process inside the session say which session it is when it
     /// talks back over the control socket — the revdiff launcher forwards it
     /// so its review can be scoped to the row that asked, rather than taking
-    /// over whatever is selected.
+    /// over whatever is selected. Every pane of a session shares the
+    /// session's id: reviews are per session, not per pane, so an agent in
+    /// any pane names the same row.
     static func sessionEnvVars(for sessionID: String) -> [String: String] {
         [
             "AGENTS_APP": "1",
@@ -103,26 +144,39 @@ final class TerminalCenter: ObservableObject, SessionTerminating {
         ]
     }
 
-    /// Invoked with the session id after the underlying shell process exits
-    /// and the terminal has already been torn down.
+    /// Invoked with the session id after the session's last pane's shell
+    /// process exits and the terminal has already been torn down. A pane
+    /// exit that leaves other panes alive collapses the layout instead and
+    /// never reaches this.
     var onProcessExit: ((String) -> Void)?
 
-    /// Invoked with the session id and an `AttentionSignal` whenever a
-    /// session's terminal reports something that could bear on attention
-    /// state, via `SessionDelegateProxy`. See `SessionTerminating.onSessionSignal`.
-    var onSessionSignal: ((String, AttentionSignal) -> Void)?
+    /// Invoked with (sessionID, paneID, signal) whenever any of a session's
+    /// panes reports something that could bear on attention state, via
+    /// `SessionDelegateProxy`. The pane id rides along so `AppStore` can
+    /// reduce each pane's stream separately before folding the results into
+    /// the one session-row indicator. See `SessionTerminating.onSessionSignal`.
+    var onSessionSignal: ((String, UUID, AttentionSignal) -> Void)?
 
-    /// Invoked with the session id and new title whenever a session's
-    /// terminal reports an OSC window-title change via
-    /// `SessionDelegateProxy.terminalDidChangeTitle`.
-    var onTitleChange: ((String, String) -> Void)?
+    /// Invoked with (sessionID, paneID) after any pane's surface is freed,
+    /// on every teardown path. See `SessionTerminating.onPaneClosed`.
+    var onPaneClosed: ((String, UUID) -> Void)?
+
+    /// Invoked with (sessionID, title, roles) whenever a pane whose title
+    /// matters reports an OSC window-title change (via
+    /// `SessionDelegateProxy.terminalDidChangeTitle`), and again with the
+    /// newly focused pane's remembered title whenever focus moves to a pane
+    /// that has one. The focused pane's title drives the row's display name
+    /// (`.display`); the resume-designate pane's labels the resume metadata
+    /// (`.resume`). See `SessionTerminating.onTitleChange`.
+    var onTitleChange: ((String, String, SessionTitleRoles) -> Void)?
 
     /// Invoked with a decoded agent session event, either Warp's CLI-agent
-    /// protocol (OMP) or the app's own hook title (Claude Code, Codex).
-    /// Notifications with either magic title that fail decoding are
-    /// consumed by the delegate proxy and never arrive here or at the
-    /// attention classifier.
-    var onAgentSessionEvent: ((String, AgentSessionEvent) -> Void)?
+    /// protocol (OMP) or the app's own hook title (Claude Code, Codex),
+    /// plus the authoring pane's current OSC title as the label seed — see
+    /// `SessionTerminating.onAgentSessionEvent`. Notifications with either
+    /// magic title that fail decoding are consumed by the delegate proxy
+    /// and never arrive here or at the attention classifier.
+    var onAgentSessionEvent: ((String, AgentSessionEvent, String?) -> Void)?
 
     /// Invoked with the session id at the START of every teardown path —
     /// `closeSession` and `quiesceSessions` — before the surface is freed.
@@ -133,43 +187,85 @@ final class TerminalCenter: ObservableObject, SessionTerminating {
     /// connection nobody will ever answer.
     var onSessionTeardown: ((String) -> Void)?
 
-    /// Lazily creates (on first call) or returns the cached `TerminalView`
-    /// for a session, spawning the user's login shell rooted at
-    /// `workingDirectory`.
+    // MARK: - Session and pane creation
+
+    /// Lazily creates (on first call) or returns the cached focused pane's
+    /// `TerminalView` for a session, spawning the user's login shell rooted
+    /// at `workingDirectory` for a brand-new session.
     func terminalView(
         for sessionID: String,
         workingDirectory: String,
         restoredResume: SessionResumeMetadata?
     ) -> TerminalView? {
-        guard !quiescedSessionIDs.contains(sessionID) else { return nil }
+        guard ensureSession(
+            sessionID,
+            workingDirectory: workingDirectory,
+            restoredResume: restoredResume
+        ), let layout = layouts[sessionID] else { return nil }
+        return panes[layout.focusedPane]?.view
+    }
 
-        if var entry = entries[sessionID] {
-            if entry.controller == nil {
-                let proxy = SessionDelegateProxy(sessionID: sessionID, center: self)
+    /// Makes sure `sessionID` has a live pane layout: creates the initial
+    /// pane for a session this center has never seen, and recreates the
+    /// controller for a pane whose surface was torn down by a quiesce.
+    /// Returns false — creating nothing — while the session is quiesced.
+    @discardableResult
+    func ensureSession(
+        _ sessionID: String,
+        workingDirectory: String,
+        restoredResume: SessionResumeMetadata?
+    ) -> Bool {
+        guard !quiescedSessionIDs.contains(sessionID) else { return false }
+
+        if let layout = layouts[sessionID] {
+            for paneID in layout.paneIDs {
+                guard var entry = panes[paneID], entry.controller == nil else { continue }
+                let proxy = SessionDelegateProxy(sessionID: sessionID, paneID: paneID, center: self)
                 let controller = TerminalController(
                     terminalConfiguration: Self.terminalConfiguration
                 )
                 entry.delegateProxy = proxy
                 entry.controller = controller
-                entry.restoredResume = restoredResume
-                entry.resumeHintScheduled = false
-                entry.didShowResumeHint = false
                 entry.view.delegate = proxy
-                entries[sessionID] = entry
+                panes[paneID] = entry
                 entry.view.controller = controller
+                resumeHints[sessionID] = ResumeHintState(metadata: restoredResume)
+                if restoredResume != nil, resumeAuthorship[sessionID] == nil {
+                    resumeAuthorship[sessionID] = .frozen
+                }
             }
-            return entry.view
+            return true
         }
 
-        let proxy = SessionDelegateProxy(sessionID: sessionID, center: self)
+        let paneID = UUID()
+        layouts[sessionID] = SessionPaneLayout(initialPane: paneID)
+        resumeHints[sessionID] = ResumeHintState(metadata: restoredResume)
+        if restoredResume != nil {
+            // A restored row carries a persisted record authored by a
+            // process that predates this launch — frozen until an agent
+            // event re-authors it, exactly like a record whose author died.
+            resumeAuthorship[sessionID] = .frozen
+        }
+        panes[paneID] = makePane(
+            sessionID: sessionID, paneID: paneID, workingDirectory: workingDirectory
+        )
+        return true
+    }
+
+    /// Spawns a fresh pane surface: the user's login shell in
+    /// `workingDirectory`, with the session's stamped environment (shared
+    /// `AGENTS_SESSION_ID` included). Setup order mirrors the package's own
+    /// AppKit example: delegate, then configuration, then controller, before
+    /// the caller adds the view to the hierarchy.
+    private func makePane(
+        sessionID: String, paneID: UUID, workingDirectory: String
+    ) -> PaneEntry {
+        let proxy = SessionDelegateProxy(sessionID: sessionID, paneID: paneID, center: self)
         // DropTerminalView adds Finder drag-and-drop (the package itself has
-        // none) — see its doc comment for why. The stored type stays
+        // none) — see its doc comment for why. Per pane, so drag and drop
+        // stays fully native in every pane. The stored type stays
         // TerminalView; every caller only needs the base API.
         let view = DropTerminalView(frame: .zero)
-
-        // Setup order mirrors the package's own AppKit example: delegate,
-        // then configuration, then controller, before the caller adds the
-        // view to the hierarchy.
         view.delegate = proxy
         view.configuration = TerminalSurfaceOptions(
             backend: .exec,
@@ -178,84 +274,262 @@ final class TerminalCenter: ObservableObject, SessionTerminating {
         )
         let controller = TerminalController(terminalConfiguration: Self.terminalConfiguration)
         view.controller = controller
-
-        entries[sessionID] = Entry(
-            view: view,
-            controller: controller,
-            delegateProxy: proxy,
-            restoredResume: restoredResume
+        return PaneEntry(
+            sessionID: sessionID, view: view, controller: controller, delegateProxy: proxy
         )
-        return view
     }
 
-    /// Prints a resume hint exactly once, and only when metadata was already
-    /// present when this live surface was created. Metadata learned from an
+    /// The live view for a pane id, if any. `TerminalHostView` mounts every
+    /// pane of the selected session through this.
+    func view(forPane paneID: UUID) -> TerminalView? {
+        panes[paneID]?.view
+    }
+
+    // MARK: - Split/close/focus commands
+
+    /// Splits the selected session's focused pane, spawning a fresh login
+    /// shell in `workingDirectory`. Returns the new pane's id (now focused),
+    /// or nil for a session with no live layout (never shown, or quiesced).
+    @discardableResult
+    func splitPane(
+        in sessionID: String, axis: SplitAxis, workingDirectory: String
+    ) -> UUID? {
+        guard !quiescedSessionIDs.contains(sessionID), var layout = layouts[sessionID] else {
+            return nil
+        }
+        let paneID = UUID()
+        panes[paneID] = makePane(
+            sessionID: sessionID, paneID: paneID, workingDirectory: workingDirectory
+        )
+        layout.splitFocused(axis: axis, adding: paneID)
+        layouts[sessionID] = layout
+        // No title emit: the new pane is focused and hasn't announced a
+        // title yet, so the row keeps its current name until it does.
+        return paneID
+    }
+
+    /// Closes the focused pane of a multi-pane session, killing its process.
+    /// Refuses (returns false) for a single-pane session: closing the last
+    /// pane is closing the session, and that decision belongs to the
+    /// explicit close-session command, not a pane command.
+    @discardableResult
+    func closeFocusedPane(in sessionID: String) -> Bool {
+        guard !quiescedSessionIDs.contains(sessionID),
+              let layout = layouts[sessionID],
+              layout.paneCount > 1
+        else { return false }
+        removePane(layout.focusedPane, from: sessionID)
+        return true
+    }
+
+    /// Moves a session's focus to `paneID` (click-to-focus). No-op when the
+    /// pane is unknown or already focused.
+    func focusPane(_ paneID: UUID) {
+        guard let sessionID = panes[paneID]?.sessionID,
+              var layout = layouts[sessionID],
+              layout.focusedPane != paneID
+        else { return }
+        layout.focus(paneID)
+        layouts[sessionID] = layout
+        emitFocusedPaneTitle(for: sessionID)
+    }
+
+    /// Moves the session's focus one pane toward `direction`. Returns
+    /// whether focus moved (false at an edge).
+    @discardableResult
+    func moveFocus(in sessionID: String, direction: FocusDirection) -> Bool {
+        guard var layout = layouts[sessionID], layout.moveFocus(direction) else { return false }
+        layouts[sessionID] = layout
+        emitFocusedPaneTitle(for: sessionID)
+        return true
+    }
+
+    /// Adjusts a split's ratio (divider drag) — see
+    /// `SessionPaneLayout.setRatio`.
+    func setRatio(in sessionID: String, at path: [PaneBranch], to ratio: Double) {
+        guard var layout = layouts[sessionID] else { return }
+        layout.setRatio(at: path, to: ratio)
+        layouts[sessionID] = layout
+    }
+
+    /// Removes one pane of a multi-pane session: frees its surface, then
+    /// collapses its layout node. Callers guarantee the session has another
+    /// pane to inherit the space.
+    private func removePane(_ paneID: UUID, from sessionID: String) {
+        guard var layout = layouts[sessionID] else { return }
+        teardownPaneEntry(paneID)
+        if case .removed = layout.removePane(paneID) {
+            layouts[sessionID] = layout
+            // Focus may have moved to the inheriting pane — let its
+            // remembered title take over the row.
+            emitFocusedPaneTitle(for: sessionID)
+        }
+    }
+
+    /// Frees one pane's surface. Explicitly clearing the controller calls
+    /// Ghostty's synchronous surface-free path before this method returns;
+    /// ARC is not used as the lifecycle boundary. Announces the closed pane
+    /// afterward so `AppStore` drops its attention contribution.
+    private func teardownPaneEntry(_ paneID: UUID) {
+        guard let entry = panes.removeValue(forKey: paneID) else { return }
+        entry.delegateProxy.suppressesProcessExit = true
+        entry.view.delegate = nil
+        entry.view.removeFromSuperview()
+        entry.view.controller = nil
+        onPaneClosed?(entry.sessionID, paneID)
+    }
+
+    /// Re-announces the focused pane's remembered title after focus moved.
+    /// A pane that never announced one emits nothing: the row keeps its
+    /// current name rather than flashing back to a default.
+    private func emitFocusedPaneTitle(for sessionID: String) {
+        guard let layout = layouts[sessionID],
+              let title = panes[layout.focusedPane]?.lastTitle,
+              !title.isEmpty
+        else { return }
+        onTitleChange?(
+            sessionID, title,
+            titleRoles(of: layout.focusedPane, in: layout, sessionID: sessionID)
+        )
+    }
+
+    /// Which title roles a pane currently holds — see
+    /// `SessionTerminating.onTitleChange`. Empty for a pane that is neither
+    /// focused nor allowed to label the resume record.
+    private func titleRoles(
+        of paneID: UUID, in layout: SessionPaneLayout, sessionID: String
+    ) -> SessionTitleRoles {
+        var roles: SessionTitleRoles = []
+        if layout.focusedPane == paneID { roles.insert(.display) }
+        if resumeLabelPane(in: layout, sessionID: sessionID) == paneID { roles.insert(.resume) }
+        return roles
+    }
+
+    /// The pane whose titles may label the resume record: the record's
+    /// author while it lives; nobody while an unowned record stands (frozen
+    /// — see `ResumeAuthorship`); the designate before any record exists,
+    /// so a title arriving ahead of the first agent event still seeds the
+    /// label.
+    private func resumeLabelPane(in layout: SessionPaneLayout, sessionID: String) -> UUID? {
+        switch resumeAuthorship[sessionID] {
+        case .pane(let author):
+            return layout.tree.contains(author) ? author : nil
+        case .frozen:
+            return nil
+        case nil:
+            return resumeDesignatePane(in: layout)
+        }
+    }
+
+    // MARK: - Resume hint
+
+    /// Prints a resume hint exactly once per restored session, into the
+    /// session's initial pane only, and only when metadata was already
+    /// present when the live surface was created. Metadata learned from an
     /// agent running in the current surface is intentionally never injected
     /// back into that active session.
     func showResumeHintIfNeeded(for sessionID: String) {
-        guard var entry = entries[sessionID],
-              entry.view.superview != nil,
-              !entry.resumeHintScheduled,
-              !entry.didShowResumeHint,
-              entry.restoredResume != nil
+        guard var hint = resumeHints[sessionID],
+              hint.metadata != nil,
+              !hint.scheduled,
+              !hint.didShow,
+              let layout = layouts[sessionID],
+              let entry = panes[layout.initialPane],
+              entry.view.superview != nil
         else { return }
 
         // Give AppKit one run-loop turn to create the Ghostty surface after
         // the view enters the hierarchy; sendText is intentionally a no-op
         // before that surface exists.
-        entry.resumeHintScheduled = true
-        entries[sessionID] = entry
+        hint.scheduled = true
+        resumeHints[sessionID] = hint
         DispatchQueue.main.async { [weak self] in
             self?.deliverResumeHint(for: sessionID)
         }
     }
 
     private func deliverResumeHint(for sessionID: String) {
-        guard var entry = entries[sessionID],
-              entry.resumeHintScheduled,
-              !entry.didShowResumeHint,
-              let metadata = entry.restoredResume
+        guard var hint = resumeHints[sessionID],
+              hint.scheduled,
+              !hint.didShow,
+              let metadata = hint.metadata,
+              let layout = layouts[sessionID],
+              let entry = panes[layout.initialPane]
         else { return }
 
-        entry.didShowResumeHint = true
-        entries[sessionID] = entry
+        hint.didShow = true
+        resumeHints[sessionID] = hint
         textDelivery(
             entry.view,
             SessionResumeMetadata.resumeHintCommand(for: metadata)
         )
     }
 
-    /// Permanently tears down a session terminal. Explicitly clearing the
-    /// controller calls Ghostty's synchronous surface-free path before this
-    /// method returns; ARC is not used as the lifecycle boundary.
+    // MARK: - Session teardown
+
+    /// Permanently tears down every pane of a session.
     func closeSession(_ sessionID: String) {
         onSessionTeardown?(sessionID)
         quiescedSessionIDs.remove(sessionID)
-        guard let entry = entries.removeValue(forKey: sessionID) else { return }
-        entry.delegateProxy.suppressesProcessExit = true
-        entry.view.delegate = nil
-        entry.view.removeFromSuperview()
-        entry.view.controller = nil
+        resumeHints.removeValue(forKey: sessionID)
+        resumeAuthorship.removeValue(forKey: sessionID)
+        guard let layout = layouts.removeValue(forKey: sessionID) else { return }
+        for paneID in layout.paneIDs {
+            teardownPaneEntry(paneID)
+        }
     }
 
     /// Prevents target processes from writing during a manager operation.
     /// Clearing TerminalView.controller synchronously tears down and calls
     /// ghostty_surface_free before returning.
+    ///
+    /// Split layout is not preserved across a quiesce: the processes don't
+    /// survive, so the session resumes as a single pane — the same rule as
+    /// app relaunch. One pane's *view* is kept for reuse (the initial pane's
+    /// where it still exists) so lazy recreation after resume restores the
+    /// same NSView identity the pre-pane code did; every other pane is torn
+    /// down outright.
     func quiesceSessions(_ ids: Set<String>) async {
         for sessionID in ids {
             onSessionTeardown?(sessionID)
         }
         quiescedSessionIDs.formUnion(ids)
         for sessionID in ids {
-            guard var entry = entries[sessionID] else { continue }
+            guard let layout = layouts[sessionID] else { continue }
+            let survivor = resumeDesignatePane(in: layout)
+            for paneID in layout.paneIDs where paneID != survivor {
+                teardownPaneEntry(paneID)
+            }
+            guard var entry = panes[survivor] else { continue }
             entry.delegateProxy.suppressesProcessExit = true
             entry.view.delegate = nil
             entry.view.removeFromSuperview()
             entry.view.controller = nil
             entry.controller = nil
-            entry.resumeHintScheduled = false
-            entry.didShowResumeHint = false
-            entries[sessionID] = entry
+            entry.lastTitle = nil
+            panes[survivor] = entry
+            // The survivor keeps its view and its pane id, but its PROCESS
+            // is as dead as its siblings' — announce the closure so its
+            // attention contribution is dropped. Without this, a structured
+            // latch or a blocked state from the old shell would carry over
+            // onto the fresh shell spawned after resume, under the same
+            // reused pane id.
+            onPaneClosed?(sessionID, survivor)
+            // Any record's author dies with its process, but the RECORD
+            // survives the quiesce in AppStore — freeze it (never clear to
+            // absent, which would let the fresh shell's first decorated
+            // title relabel the old conversation's id) until a new agent
+            // event re-authors it. A session that never had a record keeps
+            // having none, and its fresh shell may seed one.
+            if resumeAuthorship[sessionID] != nil {
+                resumeAuthorship[sessionID] = .frozen
+            }
+            layouts[sessionID] = SessionPaneLayout(initialPane: survivor)
+            if var hint = resumeHints[sessionID] {
+                hint.scheduled = false
+                hint.didShow = false
+                resumeHints[sessionID] = hint
+            }
         }
     }
 
@@ -267,37 +541,93 @@ final class TerminalCenter: ObservableObject, SessionTerminating {
         quiescedSessionIDs.contains(sessionID)
     }
 
-    /// Ignores process-exit delivery while a close operation owns terminal
-    /// teardown, so persisted rows survive until the manager succeeds.
-    func handleProcessExit(sessionID: String) {
+    // MARK: - Delegate-proxy entry points
+
+    /// Called by a pane's delegate proxy when its shell process exits. A
+    /// multi-pane session collapses the exited pane's node and carries on;
+    /// the last pane's exit removes the whole session through the existing
+    /// close path. Ignored while a close operation owns terminal teardown
+    /// (quiesce), so persisted rows survive until the manager succeeds.
+    func handleProcessExit(paneID: UUID) {
+        guard let entry = panes[paneID] else { return }
+        let sessionID = entry.sessionID
         guard !quiescedSessionIDs.contains(sessionID) else { return }
+        if let layout = layouts[sessionID], layout.paneCount > 1 {
+            removePane(paneID, from: sessionID)
+            return
+        }
         closeSession(sessionID)
         onProcessExit?(sessionID)
     }
 
-    /// Called by a session's delegate proxy with any signal that could bear
-    /// on attention state. Just forwards — no terminal-lifecycle teardown
-    /// needed here, unlike `handleProcessExit`.
-    func handleSessionSignal(sessionID: String, signal: AttentionSignal) {
-        onSessionSignal?(sessionID, signal)
+    /// Called by a pane's delegate proxy with any signal that could bear on
+    /// attention state. Forwarded with both ids: the session id names the
+    /// row that lights up, the pane id names the stream being reduced.
+    func handleSessionSignal(sessionID: String, paneID: UUID, signal: AttentionSignal) {
+        onSessionSignal?(sessionID, paneID, signal)
     }
 
-    /// Called by a session's delegate proxy when the shell reports a new OSC
-    /// window title. Just forwards — same reasoning as `handleSessionSignal`.
-    func handleTitleChange(sessionID: String, title: String) {
-        onTitleChange?(sessionID, title)
+    /// Called by a pane's delegate proxy when its shell reports a new OSC
+    /// window title. Always remembered on the pane; forwarded with the
+    /// roles the pane holds — a title from a pane that is neither focused
+    /// nor the resume designate is remembered but never forwarded (see
+    /// `onTitleChange`).
+    func handleTitleChange(paneID: UUID, title: String) {
+        guard var entry = panes[paneID] else { return }
+        entry.lastTitle = title
+        panes[paneID] = entry
+        guard let layout = layouts[entry.sessionID] else { return }
+        let roles = titleRoles(of: paneID, in: layout, sessionID: entry.sessionID)
+        guard !roles.isEmpty else { return }
+        onTitleChange?(entry.sessionID, title, roles)
     }
 
-    func handleAgentSessionEvent(sessionID: String, event: AgentSessionEvent) {
-        onAgentSessionEvent?(sessionID, event)
+    /// Called by a pane's delegate proxy with a decoded agent session
+    /// event. Forwarded only from the session's resume-designate pane: the
+    /// row keeps ONE resume metadata record (`SessionRow.resume`), and the
+    /// hint built from it is later injected into the initial pane — so only
+    /// the agent running where that hint will land may write it. An agent
+    /// in any other pane would otherwise overwrite it, and after a relaunch
+    /// its `--resume` command would be typed into a different agent's pane.
+    /// A session with no layout (not seen by this center) forwards
+    /// unfiltered — there is no designate to check against, and dropping
+    /// would be the lie.
+    ///
+    /// Deliberate: metadata recorded by a designate that later CLOSES is
+    /// kept, not invalidated. The whole point of resume metadata is
+    /// outliving its process — the dead agent's conversation is still
+    /// genuinely resumable, and the row survives through its other panes
+    /// (single-pane sessions never hit this: the last pane's exit removes
+    /// the row and the metadata with it). The record is stale only until
+    /// the NEW designate's agent next announces itself, which the hook
+    /// does on every prompt.
+    func handleAgentSessionEvent(sessionID: String, paneID: UUID, event: AgentSessionEvent) {
+        if let layout = layouts[sessionID], resumeDesignatePane(in: layout) != paneID {
+            return
+        }
+        resumeAuthorship[sessionID] = .pane(paneID)
+        onAgentSessionEvent?(sessionID, event, panes[paneID]?.lastTitle)
+    }
+
+    /// The pane whose agent owns the session's resume metadata, and the
+    /// pane a quiesce keeps: the initial pane while it lives, else the
+    /// first remaining leaf. The two uses must stay the same pane — the
+    /// resume hint is delivered into the survivor, so the survivor's agent
+    /// must be the one whose metadata was recorded.
+    private func resumeDesignatePane(in layout: SessionPaneLayout) -> UUID {
+        layout.tree.contains(layout.initialPane) ? layout.initialPane : layout.paneIDs[0]
     }
 }
 
-/// Small per-session delegate that closes over a session id and forwards to
-/// `TerminalCenter`. Each session needs its own instance since neither
-/// delegate callback carries the sender's identity. `TerminalView.delegate`
-/// is weak, so `TerminalCenter` retains this object itself (alongside the
-/// view/controller in its cache entry).
+/// Small per-pane delegate that closes over a pane id (and the session it
+/// belongs to) and forwards to `TerminalCenter`. Each pane needs its own
+/// instance since no delegate callback carries the sender's identity.
+/// Attention/title/agent-event callbacks carry the session id — those
+/// signals aggregate to the session row — while process exit and title
+/// changes are routed by pane id so the center can collapse the right layout
+/// node and apply the focused-pane title rule. `TerminalView.delegate` is
+/// weak, so `TerminalCenter` retains this object itself (alongside the
+/// view/controller in its pane entry).
 @MainActor
 final class SessionDelegateProxy:
     TerminalSurfaceTitleDelegate,
@@ -307,24 +637,26 @@ final class SessionDelegateProxy:
     TerminalSurfaceProgressReportDelegate
 {
     let sessionID: String
+    let paneID: UUID
     weak var center: TerminalCenter?
     var suppressesProcessExit = false
-    init(sessionID: String, center: TerminalCenter) {
+    init(sessionID: String, paneID: UUID, center: TerminalCenter) {
         self.sessionID = sessionID
+        self.paneID = paneID
         self.center = center
     }
 
     func terminalDidChangeTitle(_ title: String) {
-        // The agent's OSC title becomes the session's display name (sidebar
-        // + window title) unless the user has manually renamed it, and also
-        // the window subtitle — see SessionRow.displayName/subtitle and
-        // AppStore.setSessionTitle, which persists it onto the row.
-        center?.handleTitleChange(sessionID: sessionID, title: title)
+        // The focused pane's OSC title becomes the session's display name
+        // (sidebar + window title) unless the user has manually renamed it,
+        // and also the window subtitle — see SessionRow.displayName/subtitle
+        // and AppStore.setSessionTitle, which persists it onto the row.
+        center?.handleTitleChange(paneID: paneID, title: title)
     }
 
     func terminalDidClose(processAlive: Bool) {
         guard !suppressesProcessExit else { return }
-        center?.handleProcessExit(sessionID: sessionID)
+        center?.handleProcessExit(paneID: paneID)
     }
 
     /// The package dispatches every specialized delegate by conditional-
@@ -349,7 +681,7 @@ final class SessionDelegateProxy:
     func terminalDidRequestDesktopNotification(title: String, body: String) {
         if AgentSessionEvent.isSessionNotification(title: title) {
             if let event = AgentSessionEvent.parseNotification(title: title, body: body) {
-                center?.handleAgentSessionEvent(sessionID: sessionID, event: event)
+                center?.handleAgentSessionEvent(sessionID: sessionID, paneID: paneID, event: event)
             }
             return
         }
@@ -360,7 +692,7 @@ final class SessionDelegateProxy:
         } else {
             signal = .notification(title: title, body: body)
         }
-        center?.handleSessionSignal(sessionID: sessionID, signal: signal)
+        center?.handleSessionSignal(sessionID: sessionID, paneID: paneID, signal: signal)
     }
 
     /// A bare BEL — the lowest-fidelity signal in the whole design, carrying
@@ -380,7 +712,7 @@ final class SessionDelegateProxy:
     /// parser consumes it as a string terminator, so our own hook's
     /// `\033]777;...\a` never doubles as a bell.
     func terminalDidRingBell() {
-        center?.handleSessionSignal(sessionID: sessionID, signal: .bell)
+        center?.handleSessionSignal(sessionID: sessionID, paneID: paneID, signal: .bell)
     }
 
     /// OSC 9;4 progress reporting, mapped to a semantic signal HERE rather
@@ -411,6 +743,6 @@ final class SessionDelegateProxy:
         case .remove:
             return
         }
-        center?.handleSessionSignal(sessionID: sessionID, signal: signal)
+        center?.handleSessionSignal(sessionID: sessionID, paneID: paneID, signal: signal)
     }
 }

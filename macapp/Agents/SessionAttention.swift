@@ -62,7 +62,10 @@ struct AttentionState: Equatable {
 
 /// The single funnel every attention signal, from every source, passes
 /// through — nothing else may compute or write attention state (see
-/// `AppStore.apply(_:to:)`, the only caller). Foundation-only, like
+/// `AppStore.apply(_:toSession:pane:)` and `setAttended`, the only
+/// callers). The unit being reduced is one PANE's signal stream — one
+/// agent, one terminal; `AppStore.recombineAttention` folds a session's
+/// pane states into its row's indicator. Foundation-only, like
 /// `SessionActivity.swift`, so the whole state machine is testable without
 /// SwiftUI, AppKit, or a real terminal.
 ///
