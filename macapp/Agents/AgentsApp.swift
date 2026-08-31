@@ -50,6 +50,22 @@ struct AgentsApp: App {
         let store = AppStore(terminals: center, stateURL: AppStore.defaultStateURL)
         _store = StateObject(wrappedValue: store)
 
+        // A review request must name a live session row; anything else is
+        // refused (no app-global fallback). Wired here, after the store
+        // exists — a request racing app construction is refused too, which
+        // is the correct answer for a launcher that somehow beat the UI up.
+        controlServer.validateSession = { [weak store] sessionID in
+            store?.sessions.contains { $0.id == sessionID } ?? false
+        }
+
+        // Every session-teardown path (close, project removal, workspace
+        // quiesce, process exit) funnels through TerminalCenter, and a
+        // session going away must cancel its open review so the launcher
+        // blocked on the control socket is answered rather than left hanging.
+        center.onSessionTeardown = { [weak overlays] sessionID in
+            overlays?.cancelReview(forSession: sessionID)
+        }
+
         let uiState = UIState()
         self.uiState = uiState
 

@@ -5,38 +5,60 @@ import XCTest
 @testable import Agents
 
 /// `OverlayCenter` is what lets a review TUI (revdiff, via the Claude Code
-/// plugin's launcher override) take the detail pane. The properties pinned
-/// here are the ones the launcher's contract actually rests on, each of which
-/// fails silently rather than loudly if it regresses:
+/// plugin's launcher override) take the detail pane — scoped to the session
+/// that asked for it. The properties pinned here are the ones the launcher's
+/// contract actually rests on, each of which fails silently rather than
+/// loudly if it regresses:
 ///
 /// - the command is sent **once**, and only after the surface is mounted —
 ///   `sendText` is a no-op before libghostty has created the surface, so an
 ///   early send is not an error, just a review that never starts;
 /// - the command is `exec`'d, so the surface closes when it exits rather than
 ///   dropping the user at a shell prompt they have to dismiss by hand;
-/// - a process exit both frees the slot and fires `onFinished`, which is the
-///   only thing that ever unblocks the waiting launcher.
+/// - a process exit both frees the session's slot and fires `onClosed`, which
+///   is the only thing that ever unblocks the waiting launcher;
+/// - reviews are per session: one session's review must never block, replace,
+///   or outlive another session's.
 @MainActor
 final class OverlayCenterTests: XCTestCase {
-    func testPresentRefusesASecondConcurrentOverlay() throws {
+    func testPresentRefusesASecondOverlayForTheSameSession() throws {
         let overlays = OverlayCenter(textDelivery: { _, _ in })
-        _ = try overlays.present(command: "/tmp/first.sh", workingDirectory: "/tmp")
+        try overlays.present(command: "/tmp/first.sh", workingDirectory: "/tmp", sessionID: "s1")
 
         XCTAssertThrowsError(
-            try overlays.present(command: "/tmp/second.sh", workingDirectory: "/tmp"),
-            "a second concurrent overlay must be refused — the pane can only show one review, and queuing would leave the second caller blocked with no UI explaining the wait"
+            try overlays.present(command: "/tmp/second.sh", workingDirectory: "/tmp", sessionID: "s1"),
+            "a second concurrent overlay for one session must be refused — its pane can only show one review, and queuing would leave the second caller blocked with no UI explaining the wait"
         ) { error in
             XCTAssertEqual(error as? OverlayCenter.PresentError, .alreadyActive)
         }
     }
 
+    func testDifferentSessionsReviewConcurrently() throws {
+        let overlays = OverlayCenter(textDelivery: { _, _ in })
+        try overlays.present(command: "/tmp/first.sh", workingDirectory: "/tmp", sessionID: "s1")
+
+        XCTAssertNoThrow(
+            try overlays.present(command: "/tmp/second.sh", workingDirectory: "/tmp", sessionID: "s2"),
+            "reviews are scoped per session — one session's open review must not refuse another session's request, or a busy teammate session would block reviews everywhere"
+        )
+        XCTAssertEqual(overlays.reviewSessionIDs, ["s1", "s2"])
+        XCTAssertNotNil(overlays.view(forSession: "s1"))
+        XCTAssertNotNil(overlays.view(forSession: "s2"))
+        XCTAssertIdentical(overlays.view(forSession: "s1"), overlays.view(forSession: "s1"))
+        XCTAssertNotIdentical(
+            overlays.view(forSession: "s1"),
+            overlays.view(forSession: "s2"),
+            "each session's review must own its own surface — sharing one would interleave two TUIs into a single terminal"
+        )
+    }
+
     func testCommandIsExecdExactlyOnceAfterMounting() async throws {
         var delivered: [String] = []
         let overlays = OverlayCenter(textDelivery: { _, text in delivered.append(text) })
-        _ = try overlays.present(command: "/tmp/review.sh", workingDirectory: "/tmp")
+        try overlays.present(command: "/tmp/review.sh", workingDirectory: "/tmp", sessionID: "s1")
 
         // Not mounted yet: delivering here would be swallowed by libghostty.
-        overlays.deliverCommandIfNeeded()
+        overlays.deliverCommandsIfNeeded()
         await drainMainQueue()
         XCTAssertTrue(
             delivered.isEmpty,
@@ -44,12 +66,12 @@ final class OverlayCenterTests: XCTestCase {
         )
 
         let host = NSView()
-        host.addSubview(try XCTUnwrap(overlays.currentView))
+        host.addSubview(try XCTUnwrap(overlays.view(forSession: "s1")))
 
-        overlays.deliverCommandIfNeeded()
-        overlays.deliverCommandIfNeeded()
+        overlays.deliverCommandsIfNeeded()
+        overlays.deliverCommandsIfNeeded()
         await drainMainQueue()
-        overlays.deliverCommandIfNeeded()
+        overlays.deliverCommandsIfNeeded()
         await drainMainQueue()
 
         XCTAssertEqual(
@@ -59,43 +81,96 @@ final class OverlayCenterTests: XCTestCase {
         )
     }
 
-    func testProcessExitDismissesAndFreesTheSlot() throws {
-        let overlays = OverlayCenter(textDelivery: { _, _ in })
-        var finished: [String] = []
-        overlays.onFinished = { finished.append($0) }
+    /// A review requested by a session that isn't on screen is mounted
+    /// hidden by `TerminalHostView`; its command must still be delivered —
+    /// the review runs behind the scenes and is simply revealed later.
+    func testCommandDeliveryIgnoresOnlyUnmountedOverlays() async throws {
+        var delivered: [String] = []
+        let overlays = OverlayCenter(textDelivery: { _, text in delivered.append(text) })
+        try overlays.present(command: "/tmp/mounted.sh", workingDirectory: "/tmp", sessionID: "s1")
+        try overlays.present(command: "/tmp/unmounted.sh", workingDirectory: "/tmp", sessionID: "s2")
 
-        let id = try overlays.present(command: "/tmp/review.sh", workingDirectory: "/tmp")
-        let view = try XCTUnwrap(overlays.currentView)
+        let host = NSView()
+        let mounted = try XCTUnwrap(overlays.view(forSession: "s1"))
+        host.addSubview(mounted)
+        mounted.isHidden = true
+
+        overlays.deliverCommandsIfNeeded()
+        await drainMainQueue()
+
+        XCTAssertEqual(
+            delivered,
+            ["exec /tmp/mounted.sh\n"],
+            "a mounted-but-hidden overlay must still receive its command (a background session's review has to actually start), while an unmounted one must not (sendText would be silently swallowed)"
+        )
+    }
+
+    func testProcessExitDismissesAndFreesTheSessionSlot() throws {
+        let overlays = OverlayCenter(textDelivery: { _, _ in })
+        var closed: [(String, OverlayCenter.ReviewOutcome)] = []
+        overlays.onClosed = { closed.append(($0, $1)) }
+
+        try overlays.present(command: "/tmp/review.sh", workingDirectory: "/tmp", sessionID: "s1")
+        let view = try XCTUnwrap(overlays.view(forSession: "s1"))
         let proxy = try XCTUnwrap(view.delegate as? OverlayDelegateProxy)
 
         proxy.terminalDidClose(processAlive: false)
 
+        XCTAssertEqual(closed.map(\.0), ["s1"])
         XCTAssertEqual(
-            finished,
-            [id],
-            "onFinished is the only signal that unblocks the launcher waiting on the control socket — without it a finished review hangs its caller forever"
+            closed.map(\.1),
+            [.finished],
+            "onClosed(.finished) is the only signal that unblocks the launcher waiting on the control socket — without it a finished review hangs its caller forever"
         )
-        XCTAssertNil(overlays.currentView)
-        XCTAssertNil(overlays.activeID)
+        XCTAssertNil(overlays.view(forSession: "s1"))
+        XCTAssertTrue(overlays.reviewSessionIDs.isEmpty)
         XCTAssertNil(view.controller, "the surface must be freed synchronously on dismissal, as TerminalCenter.closeSession does — ARC is not the lifecycle boundary here")
         XCTAssertNoThrow(
-            try overlays.present(command: "/tmp/next.sh", workingDirectory: "/tmp"),
+            try overlays.present(command: "/tmp/next.sh", workingDirectory: "/tmp", sessionID: "s1"),
             "the slot must be free once a review exits, or the first review of a session would be the only one ever possible"
         )
     }
 
-    func testDismissDoesNotReportCompletion() throws {
+    /// Cancelling is the session-teardown path (close, quiesce, process
+    /// exit): the overlay is torn down AND the launcher is answered with a
+    /// failure. Both halves matter — skipping the answer leaves the launcher
+    /// blocked forever on a connection nobody will write to.
+    func testCancelReviewReportsCancelledAndTearsDown() throws {
         let overlays = OverlayCenter(textDelivery: { _, _ in })
-        var finished: [String] = []
-        overlays.onFinished = { finished.append($0) }
+        var closed: [(String, OverlayCenter.ReviewOutcome)] = []
+        overlays.onClosed = { closed.append(($0, $1)) }
 
-        _ = try overlays.present(command: "/tmp/review.sh", workingDirectory: "/tmp")
-        overlays.dismiss()
+        try overlays.present(command: "/tmp/review.sh", workingDirectory: "/tmp", sessionID: "s1")
+        try overlays.present(command: "/tmp/other.sh", workingDirectory: "/tmp", sessionID: "s2")
+        let cancelledView = try XCTUnwrap(overlays.view(forSession: "s1"))
 
-        XCTAssertNil(overlays.activeID)
+        overlays.cancelReview(forSession: "s1")
+
+        XCTAssertEqual(closed.map(\.0), ["s1"])
+        XCTAssertEqual(
+            closed.map(\.1),
+            [.cancelled],
+            "a cancelled review must be reported as cancelled, not finished — answering the launcher with success would make the caller believe annotations were collected when the review was actually destroyed"
+        )
+        XCTAssertNil(overlays.view(forSession: "s1"))
+        XCTAssertNil(cancelledView.controller)
+        XCTAssertNotNil(
+            overlays.view(forSession: "s2"),
+            "cancelling one session's review must never touch another session's — that cross-session interference is exactly what session scoping exists to remove"
+        )
+        XCTAssertEqual(overlays.reviewSessionIDs, ["s2"])
+    }
+
+    func testCancelReviewIsANoOpForASessionWithoutOne() {
+        let overlays = OverlayCenter(textDelivery: { _, _ in })
+        var closed: [String] = []
+        overlays.onClosed = { sessionID, _ in closed.append(sessionID) }
+
+        overlays.cancelReview(forSession: "s1")
+
         XCTAssertTrue(
-            finished.isEmpty,
-            "dismiss() is teardown, not completion: reporting it would answer the launcher's socket as though the review had ended normally"
+            closed.isEmpty,
+            "cancelReview fires on EVERY session teardown, almost none of which have a review open — reporting a closure here would answer a control-socket client that does not exist, or worse, a later one"
         )
     }
 
@@ -226,7 +301,7 @@ final class OverlayCenterTests: XCTestCase {
     /// that does not exist on this machine.
     func testSessionEnvVarsAdvertisesTheControlSocket() {
         XCTAssertEqual(
-            TerminalCenter.sessionEnvVars["AGENTS_CONTROL_SOCK"],
+            TerminalCenter.sessionEnvVars(for: "some-session")["AGENTS_CONTROL_SOCK"],
             ControlServer.socketPath,
             "sessions must advertise this build's control socket, or revdiff's launcher cannot find the app that owns the terminal it is running in"
         )

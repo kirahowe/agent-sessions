@@ -2,7 +2,24 @@ import SwiftUI
 
 struct SidebarView: View {
     @ObservedObject var store: AppStore
+    @ObservedObject var overlays: OverlayCenter
     @Environment(\.appActions) private var actions
+
+    /// The activity glyph for a session row. A review open in an unselected
+    /// session shows as `.blocked` — the agent genuinely is blocked, waiting
+    /// on feedback the user cannot see — and self-clears the moment the
+    /// session is selected and the review is back on screen. Derived here
+    /// from `OverlayCenter`'s live state rather than routed through
+    /// `SessionAttention.reduce`: that reducer arbitrates *terminal* signals
+    /// and its structured-protocol latch would suppress exactly this raise
+    /// for hook-speaking agents, whereas the app knows an open hidden review
+    /// first-hand and needs no arbitration to say so.
+    private func activity(for sessionID: String) -> SessionActivity? {
+        if overlays.reviewSessionIDs.contains(sessionID), store.selection != sessionID {
+            return .blocked
+        }
+        return store.attention[sessionID]?.activity
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -10,7 +27,7 @@ struct SidebarView: View {
                 ForEach(store.projects) { project in
                     Section {
                         ForEach(store.sessions.filter { $0.target == .root(projectPath: project.path) }) { session in
-                            SessionRowView(store: store, session: session, activity: store.attention[session.id]?.activity)
+                            SessionRowView(store: store, session: session, activity: activity(for: session.id))
                         }
                         .onMove { offsets, destination in
                             store.moveSessions(
@@ -24,7 +41,7 @@ struct SidebarView: View {
                             WorkspaceRowView(store: store, workspace: workspace)
 
                             ForEach(sessions(in: workspace)) { session in
-                                SessionRowView(store: store, session: session, activity: store.attention[session.id]?.activity, indent: 16)
+                                SessionRowView(store: store, session: session, activity: activity(for: session.id), indent: 16)
                             }
                             .onMove { offsets, destination in
                                 store.moveSessions(

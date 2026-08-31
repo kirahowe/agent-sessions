@@ -74,25 +74,34 @@ final class TerminalCenter: ObservableObject, SessionTerminating {
     /// iTerm2 and every other terminal, and it refuses to emit its OSC 777
     /// status escape unless `AGENTS_APP` is present in its environment —
     /// that's the only signal it has for "I'm actually running inside the
-    /// Agents app." Dropping this static, or losing it from the options
+    /// Agents app." Dropping this function, or losing it from the options
     /// passed to `TerminalSurfaceOptions` below, silently disables every
     /// session's status indicator in the sidebar with no error to point at:
     /// the hook just sees an unset variable and exits 0 before ever writing
     /// its escape, so nothing in this app's logs would even hint at why the
     /// dots stopped appearing.
-    static let sessionEnvVars: [String: String] = [
-        "AGENTS_APP": "1",
-        "WARP_CLI_AGENT_PROTOCOL_VERSION": "1",
-        // Where to reach this instance's control socket. A process running in
-        // this surface can then ask the app for a full-pane overlay without
-        // discovering anything: not which app hosts it, and — since the path
-        // carries both the bundle id and the pid that bound it — not which
-        // build either, nor which launch of that build, so a review can never
-        // surface in another build's app or contend with another instance of
-        // this same build. See ControlServer for the protocol and why it
-        // isn't AppleScript.
-        "AGENTS_CONTROL_SOCK": ControlServer.socketPath,
-    ]
+    ///
+    /// A function of the session id, not a constant: `AGENTS_SESSION_ID` is
+    /// what lets a process inside the session say which session it is when it
+    /// talks back over the control socket — the revdiff launcher forwards it
+    /// so its review can be scoped to the row that asked, rather than taking
+    /// over whatever is selected.
+    static func sessionEnvVars(for sessionID: String) -> [String: String] {
+        [
+            "AGENTS_APP": "1",
+            "AGENTS_SESSION_ID": sessionID,
+            "WARP_CLI_AGENT_PROTOCOL_VERSION": "1",
+            // Where to reach this instance's control socket. A process running in
+            // this surface can then ask the app for a full-pane overlay without
+            // discovering anything: not which app hosts it, and — since the path
+            // carries both the bundle id and the pid that bound it — not which
+            // build either, nor which launch of that build, so a review can never
+            // surface in another build's app or contend with another instance of
+            // this same build. See ControlServer for the protocol and why it
+            // isn't AppleScript.
+            "AGENTS_CONTROL_SOCK": ControlServer.socketPath,
+        ]
+    }
 
     /// Invoked with the session id after the underlying shell process exits
     /// and the terminal has already been torn down.
@@ -114,6 +123,15 @@ final class TerminalCenter: ObservableObject, SessionTerminating {
     /// consumed by the delegate proxy and never arrive here or at the
     /// attention classifier.
     var onAgentSessionEvent: ((String, AgentSessionEvent) -> Void)?
+
+    /// Invoked with the session id at the START of every teardown path —
+    /// `closeSession` and `quiesceSessions` — before the surface is freed.
+    /// This is the single choke point every close route funnels through
+    /// (user close, project removal, workspace close/quiesce, process exit),
+    /// which is what `OverlayCenter` hooks to cancel a session's open review
+    /// and unblock its waiting launcher rather than leaving it hanging on a
+    /// connection nobody will ever answer.
+    var onSessionTeardown: ((String) -> Void)?
 
     /// Lazily creates (on first call) or returns the cached `TerminalView`
     /// for a session, spawning the user's login shell rooted at
@@ -156,7 +174,7 @@ final class TerminalCenter: ObservableObject, SessionTerminating {
         view.configuration = TerminalSurfaceOptions(
             backend: .exec,
             workingDirectory: workingDirectory,
-            envVars: Self.sessionEnvVars
+            envVars: Self.sessionEnvVars(for: sessionID)
         )
         let controller = TerminalController(terminalConfiguration: Self.terminalConfiguration)
         view.controller = controller
@@ -211,6 +229,7 @@ final class TerminalCenter: ObservableObject, SessionTerminating {
     /// controller calls Ghostty's synchronous surface-free path before this
     /// method returns; ARC is not used as the lifecycle boundary.
     func closeSession(_ sessionID: String) {
+        onSessionTeardown?(sessionID)
         quiescedSessionIDs.remove(sessionID)
         guard let entry = entries.removeValue(forKey: sessionID) else { return }
         entry.delegateProxy.suppressesProcessExit = true
@@ -223,6 +242,9 @@ final class TerminalCenter: ObservableObject, SessionTerminating {
     /// Clearing TerminalView.controller synchronously tears down and calls
     /// ghostty_surface_free before returning.
     func quiesceSessions(_ ids: Set<String>) async {
+        for sessionID in ids {
+            onSessionTeardown?(sessionID)
+        }
         quiescedSessionIDs.formUnion(ids)
         for sessionID in ids {
             guard var entry = entries[sessionID] else { continue }

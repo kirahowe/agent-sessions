@@ -33,7 +33,7 @@ struct RootView: View {
 
     var body: some View {
         NavigationSplitView {
-            SidebarView(store: store)
+            SidebarView(store: store, overlays: overlays)
                 .navigationSplitViewColumnWidth(min: 240, ideal: 280, max: .infinity)
         } detail: {
             // The terminal host must always be present in the tree — even
@@ -43,11 +43,12 @@ struct RootView: View {
             ZStack {
                 TerminalHostView(store: store, center: center, overlays: overlays)
 
-                // Suppressed while a review is open: the empty state is a
-                // ZStack sibling layered ON TOP of the terminal host, so
-                // without this it would paint over a full-pane review in the
-                // one case where a review can run with nothing selected.
-                if store.selection == nil, overlays.activeID == nil {
+                // Reviews are session-scoped, so with nothing selected
+                // nothing is on screen — any still-open review is mounted
+                // hidden inside the host and comes back when its session is
+                // reselected. The empty state can therefore key off the
+                // selection alone.
+                if store.selection == nil {
                     VStack(spacing: 12) {
                         Image(systemName: "terminal")
                             .font(.system(size: 48))

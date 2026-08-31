@@ -81,6 +81,35 @@ final class ControlServer: @unchecked Sendable {
         let cmd: String
         let command: String?
         let cwd: String?
+        let session: String?
+    }
+
+    /// What one request line asks the app to do, after syntactic validation
+    /// but before any main-actor state (live sessions, open reviews) is
+    /// consulted. Extracted from `serve` so the wire-format rules — the
+    /// contract the revdiff launcher is written against — can be pinned in
+    /// tests without standing up a socket.
+    enum RequestDecision: Equatable {
+        case refuse(String)
+        case run(command: String, cwd: String, session: String)
+    }
+
+    static func decide(line: String) -> RequestDecision {
+        guard let request = try? JSONDecoder().decode(Request.self, from: Data(line.utf8)) else {
+            return .refuse("malformed request")
+        }
+        guard request.cmd == "overlay-run" else {
+            return .refuse("unknown cmd: \(request.cmd)")
+        }
+        guard let command = request.command, !command.isEmpty else {
+            return .refuse("missing command")
+        }
+        guard let session = request.session, !session.isEmpty else {
+            // An old launcher that predates session scoping omits this field.
+            // The message names the fix because the launcher prints it verbatim.
+            return .refuse("missing session — update the revdiff launcher to forward AGENTS_SESSION_ID")
+        }
+        return .run(command: command, cwd: request.cwd ?? NSHomeDirectory(), session: session)
     }
 
     private let overlays: OverlayCenter
@@ -88,11 +117,19 @@ final class ControlServer: @unchecked Sendable {
     private var listenFD: Int32 = -1
     private var acceptSource: DispatchSourceRead?
 
-    /// The client waiting on the live overlay, if any. Only ever touched on
-    /// the main actor, alongside the `OverlayCenter` state it mirrors, so the
-    /// "is an overlay running" question has exactly one answer rather than two
-    /// that can disagree.
-    @MainActor private var pendingClientFD: Int32?
+    /// Answers whether a session id names a live session row. Wired by
+    /// `AgentsApp` once the store exists; a request arriving before then (or
+    /// naming a session this app has never heard of) is refused. Refusal is
+    /// deliberate — there is no app-global fallback, so a review either
+    /// belongs to a live session or does not open at all.
+    @MainActor var validateSession: ((String) -> Bool)?
+
+    /// The clients waiting on live overlays, keyed by invoking session id —
+    /// mirroring `OverlayCenter`'s one-review-per-session map. Only ever
+    /// touched on the main actor, alongside the overlay state it mirrors, so
+    /// "is a review running for this session" has exactly one answer rather
+    /// than two that can disagree.
+    @MainActor private var pendingClients: [String: Int32] = [:]
 
     init(overlays: OverlayCenter) {
         self.overlays = overlays
@@ -100,8 +137,17 @@ final class ControlServer: @unchecked Sendable {
 
     @MainActor
     func start() {
-        overlays.onFinished = { [weak self] _ in
-            self?.completePending(ok: true, error: nil)
+        overlays.onClosed = { [weak self] sessionID, outcome in
+            switch outcome {
+            case .finished:
+                self?.completePending(forSession: sessionID, ok: true, error: nil)
+            case .cancelled:
+                self?.completePending(
+                    forSession: sessionID,
+                    ok: false,
+                    error: "the session that requested this review was closed"
+                )
+            }
         }
         queue.async { [weak self] in self?.bindAndListen() }
 
@@ -282,45 +328,57 @@ final class ControlServer: @unchecked Sendable {
             close(client)
             return
         }
-        guard let request = try? JSONDecoder().decode(Request.self, from: Data(line.utf8)) else {
-            reply(to: client, ok: false, error: "malformed request", closing: true)
+        let command: String
+        let cwd: String
+        let session: String
+        switch Self.decide(line: line) {
+        case .refuse(let error):
+            reply(to: client, ok: false, error: error, closing: true)
             return
+        case .run(let decidedCommand, let decidedCwd, let decidedSession):
+            command = decidedCommand
+            cwd = decidedCwd
+            session = decidedSession
         }
-        guard request.cmd == "overlay-run" else {
-            reply(to: client, ok: false, error: "unknown cmd: \(request.cmd)", closing: true)
-            return
-        }
-        guard let command = request.command, !command.isEmpty else {
-            reply(to: client, ok: false, error: "missing command", closing: true)
-            return
-        }
-        let cwd = request.cwd ?? NSHomeDirectory()
 
         Task { @MainActor [weak self] in
             guard let self else {
                 close(client)
                 return
             }
-            guard self.pendingClientFD == nil else {
-                self.reply(to: client, ok: false, error: "a review is already open", closing: true)
+            guard self.validateSession?(session) == true else {
+                self.reply(to: client, ok: false, error: "unknown session: \(session)", closing: true)
+                return
+            }
+            guard self.pendingClients[session] == nil else {
+                self.reply(
+                    to: client,
+                    ok: false,
+                    error: "a review is already open in this session",
+                    closing: true
+                )
                 return
             }
             do {
-                _ = try self.overlays.present(command: command, workingDirectory: cwd)
+                try self.overlays.present(command: command, workingDirectory: cwd, sessionID: session)
                 // No reply yet — the overlay is live, and this connection is
                 // the thing the caller is blocked on. `completePending` answers
                 // it when the command exits.
-                self.pendingClientFD = client
+                self.pendingClients[session] = client
             } catch {
-                self.reply(to: client, ok: false, error: "a review is already open", closing: true)
+                self.reply(
+                    to: client,
+                    ok: false,
+                    error: "a review is already open in this session",
+                    closing: true
+                )
             }
         }
     }
 
     @MainActor
-    private func completePending(ok: Bool, error: String?) {
-        guard let client = pendingClientFD else { return }
-        pendingClientFD = nil
+    private func completePending(forSession sessionID: String, ok: Bool, error: String?) {
+        guard let client = pendingClients.removeValue(forKey: sessionID) else { return }
         reply(to: client, ok: ok, error: error, closing: true)
     }
 

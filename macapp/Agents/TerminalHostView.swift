@@ -9,8 +9,8 @@ import SwiftUI
 /// surface while it is quiesced, and this host must not lazily request a new
 /// one until the manager outcome resumes that session.
 ///
-/// An open review overlay (see `OverlayCenter`) is hosted in this same
-/// container and shown the same way — by hiding its siblings rather than by
+/// Open review overlays (see `OverlayCenter`) are hosted in this same
+/// container and shown the same way — by hiding their siblings rather than by
 /// removing them. That is what lets a review take the whole pane while the
 /// session underneath keeps running and comes back untouched on exit.
 struct TerminalHostView: NSViewRepresentable {
@@ -23,21 +23,36 @@ struct TerminalHostView: NSViewRepresentable {
     }
 
     func updateNSView(_ containerView: NSView, context: Context) {
-        // A live review owns the entire pane, whatever is selected in the
-        // sidebar. Checked before the selection at all, so that switching
-        // sessions mid-review cannot pull the review off screen and strand
-        // the agent waiting on a surface the user can no longer see.
-        if let overlayView = overlays.currentView {
+        // Every live overlay is mounted, not just the selected session's: a
+        // review can be requested by a session that isn't on screen, and its
+        // command cannot be delivered — the review never starts — until its
+        // surface exists, which requires the view to be in the hierarchy.
+        // Mounting is not revealing: which single subview is visible is
+        // decided below, so a hidden session's review runs behind the scenes.
+        for overlayView in overlays.allViews {
             mount(overlayView, in: containerView)
-            // Only safe once the view is in the hierarchy — see
-            // OverlayCenter.deliverCommandIfNeeded.
-            overlays.deliverCommandIfNeeded()
+        }
+        // Only safe once the views are in the hierarchy — see
+        // OverlayCenter.deliverCommandsIfNeeded.
+        overlays.deliverCommandsIfNeeded()
+
+        guard let selectedID = store.selection else {
+            for subview in containerView.subviews {
+                subview.isHidden = true
+            }
+            return
+        }
+
+        // The selected session's own review owns its pane. Scoped to the
+        // selection: another session's review must never take over work the
+        // user is looking at — it stays mounted, hidden, and running, and
+        // reselecting its session restores it exactly where it was.
+        if let overlayView = overlays.view(forSession: selectedID) {
             reveal(overlayView, in: containerView)
             return
         }
 
-        guard let selectedID = store.selection,
-              let row = store.sessions.first(where: { $0.id == selectedID }),
+        guard let row = store.sessions.first(where: { $0.id == selectedID }),
               !center.isSessionQuiesced(selectedID),
               let terminalView = center.terminalView(
                   for: selectedID,

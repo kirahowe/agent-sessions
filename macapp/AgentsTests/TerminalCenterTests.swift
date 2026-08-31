@@ -71,14 +71,14 @@ final class TerminalCenterTests: XCTestCase {
     /// user's Claude Code settings (so it also runs for sessions hosted in
     /// iTerm2 and every other terminal), and it refuses to emit its OSC 777
     /// status escape unless it sees a non-empty `AGENTS_APP` in its
-    /// environment. If this static ever loses that key — or stops being
+    /// environment. If this function ever loses that key — or stops being
     /// passed through to `TerminalSurfaceOptions.envVars` — the hook keeps
     /// running exactly as before but silently exits before writing anything,
     /// which means every session's sidebar status indicator (the gold/red
     /// dot) simply stops updating, with nothing in this app's own logs to
     /// explain why.
     func testSessionEnvVarsStampsAGENTS_APP() {
-        let value = TerminalCenter.sessionEnvVars["AGENTS_APP"]
+        let value = TerminalCenter.sessionEnvVars(for: "some-session")["AGENTS_APP"]
         XCTAssertNotNil(
             value,
             "TerminalCenter.sessionEnvVars is missing AGENTS_APP — hooks/agents-status.sh gates its entire OSC 777 status escape on that variable, so every session's sidebar status indicator would silently stop updating with no error to point at why"
@@ -91,8 +91,53 @@ final class TerminalCenterTests: XCTestCase {
 
     func testSessionEnvVarsEnablesWarpCliAgentProtocol() {
         XCTAssertEqual(
-            TerminalCenter.sessionEnvVars["WARP_CLI_AGENT_PROTOCOL_VERSION"],
+            TerminalCenter.sessionEnvVars(for: "some-session")["WARP_CLI_AGENT_PROTOCOL_VERSION"],
             "1"
+        )
+    }
+
+    /// `AGENTS_SESSION_ID` is how a process inside a session names itself
+    /// when it talks back over the control socket — the revdiff launcher
+    /// forwards it so its review is scoped to the row that asked. Losing it
+    /// (or stamping the wrong id) doesn't error anywhere: the control server
+    /// just refuses every review request from that session.
+    func testSessionEnvVarsStampsTheSessionID() {
+        XCTAssertEqual(
+            TerminalCenter.sessionEnvVars(for: "row-uuid-123")["AGENTS_SESSION_ID"],
+            "row-uuid-123"
+        )
+    }
+
+    /// Closing a session must announce the teardown BEFORE freeing anything:
+    /// `OverlayCenter` hooks this to cancel the session's open review and
+    /// unblock the launcher waiting on the control socket. A missing or
+    /// late callback doesn't error — it leaves a cancelled review's launcher
+    /// blocked forever on a connection nobody will answer.
+    func testCloseSessionFiresTeardownCallback() {
+        let center = TerminalCenter()
+        var torndown: [String] = []
+        center.onSessionTeardown = { torndown.append($0) }
+
+        center.closeSession("row-a")
+
+        XCTAssertEqual(
+            torndown,
+            ["row-a"],
+            "closeSession must report the teardown even for a session with no live terminal entry — the review overlay's lifecycle is independent of whether the session's own surface was ever created"
+        )
+    }
+
+    func testQuiesceFiresTeardownCallbackForEverySession() async {
+        let center = TerminalCenter()
+        var torndown: Set<String> = []
+        center.onSessionTeardown = { torndown.insert($0) }
+
+        await center.quiesceSessions(["row-a", "row-b"])
+
+        XCTAssertEqual(
+            torndown,
+            ["row-a", "row-b"],
+            "quiescing must report teardown for each session — a workspace operation that leaves one session's review alive would strand its launcher and let a stale review resurface after resume"
         )
     }
 
