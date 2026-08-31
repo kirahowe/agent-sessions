@@ -103,7 +103,12 @@ struct AgentsApp: App {
         let uiState = UIState()
         self.uiState = uiState
 
-        let actions = AppActions(store: store, uiState: uiState)
+        let actions = AppActions(
+            store: store,
+            uiState: uiState,
+            panes: center,
+            reviewSessions: { [weak overlays] in overlays?.reviewSessionIDs ?? [] }
+        )
         self.actions = actions
         let router = ShortcutRouter { actions.perform($0) }
         self.router = router
@@ -235,6 +240,35 @@ struct AgentsApp: App {
                     actions.perform(.nextSession)
                 }
                 .keymapShortcut(.nextSession)
+
+                Divider()
+
+                // Pane commands live in the Session menu rather than their
+                // own top-level menu: panes are a property of the selected
+                // session, and a seven-item menu of their own would overstate
+                // their place in the app.
+                Button("Split Pane Right") {
+                    actions.perform(.splitPaneRight)
+                }
+                .keymapShortcut(.splitPaneRight)
+                .disabled(store.selection == nil)
+
+                Button("Split Pane Down") {
+                    actions.perform(.splitPaneDown)
+                }
+                .keymapShortcut(.splitPaneDown)
+                .disabled(store.selection == nil)
+
+                Button("Close Pane") {
+                    actions.perform(.closePane)
+                }
+                .keymapShortcut(.closePane)
+                .disabled(store.selection == nil)
+
+                // The four focus-movement commands are deliberately NOT menu
+                // items: they're navigation keystrokes like ⌘1–9 (also
+                // menu-less), and four directional entries would double the
+                // menu's length to say "arrow keys move focus."
             }
 
             CommandGroup(replacing: .help) {

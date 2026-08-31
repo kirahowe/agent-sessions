@@ -8,6 +8,21 @@ import SwiftUI
 final class AppActions {
     let store: AppStore
     let uiState: UIState
+    /// The pane-command seam (`TerminalCenter` in production). Optional
+    /// because most `AppActions` tests exercise session/project actions and
+    /// shouldn't have to stand up pane machinery; with no commander every
+    /// pane action just reports unhandled.
+    private weak var panes: (any PaneCommanding)?
+
+    /// The sessions with an open review overlay (`OverlayCenter
+    /// .reviewSessionIDs` in production; `{ [] }` default for tests that
+    /// don't care). Pane commands consult this because a review covers the
+    /// session's ENTIRE pane area: with one open, every pane is invisible,
+    /// so ⌘D would spawn a shell behind the review, ⌥⌘W would kill a pane
+    /// the user cannot see, and focus moves would silently change what
+    /// appears when the review exits. All of them refuse instead.
+    private let reviewSessions: () -> Set<String>
+
     private let dialogs: any DialogPresenting
 
     /// Schedules dialog presentation one runloop turn after `perform`
@@ -39,12 +54,16 @@ final class AppActions {
     init(
         store: AppStore,
         uiState: UIState,
+        panes: (any PaneCommanding)? = nil,
+        reviewSessions: @escaping () -> Set<String> = { [] },
         dialogs: any DialogPresenting = LiveDialogPresenter(),
         present: @escaping (@escaping () -> Void) -> Void = { work in DispatchQueue.main.async(execute: work) },
         currentEvent: @escaping () -> NSEvent? = { NSApp.currentEvent }
     ) {
         self.store = store
         self.uiState = uiState
+        self.panes = panes
+        self.reviewSessions = reviewSessions
         self.dialogs = dialogs
         self.present = present
         self.currentEvent = currentEvent
@@ -193,10 +212,59 @@ final class AppActions {
             Task { await store.prepareCloseWorkspace(workspace.id) }
             return true
 
+        case .splitPaneRight:
+            return splitSelectedSession(axis: .horizontal)
+
+        case .splitPaneDown:
+            return splitSelectedSession(axis: .vertical)
+
+        case .closePane:
+            guard let selection = store.selection, !reviewSessions().contains(selection) else {
+                return false
+            }
+            return panes?.closeFocusedPane(in: selection) ?? false
+
+        case .focusPaneLeft:
+            return moveSelectedSessionFocus(.left)
+
+        case .focusPaneRight:
+            return moveSelectedSessionFocus(.right)
+
+        case .focusPaneUp:
+            return moveSelectedSessionFocus(.up)
+
+        case .focusPaneDown:
+            return moveSelectedSessionFocus(.down)
+
         case .showShortcutHelp:
             uiState.showShortcutHelp.toggle()
             return true
         }
+    }
+
+    /// Splits the selected session's focused pane. The new shell spawns in
+    /// the session's working directory — same as the session's own shell —
+    /// which the row is needed to resolve; a selection with no row (mid-
+    /// close race) is unhandled.
+    private func splitSelectedSession(axis: SplitAxis) -> Bool {
+        guard let selection = store.selection,
+              !reviewSessions().contains(selection),
+              let row = store.sessions.first(where: { $0.id == selection })
+        else { return false }
+        return panes?.splitPane(
+            in: selection,
+            axis: axis,
+            workingDirectory: store.workingDirectory(for: row)
+        ) != nil
+    }
+
+    /// Reports false at a layout edge so the unmatched shortcut falls back
+    /// to the system (beep) instead of pretending focus moved.
+    private func moveSelectedSessionFocus(_ direction: FocusDirection) -> Bool {
+        guard let selection = store.selection, !reviewSessions().contains(selection) else {
+            return false
+        }
+        return panes?.moveFocus(in: selection, direction: direction) ?? false
     }
 
     /// Returns the project represented by the current session selection.

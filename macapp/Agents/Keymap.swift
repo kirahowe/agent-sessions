@@ -17,6 +17,13 @@ enum AppAction: Hashable {
     case selectSession(Int)
     case newWorkspace
     case closeWorkspace
+    case splitPaneRight
+    case splitPaneDown
+    case closePane
+    case focusPaneLeft
+    case focusPaneRight
+    case focusPaneUp
+    case focusPaneDown
     case showShortcutHelp
 }
 
@@ -28,7 +35,10 @@ extension AppAction: CaseIterable {
     static var allCases: [AppAction] {
         [
             .newSession, .closeSession, .renameSession, .closeWindow, .addProject, .removeProject,
-            .previousSession, .nextSession, .newWorkspace, .closeWorkspace, .showShortcutHelp,
+            .previousSession, .nextSession, .newWorkspace, .closeWorkspace,
+            .splitPaneRight, .splitPaneDown, .closePane,
+            .focusPaneLeft, .focusPaneRight, .focusPaneUp, .focusPaneDown,
+            .showShortcutHelp,
         ]
             + (0..<9).map { AppAction.selectSession($0) }
     }
@@ -53,6 +63,13 @@ extension AppAction {
         case .selectSession: return "Jump to session"
         case .newWorkspace: return "New Workspace"
         case .closeWorkspace: return "Close Workspace…"
+        case .splitPaneRight: return "Split Pane Right"
+        case .splitPaneDown: return "Split Pane Down"
+        case .closePane: return "Close Pane"
+        case .focusPaneLeft: return "Focus Pane Left"
+        case .focusPaneRight: return "Focus Pane Right"
+        case .focusPaneUp: return "Focus Pane Up"
+        case .focusPaneDown: return "Focus Pane Down"
         case .showShortcutHelp: return "Keyboard Shortcuts"
         }
     }
@@ -63,6 +80,9 @@ extension AppAction {
         switch self {
         case .newSession, .closeSession, .renameSession, .previousSession, .nextSession, .selectSession:
             return "Sessions"
+        case .splitPaneRight, .splitPaneDown, .closePane,
+             .focusPaneLeft, .focusPaneRight, .focusPaneUp, .focusPaneDown:
+            return "Panes"
         case .newWorkspace, .closeWorkspace:
             return "Workspaces"
         case .addProject, .removeProject:
@@ -81,6 +101,8 @@ struct Shortcut: Hashable {
         case char(Character)
         case upArrow
         case downArrow
+        case leftArrow
+        case rightArrow
     }
 
     let key: Key
@@ -119,6 +141,10 @@ struct Shortcut: Hashable {
             return event.specialKey == .upArrow
         case .downArrow:
             return event.specialKey == .downArrow
+        case .leftArrow:
+            return event.specialKey == .leftArrow
+        case .rightArrow:
+            return event.specialKey == .rightArrow
         }
     }
 
@@ -130,6 +156,8 @@ struct Shortcut: Hashable {
         case .char(let character): keyEquivalent = KeyEquivalent(character)
         case .upArrow: keyEquivalent = .upArrow
         case .downArrow: keyEquivalent = .downArrow
+        case .leftArrow: keyEquivalent = .leftArrow
+        case .rightArrow: keyEquivalent = .rightArrow
         }
 
         var eventModifiers: EventModifiers = []
@@ -154,6 +182,8 @@ struct Shortcut: Hashable {
         case .char(let character): result += String(character).uppercased()
         case .upArrow: result += "↑"
         case .downArrow: result += "↓"
+        case .leftArrow: result += "←"
+        case .rightArrow: result += "→"
         }
         return result
     }
@@ -177,6 +207,22 @@ enum Keymap {
             .previousSession: Shortcut(key: .upArrow, modifiers: [.command, .option]),
             .nextSession: Shortcut(key: .downArrow, modifiers: [.command, .option]),
             .newWorkspace: Shortcut(key: .char("n"), modifiers: [.command]),
+            // ⌘D / ⇧⌘D follow the iTerm2/Ghostty split convention. Close
+            // Pane gets ⌥⌘W rather than overloading ⌘W: ⌘W closes the whole
+            // session, and a modifier-distinct binding keeps "close the pane
+            // I'm in" from ever being one slipped shift away from "kill the
+            // session."
+            .splitPaneRight: Shortcut(key: .char("d"), modifiers: [.command]),
+            .splitPaneDown: Shortcut(key: .char("d"), modifiers: [.command, .shift]),
+            .closePane: Shortcut(key: .char("w"), modifiers: [.command, .option]),
+            // ⌃⌘ arrows: a full four-direction set that doesn't collide with
+            // ⌥⌘↑/↓ (previous/next session). Pane focus and session switching
+            // being different modifier pairs is deliberate — the two "move
+            // around" gestures must never depend on which session is split.
+            .focusPaneLeft: Shortcut(key: .leftArrow, modifiers: [.command, .control]),
+            .focusPaneRight: Shortcut(key: .rightArrow, modifiers: [.command, .control]),
+            .focusPaneUp: Shortcut(key: .upArrow, modifiers: [.command, .control]),
+            .focusPaneDown: Shortcut(key: .downArrow, modifiers: [.command, .control]),
             .showShortcutHelp: Shortcut(key: .char("?"), modifiers: [.command, .shift]),
             // .removeProject and .closeWorkspace intentionally have no entry: menu-only.
         ]

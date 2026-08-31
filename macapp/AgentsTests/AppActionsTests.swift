@@ -31,16 +31,49 @@ private func waitUntil(_ condition: () -> Bool, iterations: Int = 50) async {
 private func makeActions(
     store: AppStore,
     uiState: UIState? = nil,
+    panes: SpyPanes? = nil,
+    reviewSessions: @escaping () -> Set<String> = { [] },
     dialogs: FakeDialogs? = nil,
     currentEvent: @escaping () -> NSEvent? = { nil }
 ) -> AppActions {
     AppActions(
         store: store,
         uiState: uiState ?? UIState(),
+        panes: panes,
+        reviewSessions: reviewSessions,
         dialogs: dialogs ?? FakeDialogs(),
         present: { $0() },
         currentEvent: currentEvent
     )
+}
+
+/// Test double for `PaneCommanding`. Records every command so tests can
+/// assert `AppActions` resolved the right session and working directory
+/// without any real terminal machinery; canned results simulate the edge
+/// cases (single-pane close refusal, focus at a layout edge).
+@MainActor
+private final class SpyPanes: PaneCommanding {
+    private(set) var splitCalls: [(sessionID: String, axis: SplitAxis, workingDirectory: String)] = []
+    private(set) var closeCalls: [String] = []
+    private(set) var moveCalls: [(sessionID: String, direction: FocusDirection)] = []
+    var splitResult: UUID? = UUID()
+    var closeResult = true
+    var moveResult = true
+
+    func splitPane(in sessionID: String, axis: SplitAxis, workingDirectory: String) -> UUID? {
+        splitCalls.append((sessionID, axis, workingDirectory))
+        return splitResult
+    }
+
+    func closeFocusedPane(in sessionID: String) -> Bool {
+        closeCalls.append(sessionID)
+        return closeResult
+    }
+
+    func moveFocus(in sessionID: String, direction: FocusDirection) -> Bool {
+        moveCalls.append((sessionID, direction))
+        return moveResult
+    }
 }
 
 /// A ⇧⌘R keydown with a caller-chosen timestamp. `AppActions` keys its
@@ -552,5 +585,107 @@ final class AppActionsTests: XCTestCase {
         XCTAssertTrue(actions.perform(.renameSession))
 
         XCTAssertEqual(dialogs.promptRenameCalls.count, 2)
+    }
+
+    // MARK: - 13: pane actions (.splitPaneRight/.splitPaneDown/.closePane/.focusPane*)
+
+    func test13a_paneActionsAreUnhandledWithNoSelection() {
+        let (store, _, _) = TestSupport.makeStore()
+        let panes = SpyPanes()
+        let actions = makeActions(store: store, panes: panes)
+
+        XCTAssertFalse(actions.perform(.splitPaneRight))
+        XCTAssertFalse(actions.perform(.splitPaneDown))
+        XCTAssertFalse(actions.perform(.closePane))
+        XCTAssertFalse(actions.perform(.focusPaneLeft))
+        XCTAssertTrue(panes.splitCalls.isEmpty)
+        XCTAssertTrue(panes.closeCalls.isEmpty)
+        XCTAssertTrue(panes.moveCalls.isEmpty, "with nothing selected there is no session to command — reaching the pane seam anyway would split whatever session was selected last")
+    }
+
+    func test13b_splitActionsResolveTheSelectedSessionAndItsWorkingDirectory() {
+        let (store, _, _) = TestSupport.makeStore()
+        let panes = SpyPanes()
+        let actions = makeActions(store: store, panes: panes)
+        store.addProject(path: "/tmp/proj-A")
+        let selection = store.selection!
+
+        XCTAssertTrue(actions.perform(.splitPaneRight))
+        XCTAssertTrue(actions.perform(.splitPaneDown))
+
+        XCTAssertEqual(panes.splitCalls.map(\.sessionID), [selection, selection])
+        XCTAssertEqual(
+            panes.splitCalls.map(\.axis), [.horizontal, .vertical],
+            "split right must be a horizontal-axis split (panes side by side) and split down a vertical one — swapping them silently mirrors every split the user makes"
+        )
+        XCTAssertEqual(
+            panes.splitCalls.map(\.workingDirectory),
+            [store.workingDirectory(for: store.sessions.first!), store.workingDirectory(for: store.sessions.first!)],
+            "the new pane must spawn in the session's working directory, same as the session's own shell"
+        )
+    }
+
+    func test13c_closePaneReportsTheSeamsRefusal() {
+        let (store, _, _) = TestSupport.makeStore()
+        let panes = SpyPanes()
+        let actions = makeActions(store: store, panes: panes)
+        store.addProject(path: "/tmp/proj-A")
+
+        panes.closeResult = true
+        XCTAssertTrue(actions.perform(.closePane))
+        panes.closeResult = false
+        XCTAssertFalse(
+            actions.perform(.closePane),
+            "a single-pane session's close-pane refusal must surface as unhandled so the shortcut beeps instead of looking like it silently worked"
+        )
+        XCTAssertEqual(panes.closeCalls, [store.selection!, store.selection!])
+    }
+
+    func test13d_focusActionsMapDirectionsAndReportEdges() {
+        let (store, _, _) = TestSupport.makeStore()
+        let panes = SpyPanes()
+        let actions = makeActions(store: store, panes: panes)
+        store.addProject(path: "/tmp/proj-A")
+
+        XCTAssertTrue(actions.perform(.focusPaneLeft))
+        XCTAssertTrue(actions.perform(.focusPaneRight))
+        XCTAssertTrue(actions.perform(.focusPaneUp))
+        XCTAssertTrue(actions.perform(.focusPaneDown))
+        XCTAssertEqual(panes.moveCalls.map(\.direction), [.left, .right, .up, .down])
+
+        panes.moveResult = false
+        XCTAssertFalse(
+            actions.perform(.focusPaneLeft),
+            "focus stopped at a layout edge must report unhandled — the shortcut should fall through to the system rather than pretend focus moved"
+        )
+    }
+
+    func test13f_paneActionsRefuseWhileTheSelectedSessionHasAnOpenReview() {
+        let (store, _, _) = TestSupport.makeStore()
+        let panes = SpyPanes()
+        var reviews: Set<String> = []
+        let actions = makeActions(store: store, panes: panes, reviewSessions: { reviews })
+        store.addProject(path: "/tmp/proj-A")
+        reviews = [store.selection!]
+
+        XCTAssertFalse(actions.perform(.splitPaneRight), "a review covers the session's whole pane area — ⌘D would spawn a shell behind it that the user never asked to see")
+        XCTAssertFalse(actions.perform(.closePane), "⌥⌘W during a review would kill a pane the user cannot currently see")
+        XCTAssertFalse(actions.perform(.focusPaneLeft), "focus moves during a review would silently change which pane appears when the review exits")
+        XCTAssertTrue(panes.splitCalls.isEmpty)
+        XCTAssertTrue(panes.closeCalls.isEmpty)
+        XCTAssertTrue(panes.moveCalls.isEmpty)
+
+        reviews = []
+        XCTAssertTrue(actions.perform(.splitPaneRight), "the refusal must be scoped to the open review — the moment it exits, pane commands work again")
+    }
+
+    func test13e_paneActionsAreUnhandledWithNoPaneCommander() {
+        let (store, _, _) = TestSupport.makeStore()
+        let actions = makeActions(store: store)
+        store.addProject(path: "/tmp/proj-A")
+
+        XCTAssertFalse(actions.perform(.splitPaneRight))
+        XCTAssertFalse(actions.perform(.closePane))
+        XCTAssertFalse(actions.perform(.focusPaneDown))
     }
 }

@@ -11,8 +11,9 @@ import SwiftUI
 /// AppActions/ShortcutRouter path — no special-casing needed here).
 struct ShortcutHelpView: View {
     /// Section order for the sheet. Every `AppAction.helpGroup` value must
-    /// appear here or its rows would silently vanish from the sheet.
-    private static let groupOrder = ["Sessions", "Workspaces", "Projects", "Window", "Help"]
+    /// appear here or its rows would silently vanish from the sheet —
+    /// internal (not private) so `KeymapTests` can enforce exactly that.
+    static let groupOrder = ["Sessions", "Panes", "Workspaces", "Projects", "Window", "Help"]
 
     private struct Row: Identifiable {
         let id: String
