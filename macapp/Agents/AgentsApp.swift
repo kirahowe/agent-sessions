@@ -92,6 +92,16 @@ struct AgentsApp: App {
             store?.sessions.contains { $0.id == sessionID } ?? false
         }
 
+        // The hook's per-event report lands on the pane it names, and only
+        // TerminalCenter knows which panes are live and whose they are — so
+        // it applies (or refuses) the event and the server relays the
+        // answer. Wired here for the same reason as validateSession: a
+        // report racing app construction is refused outright rather than
+        // half-applied, and the hook's next event carries the same facts.
+        controlServer.applySessionEvent = { [weak center] event in
+            center?.handleControlSessionEvent(event) ?? "app is shutting down"
+        }
+
         // Every session-teardown path (close, project removal, workspace
         // quiesce, process exit) funnels through TerminalCenter, and a
         // session going away must cancel its open review so the launcher

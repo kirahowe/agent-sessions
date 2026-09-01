@@ -46,18 +46,27 @@ extension SessionActivity {
             return nil
         }
 
+        return statusMessage(token: token)
+    }
+
+    /// The status vocabulary itself — `clear` plus each `SessionActivity`
+    /// raw value — shared by every transport that carries it: the OSC forms
+    /// above and the hook's `session-event` line over the control socket
+    /// (see `ControlServer`), so the two can never drift apart.
+    ///
+    /// An unrecognised token must not be silently treated as any
+    /// particular state (e.g. defaulted to .clear or some fallback) —
+    /// that would risk showing a stale or flat-out wrong indicator
+    /// indefinitely if the hook script and this app ever drift out of
+    /// sync on the wire format. Returning nil here means "not a status
+    /// update we understand," exactly like an unrelated notification.
+    static func statusMessage(token: String) -> StatusMessage? {
         if token == "clear" {
             return .clear
         }
         if let activity = SessionActivity(rawValue: token) {
             return .set(activity)
         }
-        // An unrecognised token must not be silently treated as any
-        // particular state (e.g. defaulted to .clear or some fallback) —
-        // that would risk showing a stale or flat-out wrong indicator
-        // indefinitely if the hook script and this app ever drift out of
-        // sync on the wire format. Returning nil here means "not a status
-        // update we understand," exactly like an unrelated notification.
         return nil
     }
 }

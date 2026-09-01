@@ -6,9 +6,19 @@ import Foundation
 /// running *inside* one of this app's terminals ask the app to do something
 /// that process cannot do for itself.
 ///
-/// Exactly one verb today — `overlay-run`, which drives `OverlayCenter` on
-/// behalf of the revdiff launcher. See that type for why a review TUI cannot
-/// simply draw into the terminal that asked for it.
+/// Two verbs. `overlay-run` drives `OverlayCenter` on behalf of the revdiff
+/// launcher — see that type for why a review TUI cannot simply draw into
+/// the terminal that asked for it. `session-event` is how
+/// `hooks/agents-status.sh` reports what the agent in one pane is doing:
+/// its attention state and its resumable session (see
+/// `ControlSessionEvent`). The hook used to write those facts as OSC 777
+/// escapes to the pane's pty and lost most of them: Ghostty throttles
+/// desktop notifications app-wide — one per second across every surface,
+/// identical content suppressed for five — so the session announcement
+/// that followed a status escape by microseconds was dropped every single
+/// time, and two agents reporting within a second of each other lost one
+/// report. A socket line is never throttled, never deduplicated, needs no
+/// pty discovery, and gets an answer.
 ///
 /// Why a Unix socket rather than the two obvious alternatives:
 ///
@@ -61,11 +71,16 @@ final class ControlServer: @unchecked Sendable {
         return directory.appendingPathComponent("\(bundleID).control.\(pid).sock").path
     }()
 
+    /// The path THIS instance binds: `socketPath` for the app, or the
+    /// private path a test hands `init` so it can stand up a real server
+    /// without touching this build's socket namespace.
+    let path: String
+
     /// Directory holding every build's control sockets, live or dead —
-    /// `socketPath` with its last component removed. Shared by the startup
+    /// `path` with its last component removed. Shared by the startup
     /// sweep, which has to look at siblings this instance did not create.
-    private static var socketDirectory: String {
-        (socketPath as NSString).deletingLastPathComponent
+    private var socketDirectory: String {
+        (path as NSString).deletingLastPathComponent
     }
 
     /// Prefix shared by every socket file this bundle id could ever have
@@ -79,28 +94,48 @@ final class ControlServer: @unchecked Sendable {
 
     private struct Request: Decodable {
         let cmd: String
+        /// Named by both verbs: the row the caller runs in (`AGENTS_SESSION_ID`).
+        let session: String?
+        // overlay-run
         let command: String?
         let cwd: String?
-        let session: String?
+        // session-event
+        let pane: String?
+        let event: String?
+        let status: String?
+        let agent: String?
+        let agentSessionID: String?
+        let prompt: String?
+
+        private enum CodingKeys: String, CodingKey {
+            case cmd, session, command, cwd, pane, event, status, agent, prompt
+            case agentSessionID = "agent_session_id"
+        }
     }
 
     /// What one request line asks the app to do, after syntactic validation
-    /// but before any main-actor state (live sessions, open reviews) is
-    /// consulted. Extracted from `serve` so the wire-format rules — the
-    /// contract the revdiff launcher is written against — can be pinned in
-    /// tests without standing up a socket.
+    /// but before any main-actor state (live sessions, live panes, open
+    /// reviews) is consulted. Extracted from `serve` so the wire-format
+    /// rules — the contract the revdiff launcher and the hook are written
+    /// against — can be pinned in tests without standing up a socket.
     enum RequestDecision: Equatable {
         case refuse(String)
         case run(command: String, cwd: String, session: String)
+        case sessionEvent(ControlSessionEvent)
     }
 
     static func decide(line: String) -> RequestDecision {
         guard let request = try? JSONDecoder().decode(Request.self, from: Data(line.utf8)) else {
             return .refuse("malformed request")
         }
-        guard request.cmd == "overlay-run" else {
-            return .refuse("unknown cmd: \(request.cmd)")
+        switch request.cmd {
+        case "overlay-run": return decideOverlayRun(request)
+        case "session-event": return decideSessionEvent(request)
+        default: return .refuse("unknown cmd: \(request.cmd)")
         }
+    }
+
+    private static func decideOverlayRun(_ request: Request) -> RequestDecision {
         guard let command = request.command, !command.isEmpty else {
             return .refuse("missing command")
         }
@@ -110,6 +145,60 @@ final class ControlServer: @unchecked Sendable {
             return .refuse("missing session — update the revdiff launcher to forward AGENTS_SESSION_ID")
         }
         return .run(command: command, cwd: request.cwd ?? NSHomeDirectory(), session: session)
+    }
+
+    /// Every refusal here is a contract violation by the sender, not a
+    /// runtime condition, and the messages say what to fix: the hook
+    /// discards replies, so these are read by someone driving `nc` by hand
+    /// after something stopped working.
+    private static func decideSessionEvent(_ request: Request) -> RequestDecision {
+        guard let session = request.session, !session.isEmpty else {
+            return .refuse("missing session — the hook forwards AGENTS_SESSION_ID; rebuild the app if its panes lack it")
+        }
+        guard let paneString = request.pane, !paneString.isEmpty else {
+            return .refuse("missing pane — the hook forwards AGENTS_PANE_ID; rebuild the app if its panes lack it")
+        }
+        guard let pane = UUID(uuidString: paneString) else {
+            return .refuse("malformed pane: \(paneString)")
+        }
+        let name = (request.event ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty else {
+            return .refuse("missing event")
+        }
+
+        var status: SessionActivity.StatusMessage?
+        if let token = request.status {
+            guard let parsed = SessionActivity.statusMessage(token: token) else {
+                return .refuse("unknown status: \(token)")
+            }
+            status = parsed
+        }
+
+        var event: AgentSessionEvent?
+        let agent = request.agent ?? ""
+        let agentSessionID = request.agentSessionID ?? ""
+        switch (agent.isEmpty, agentSessionID.isEmpty) {
+        case (true, true):
+            event = nil
+        case (false, true):
+            return .refuse("missing agent_session_id")
+        case (true, false):
+            return .refuse("missing agent")
+        case (false, false):
+            guard let made = AgentSessionEvent.make(
+                agent: agent, name: name, sessionID: agentSessionID, query: request.prompt
+            ) else {
+                return .refuse("blank agent or agent_session_id")
+            }
+            event = made
+        }
+
+        guard status != nil || event != nil else {
+            return .refuse("nothing to apply: no status and no agent session")
+        }
+        return .sessionEvent(
+            ControlSessionEvent(session: session, pane: pane, status: status, event: event)
+        )
     }
 
     private let overlays: OverlayCenter
@@ -124,6 +213,14 @@ final class ControlServer: @unchecked Sendable {
     /// belongs to a live session or does not open at all.
     @MainActor var validateSession: ((String) -> Bool)?
 
+    /// Applies one hook-delivered session event to the pane it names, or
+    /// returns why it can't (an unknown pane, a pane belonging to another
+    /// session, a pane whose process is gone). Wired by `AgentsApp` to
+    /// `TerminalCenter`, which owns the pane table and the two signal
+    /// paths the event feeds. Like `validateSession`, unwired means
+    /// refused: the hook's next event carries the same facts again.
+    @MainActor var applySessionEvent: ((ControlSessionEvent) -> String?)?
+
     /// The clients waiting on live overlays, keyed by invoking session id —
     /// mirroring `OverlayCenter`'s one-review-per-session map. Only ever
     /// touched on the main actor, alongside the overlay state it mirrors, so
@@ -131,8 +228,9 @@ final class ControlServer: @unchecked Sendable {
     /// than two that can disagree.
     @MainActor private var pendingClients: [String: Int32] = [:]
 
-    init(overlays: OverlayCenter) {
+    init(overlays: OverlayCenter, socketPath: String = ControlServer.socketPath) {
         self.overlays = overlays
+        self.path = socketPath
     }
 
     @MainActor
@@ -162,11 +260,12 @@ final class ControlServer: @unchecked Sendable {
             object: nil,
             queue: nil
         ) { [weak self] _ in
-            self?.shutdown()
+            self?.stop()
         }
     }
 
-    private func shutdown() {
+    /// Stops listening and removes the socket file. Idempotent.
+    func stop() {
         // Synchronous on purpose: termination does not drain dispatch queues,
         // so an async hop here would race exit(2) and lose often enough to
         // make this cleanup decorative. The control queue cannot deadlock a
@@ -182,14 +281,14 @@ final class ControlServer: @unchecked Sendable {
                 close(self.listenFD)
                 self.listenFD = -1
             }
-            unlink(Self.socketPath)
+            unlink(self.path)
         }
     }
 
     // MARK: - Socket setup
 
     private func bindAndListen() {
-        let path = Self.socketPath
+        let path = self.path
         // Two different processes can never collide on this exact path — it
         // is scoped to our own pid — but pids do wrap and get reused across
         // reboots, so on the small chance a stale file already sits here from
@@ -248,7 +347,7 @@ final class ControlServer: @unchecked Sendable {
         // left behind that nobody is listening on any more — see
         // `sweepDeadSockets` for why a crash or a test-host launch produces
         // exactly that kind of leftover.
-        Self.sweepDeadSockets(in: Self.socketDirectory, prefix: Self.socketPrefix, ownPath: path)
+        Self.sweepDeadSockets(in: socketDirectory, prefix: Self.socketPrefix, ownPath: path)
     }
 
     /// Removes control sockets under `directory` whose name starts with
@@ -328,19 +427,42 @@ final class ControlServer: @unchecked Sendable {
             close(client)
             return
         }
-        let command: String
-        let cwd: String
-        let session: String
         switch Self.decide(line: line) {
         case .refuse(let error):
             reply(to: client, ok: false, error: error, closing: true)
-            return
-        case .run(let decidedCommand, let decidedCwd, let decidedSession):
-            command = decidedCommand
-            cwd = decidedCwd
-            session = decidedSession
+        case .run(let command, let cwd, let session):
+            serveOverlayRun(client: client, command: command, cwd: cwd, session: session)
+        case .sessionEvent(let event):
+            serveSessionEvent(client: client, event: event)
         }
+    }
 
+    /// Answered the moment the event is applied — the hook's `nc` is what
+    /// holds the agent's next step until then, so this must never wait on
+    /// anything but the main actor.
+    private func serveSessionEvent(client: Int32, event: ControlSessionEvent) {
+        Task { @MainActor [weak self] in
+            guard let self else {
+                close(client)
+                return
+            }
+            guard self.validateSession?(event.session) == true else {
+                self.reply(to: client, ok: false, error: "unknown session: \(event.session)", closing: true)
+                return
+            }
+            guard let apply = self.applySessionEvent else {
+                self.reply(to: client, ok: false, error: "session events are not wired", closing: true)
+                return
+            }
+            if let error = apply(event) {
+                self.reply(to: client, ok: false, error: error, closing: true)
+            } else {
+                self.reply(to: client, ok: true, error: nil, closing: true)
+            }
+        }
+    }
+
+    private func serveOverlayRun(client: Int32, command: String, cwd: String, session: String) {
         Task { @MainActor [weak self] in
             guard let self else {
                 close(client)
@@ -414,4 +536,19 @@ final class ControlServer: @unchecked Sendable {
         }
         return String(decoding: bytes, as: UTF8.self)
     }
+}
+
+/// One hook event for one pane, as delivered over the control socket by
+/// `hooks/agents-status.sh`: the same two facts the pty-borne protocols
+/// carry, on a transport that cannot lose them. `status` is the structured
+/// `agents:status` vocabulary (see `SessionActivity.statusMessage`) and
+/// `event` the `agents:session` announcement (see `AgentSessionEvent.make`).
+/// Either half may be absent — a `PostToolUse` carries status only, and a
+/// hook that could not identify its harness carries no session — but a
+/// line with neither is refused rather than accepted as a no-op.
+struct ControlSessionEvent: Equatable {
+    var session: String
+    var pane: UUID
+    var status: SessionActivity.StatusMessage?
+    var event: AgentSessionEvent?
 }

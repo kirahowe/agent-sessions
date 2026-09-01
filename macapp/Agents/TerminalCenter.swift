@@ -110,15 +110,15 @@ final class TerminalCenter: ObservableObject, SessionTerminating {
     /// `TerminalCenterTests`. This is the app's half of the contract with
     /// `hooks/agents-status.sh`: that hook is registered globally in the
     /// user's Claude Code settings, so it also runs for sessions hosted in
-    /// iTerm2 and every other terminal, and it refuses to emit its OSC 777
-    /// status escape unless `AGENTS_APP` is present in its environment —
-    /// that's the only signal it has for "I'm actually running inside the
-    /// Agents app." Dropping this function, or losing it from the options
-    /// passed to `TerminalSurfaceOptions` below, silently disables every
-    /// session's status indicator in the sidebar with no error to point at:
-    /// the hook just sees an unset variable and exits 0 before ever writing
-    /// its escape, so nothing in this app's logs would even hint at why the
-    /// dots stopped appearing.
+    /// iTerm2 and every other terminal, and it refuses to report anything
+    /// unless `AGENTS_APP` and the socket/session/pane variables below are
+    /// present in its environment — that's the only signal it has for "I'm
+    /// actually running inside the Agents app." Dropping this function, or
+    /// losing it from the options passed to `TerminalSurfaceOptions` below,
+    /// silently disables every session's status indicator and every restore
+    /// banner with no error to point at: the hook just sees unset variables
+    /// and exits 0 before ever connecting, so nothing in this app's logs
+    /// would even hint at why the dots stopped appearing.
     ///
     /// A function of the session id, not a constant: `AGENTS_SESSION_ID` is
     /// what lets a process inside the session say which session it is when it
@@ -126,9 +126,15 @@ final class TerminalCenter: ObservableObject, SessionTerminating {
     /// so its review can be scoped to the row that asked, rather than taking
     /// over whatever is selected. Every pane of a session shares the
     /// session's id: reviews are per session, not per pane, so an agent in
-    /// any pane names the same row.
-    static func sessionEnvVars(for sessionID: String) -> [String: String] {
-        [
+    /// any pane names the same row. The hook's reports, by contrast, ARE per
+    /// pane — each pane is its own agent with its own attention state, and
+    /// only the resume designate's agent may author the row's resume record
+    /// — so a pane also gets `AGENTS_PANE_ID`, the one thing that lets the
+    /// socket (shared by every pane) tell the reporting panes apart. A
+    /// surface that is not a pane (an overlay) passes no pane id and gets
+    /// no such variable.
+    static func sessionEnvVars(for sessionID: String, paneID: UUID? = nil) -> [String: String] {
+        var env = [
             "AGENTS_APP": "1",
             "AGENTS_SESSION_ID": sessionID,
             "WARP_CLI_AGENT_PROTOCOL_VERSION": "1",
@@ -142,6 +148,10 @@ final class TerminalCenter: ObservableObject, SessionTerminating {
             // isn't AppleScript.
             "AGENTS_CONTROL_SOCK": ControlServer.socketPath,
         ]
+        if let paneID {
+            env["AGENTS_PANE_ID"] = paneID.uuidString
+        }
+        return env
     }
 
     /// Invoked with the session id after the session's last pane's shell
@@ -270,7 +280,7 @@ final class TerminalCenter: ObservableObject, SessionTerminating {
         view.configuration = TerminalSurfaceOptions(
             backend: .exec,
             workingDirectory: workingDirectory,
-            envVars: Self.sessionEnvVars(for: sessionID)
+            envVars: Self.sessionEnvVars(for: sessionID, paneID: paneID)
         )
         let controller = TerminalController(terminalConfiguration: Self.terminalConfiguration)
         view.controller = controller
@@ -609,6 +619,37 @@ final class TerminalCenter: ObservableObject, SessionTerminating {
         onAgentSessionEvent?(sessionID, event, panes[paneID]?.lastTitle)
     }
 
+    /// Applies one hook event delivered over the control socket, returning
+    /// a refusal for the hook (nil on success). The socket can't tell which
+    /// pane a connection came from — every pane of a session shares one
+    /// endpoint — so the pane id the hook read from `AGENTS_PANE_ID` is
+    /// checked against the live pane table, and against the session it
+    /// claims, before anything is applied: a stale id from a torn-down pane
+    /// must not light up or relabel whichever pane inherited the row, and a
+    /// quiesced survivor keeps its id for the fresh shell that follows but
+    /// has no process that could honestly report for it in between. From
+    /// there the two halves take exactly the paths their pty-borne forms
+    /// do: the status through `handleSessionSignal` as a structured
+    /// message, the announcement through `handleAgentSessionEvent` with its
+    /// resume-designate rule intact.
+    func handleControlSessionEvent(_ event: ControlSessionEvent) -> String? {
+        guard let entry = panes[event.pane], entry.sessionID == event.session else {
+            return "unknown pane \(event.pane.uuidString) in session \(event.session)"
+        }
+        guard entry.controller != nil else {
+            return "pane \(event.pane.uuidString) has no live process"
+        }
+        if let status = event.status {
+            handleSessionSignal(
+                sessionID: event.session, paneID: event.pane, signal: .structured(status)
+            )
+        }
+        if let agentEvent = event.event {
+            handleAgentSessionEvent(sessionID: event.session, paneID: event.pane, event: agentEvent)
+        }
+        return nil
+    }
+
     /// The pane whose agent owns the session's resume metadata, and the
     /// pane a quiesce keeps: the initial pane while it lives, else the
     /// first remaining leaf. The two uses must stay the same pane — the
@@ -666,14 +707,15 @@ final class SessionDelegateProxy:
     /// in.
     ///
     /// Session-resume notifications take a separate route: valid version-1
-    /// envelopes under either Warp's CLI-agent title (OMP) or the app's own
-    /// hook title (Claude Code, Codex, via `agents:session`) are forwarded
-    /// as agent session events, while every malformed or unsupported
-    /// notification carrying either magic title is consumed. Neither kind
-    /// is allowed to fall through to fuzzy attention — the hook emits
-    /// `agents:session` on every prompt, and letting a malformed one fall
-    /// through to keyword classification would raise a bogus gold dot each
-    /// time.
+    /// envelopes under either Warp's CLI-agent title (OMP) or the
+    /// `agents:session` title (any emitter still using the OSC form; the
+    /// bundled hook now reports over the control socket instead — see
+    /// `handleControlSessionEvent`) are forwarded as agent session events,
+    /// while every malformed or unsupported notification carrying either
+    /// magic title is consumed. Neither kind is allowed to fall through to
+    /// fuzzy attention — an emitter may announce on every prompt, and
+    /// letting a malformed one fall through to keyword classification
+    /// would raise a bogus gold dot each time.
     ///
     /// Other notifications are split between the structured `agents:status`
     /// protocol and free text for `AttentionClassifier`; all attention-state

@@ -70,6 +70,14 @@ final class TerminalCenterPaneTests: XCTestCase {
         )
         XCTAssertEqual(newView.configuration.envVars["AGENTS_APP"], "1")
         XCTAssertEqual(
+            newView.configuration.envVars["AGENTS_PANE_ID"], newPane!.uuidString,
+            "each pane must carry its OWN id — the hook reports over the session's shared socket, and this is the only thing that tells the app which pane's agent is talking"
+        )
+        XCTAssertEqual(
+            center.view(forPane: center.layouts[sessionID]!.initialPane)!.configuration.envVars["AGENTS_PANE_ID"],
+            center.layouts[sessionID]!.initialPane.uuidString
+        )
+        XCTAssertEqual(
             newView.configuration.workingDirectory, "/tmp/elsewhere",
             "a new pane spawns in the session's working directory passed by the caller"
         )
@@ -279,6 +287,93 @@ final class TerminalCenterPaneTests: XCTestCase {
             events.map(\.event.sessionID), ["survivor"],
             "once the initial pane is gone, the surviving pane is where a quiesce keeps the session and where the resume hint lands — its agent must own the metadata, or resume tracking would silently die with the initial pane"
         )
+    }
+
+    // MARK: - Control-socket session events
+
+    func testSocketEventRoutesStatusAndAnnouncementToThePaneItNames() {
+        let center = TerminalCenter()
+        _ = makeSession(in: center)
+        let initialPane = center.layouts[sessionID]!.initialPane
+        let splitPane = center.splitPane(in: sessionID, axis: .horizontal, workingDirectory: "/tmp")!
+
+        var signals: [(pane: UUID, signal: AttentionSignal)] = []
+        center.onSessionSignal = { id, pane, signal in
+            XCTAssertEqual(id, self.sessionID)
+            signals.append((pane, signal))
+        }
+        var announced: [String] = []
+        center.onAgentSessionEvent = { _, event, _ in announced.append(event.sessionID) }
+
+        let fromSplit = ControlSessionEvent(
+            session: sessionID, pane: splitPane, status: .set(.blocked),
+            event: AgentSessionEvent(agent: "claude", name: "PreToolUse", sessionID: "intruder", query: nil)
+        )
+        let fromInitial = ControlSessionEvent(
+            session: sessionID, pane: initialPane, status: .clear,
+            event: AgentSessionEvent(agent: "claude", name: "PreToolUse", sessionID: "owner", query: nil)
+        )
+
+        XCTAssertNil(center.handleControlSessionEvent(fromSplit))
+        XCTAssertNil(center.handleControlSessionEvent(fromInitial))
+
+        XCTAssertEqual(
+            signals.map(\.pane), [splitPane, initialPane],
+            "status must be reduced for the pane the hook ran in — the socket is shared by every pane, so only the AGENTS_PANE_ID the hook forwards can attribute it"
+        )
+        XCTAssertEqual(signals.map(\.signal), [.structured(.set(.blocked)), .structured(.clear)])
+        XCTAssertEqual(
+            announced, ["owner"],
+            "the socket path must honour the same resume-designate rule as the OSC path: a split pane's agent reports its status but never authors the row's resume record"
+        )
+    }
+
+    func testSocketEventNamingAnUnknownOrForeignPaneIsRefused() {
+        let center = TerminalCenter()
+        _ = makeSession(in: center)
+        _ = center.terminalView(for: "other-session", workingDirectory: "/tmp", restoredResume: nil)
+        let foreignPane = center.layouts["other-session"]!.initialPane
+        var signals = 0
+        center.onSessionSignal = { _, _, _ in signals += 1 }
+
+        XCTAssertNotNil(
+            center.handleControlSessionEvent(
+                ControlSessionEvent(session: sessionID, pane: foreignPane, status: .set(.blocked), event: nil)
+            ),
+            "a pane id that belongs to another session must be refused — applying it would light up a row the reporting agent isn't in"
+        )
+        XCTAssertNotNil(
+            center.handleControlSessionEvent(
+                ControlSessionEvent(session: sessionID, pane: UUID(), status: .set(.blocked), event: nil)
+            )
+        )
+        XCTAssertEqual(signals, 0)
+    }
+
+    func testSocketEventForATornDownPaneIsRefused() async {
+        let center = TerminalCenter()
+        _ = makeSession(in: center)
+        let initialPane = center.layouts[sessionID]!.initialPane
+        let splitPane = center.splitPane(in: sessionID, axis: .horizontal, workingDirectory: "/tmp")!
+        var signals = 0
+        center.onSessionSignal = { _, _, _ in signals += 1 }
+
+        XCTAssertTrue(center.closeFocusedPane(in: sessionID))
+        XCTAssertNotNil(
+            center.handleControlSessionEvent(
+                ControlSessionEvent(session: sessionID, pane: splitPane, status: .clear, event: nil)
+            ),
+            "a closed pane's id must be refused — AppStore already dropped that pane's attention on teardown, and a late report would resurrect it under a dead id"
+        )
+
+        await center.quiesceSessions([sessionID])
+        XCTAssertNotNil(
+            center.handleControlSessionEvent(
+                ControlSessionEvent(session: sessionID, pane: initialPane, status: .clear, event: nil)
+            ),
+            "a quiesced survivor keeps its pane id for the fresh shell that follows, but until that shell exists no process can honestly report for it"
+        )
+        XCTAssertEqual(signals, 0)
     }
 
     func testTitlesCarryTheRolesTheirPaneHolds() {

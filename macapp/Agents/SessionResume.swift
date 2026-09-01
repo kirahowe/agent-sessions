@@ -17,18 +17,25 @@ struct SessionResumeMetadata: Codable, Hashable {
     var prompt: String?
 }
 
-/// The small, Foundation-only portion of the session-notification protocol
-/// this app consumes. Warp's own CLI-agent protocol (which OMP speaks
-/// natively) and the app's own hook (`hooks/agents-status.sh`, for Claude
-/// Code and Codex) both publish the same JSON envelope shape, just under
-/// different notification titles — see `warpNotificationTitle` and
-/// `hookNotificationTitle`. Unknown JSON fields and event-specific fields
-/// other than `query` are deliberately ignored.
+/// The small, Foundation-only portion of the session-announcement protocol
+/// this app consumes: which harness is running in a pane, under which of
+/// its own session ids, and optionally what the user last asked it. It
+/// arrives by two transports. OMP speaks Warp's CLI-agent protocol natively
+/// — a JSON envelope in an OSC 777 desktop notification under
+/// `warpNotificationTitle` — while the app's own hook
+/// (`hooks/agents-status.sh`, for Claude Code and Codex) sends the same
+/// facts as a `session-event` line over the control socket (see
+/// `ControlServer`). Both funnel through `make`, so a session looks the
+/// same downstream whichever way it was announced. Unknown JSON fields and
+/// event-specific fields other than `query` are deliberately ignored.
 struct AgentSessionEvent: Hashable {
     /// Warp's CLI-agent protocol title — OMP emits this natively.
     static let warpNotificationTitle = "warp://cli-agent"
-    /// The app's own title, emitted by hooks/agents-status.sh for Claude
-    /// Code and Codex.
+    /// The app's own OSC title. The bundled hook no longer emits it — Ghostty
+    /// throttles desktop notifications app-wide (one per second, identical
+    /// content suppressed for five), which silently dropped the hook's
+    /// announcement every time it followed a status escape — but the form
+    /// stays accepted for any other emitter that adopted it.
     static let hookNotificationTitle = "agents:session"
 
     static func isSessionNotification(title: String) -> Bool {
@@ -59,24 +66,41 @@ struct AgentSessionEvent: Hashable {
         }
     }
 
+    /// The one normalization every announcement passes through, whichever
+    /// transport carried it: the harness identifier is compared lowercase
+    /// everywhere downstream, ids and names are trimmed, and the prompt
+    /// preview is collapsed to one printable line capped at 200 characters
+    /// — a bound the OSC transport needs (terminals drop oversized escapes)
+    /// and the socket keeps so the banner heading it may become stays a
+    /// heading. Nil for a blank agent, event name, or session id: an empty
+    /// harness identifier would silently fail every downstream switch
+    /// rather than error anywhere.
+    static func make(
+        agent: String, name: String, sessionID: String, query: String?
+    ) -> AgentSessionEvent? {
+        let agent = agent.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let name = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let sessionID = sessionID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !agent.isEmpty, !name.isEmpty, !sessionID.isEmpty else { return nil }
+
+        let query = query.flatMap { query -> String? in
+            let preview = terminalSafeSingleLine(query)
+            guard !preview.isEmpty else { return nil }
+            return String(preview.prefix(200))
+        }
+        return AgentSessionEvent(agent: agent, name: name, sessionID: sessionID, query: query)
+    }
+
     static func parseNotification(title: String, body: String) -> AgentSessionEvent? {
         guard isSessionNotification(title: title),
               let data = body.data(using: .utf8),
               let envelope = try? JSONDecoder().decode(WireEnvelope.self, from: data),
               envelope.v == 1
         else { return nil }
-
-        let agent = envelope.agent.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        let name = envelope.event.trimmingCharacters(in: .whitespacesAndNewlines)
-        let sessionID = envelope.sessionID.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !agent.isEmpty, !name.isEmpty, !sessionID.isEmpty else { return nil }
-
-        let query = envelope.query.flatMap { query -> String? in
-            let preview = terminalSafeSingleLine(query)
-            guard !preview.isEmpty else { return nil }
-            return String(preview.prefix(200))
-        }
-        return AgentSessionEvent(agent: agent, name: name, sessionID: sessionID, query: query)
+        return make(
+            agent: envelope.agent, name: envelope.event,
+            sessionID: envelope.sessionID, query: envelope.query
+        )
     }
 }
 

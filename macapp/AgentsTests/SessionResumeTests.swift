@@ -153,6 +153,29 @@ final class SessionResumeTests: XCTestCase {
         )
     }
 
+    // MARK: - make (shared by the OSC and control-socket transports)
+
+    func testMakeNormalizesExactlyLikeParseNotification() {
+        let made = AgentSessionEvent.make(
+            agent: " Claude ", name: " UserPromptSubmit ", sessionID: " c-1 ", query: "Fix\n\tthe\u{001B} parser"
+        )
+
+        XCTAssertEqual(
+            made,
+            AgentSessionEvent(agent: "claude", name: "UserPromptSubmit", sessionID: "c-1", query: "Fix the parser"),
+            "the control-socket path builds events through make() — it must apply the same lowercase/trim/one-line rules the OSC path does, or the same session would look different depending on which transport announced it"
+        )
+    }
+
+    func testMakeRejectsBlankIdentityAndDropsABlankQuery() {
+        XCTAssertNil(AgentSessionEvent.make(agent: " ", name: "e", sessionID: "s", query: nil))
+        XCTAssertNil(AgentSessionEvent.make(agent: "claude", name: " ", sessionID: "s", query: nil))
+        XCTAssertNil(AgentSessionEvent.make(agent: "claude", name: "e", sessionID: " ", query: nil))
+        let blankQuery = AgentSessionEvent.make(agent: "claude", name: "e", sessionID: "s", query: " \n ")
+        XCTAssertNotNil(blankQuery)
+        XCTAssertNil(blankQuery?.query, "a whitespace-only prompt is no prompt — it must not become an empty heading fallback in the banner")
+    }
+
     // MARK: - displayName / resumeCommand
 
     func testDisplayNameForKnownAndUnknownAgents() {

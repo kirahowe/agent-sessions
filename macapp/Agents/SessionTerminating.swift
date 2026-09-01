@@ -56,13 +56,13 @@ protocol SessionTerminating: AnyObject {
     /// IGNORED downstream (see AppStore.setSessionTitle): "remember the
     /// last title" means a shell clearing its title keeps the last real one.
     var onTitleChange: ((String, String, SessionTitleRoles) -> Void)? { get set }
-    /// Fired for a valid version-1 session-resume notification — either
-    /// Warp's CLI-agent title (which OMP speaks natively) or the app's own
-    /// hook title (`agents:session`, for Claude Code and Codex) — as
-    /// (sessionID, event, authoring pane's current OSC title). The terminal
-    /// bridge consumes every notification carrying either magic title, but
-    /// forwards only successfully decoded envelopes here, and only from the
-    /// session's resume-designate pane. The attached title is the seed for
+    /// Fired for a valid session announcement — Warp's CLI-agent OSC
+    /// notification (which OMP speaks natively), the `agents:session` OSC
+    /// form, or the hook's `session-event` line over the control socket
+    /// (Claude Code and Codex) — as (sessionID, event, authoring pane's
+    /// current OSC title). Every transport forwards only successfully
+    /// decoded announcements here, and only from the session's
+    /// resume-designate pane. The attached title is the seed for
     /// the resume record's human label: it comes from the SAME pane whose
     /// agent produced the event, never from `agentTitle`, which the focused
     /// pane — possibly a sibling agent — owns. Nil when that pane hasn't

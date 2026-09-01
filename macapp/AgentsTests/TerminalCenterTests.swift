@@ -69,23 +69,41 @@ final class TerminalCenterTests: XCTestCase {
     /// `TerminalCenter.sessionEnvVars` is the app's half of its contract with
     /// `hooks/agents-status.sh`: that hook is registered globally in the
     /// user's Claude Code settings (so it also runs for sessions hosted in
-    /// iTerm2 and every other terminal), and it refuses to emit its OSC 777
-    /// status escape unless it sees a non-empty `AGENTS_APP` in its
-    /// environment. If this function ever loses that key — or stops being
-    /// passed through to `TerminalSurfaceOptions.envVars` — the hook keeps
-    /// running exactly as before but silently exits before writing anything,
-    /// which means every session's sidebar status indicator (the gold/red
-    /// dot) simply stops updating, with nothing in this app's own logs to
-    /// explain why.
+    /// iTerm2 and every other terminal), and it refuses to report anything
+    /// unless it sees a non-empty `AGENTS_APP` in its environment. If this
+    /// function ever loses that key — or stops being passed through to
+    /// `TerminalSurfaceOptions.envVars` — the hook keeps running exactly as
+    /// before but silently exits before connecting, which means every
+    /// session's sidebar status indicator (the gold/red dot) and every
+    /// restore banner simply stop working, with nothing in this app's own
+    /// logs to explain why.
     func testSessionEnvVarsStampsAGENTS_APP() {
         let value = TerminalCenter.sessionEnvVars(for: "some-session")["AGENTS_APP"]
         XCTAssertNotNil(
             value,
-            "TerminalCenter.sessionEnvVars is missing AGENTS_APP — hooks/agents-status.sh gates its entire OSC 777 status escape on that variable, so every session's sidebar status indicator would silently stop updating with no error to point at why"
+            "TerminalCenter.sessionEnvVars is missing AGENTS_APP — hooks/agents-status.sh gates everything it does on that variable, so every session's sidebar status indicator and restore banner would silently stop working with no error to point at why"
         )
         XCTAssertFalse(
             value?.isEmpty ?? true,
-            "TerminalCenter.sessionEnvVars sets AGENTS_APP to an empty string — the hook's guard treats an unset-or-empty value identically, so this would disable every session's sidebar status indicator just as completely as dropping the key entirely"
+            "TerminalCenter.sessionEnvVars sets AGENTS_APP to an empty string — the hook's guard treats an unset-or-empty value identically, so this would disable the hook just as completely as dropping the key entirely"
+        )
+    }
+
+    /// `AGENTS_PANE_ID` is how the hook names the pane it runs in when it
+    /// reports over the control socket. Every pane of a session shares the
+    /// session's socket and session id, so without it the app could tell
+    /// neither which pane's agent is blocked nor which pane's agent may
+    /// author the row's resume record — and the hook, finding it unset,
+    /// exits without reporting at all.
+    func testSessionEnvVarsStampsThePaneIDOnlyForPanes() {
+        let pane = UUID()
+        XCTAssertEqual(
+            TerminalCenter.sessionEnvVars(for: "row-uuid-123", paneID: pane)["AGENTS_PANE_ID"],
+            pane.uuidString
+        )
+        XCTAssertNil(
+            TerminalCenter.sessionEnvVars(for: "row-uuid-123")["AGENTS_PANE_ID"],
+            "a surface that is not a pane (an overlay) must not claim a pane id — a hook run inside it would otherwise report for a pane that isn't it"
         )
     }
 
