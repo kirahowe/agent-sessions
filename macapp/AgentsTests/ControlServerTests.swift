@@ -210,4 +210,119 @@ final class ControlServerTests: XCTestCase {
             .refuse("blank agent or agent_session_id")
         )
     }
+
+    // MARK: - End to end: the real hook, a real socket
+
+    /// The whole reporting path exactly as the hook drives it: the bundled
+    /// script, run the way Claude Code runs it, speaking `nc -U` to a real
+    /// `ControlServer` bound on a private path, landing on a
+    /// `TerminalCenter` pane. Every other test here pins one link; this one
+    /// proves the chain holds. A framing mismatch between the script's line
+    /// and the server's reader, a reply that never closes (the hook's `nc`
+    /// would sit on it until its timeout, stalling the agent), or a gap in
+    /// the closures `AgentsApp` wires would each pass the unit tests and
+    /// only show up as a dot that never lights or a banner that never
+    /// prints.
+    @MainActor
+    func testTheRealHookReportsOverTheSocketAndLandsOnItsPane() async throws {
+        let searchPath = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+        guard searchPath.split(separator: ":").contains(where: {
+            FileManager.default.isExecutableFile(atPath: "\($0)/jq")
+        }) else {
+            throw XCTSkip("jq is not installed, so the hook cannot run here")
+        }
+        let hook = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()  // AgentsTests
+            .deletingLastPathComponent()  // macapp
+            .deletingLastPathComponent()  // repo
+            .appendingPathComponent("hooks/agents-status.sh")
+
+        let center = TerminalCenter()
+        _ = center.terminalView(for: "row-1", workingDirectory: "/tmp", restoredResume: nil)
+        let pane = center.layouts["row-1"]!.initialPane
+        var signals: [(pane: UUID, signal: AttentionSignal)] = []
+        center.onSessionSignal = { _, pane, signal in signals.append((pane, signal)) }
+        var announced: [AgentSessionEvent] = []
+        center.onAgentSessionEvent = { _, event, _ in announced.append(event) }
+
+        let socketPath = FileManager.default.temporaryDirectory
+            .appendingPathComponent("agents-hook-test-\(getpid()).sock").path
+        let server = ControlServer(overlays: OverlayCenter(), socketPath: socketPath)
+        server.validateSession = { $0 == "row-1" }
+        server.applySessionEvent = { [center] event in center.handleControlSessionEvent(event) }
+        server.start()
+        defer { server.stop() }
+        for _ in 0..<100 where !FileManager.default.fileExists(atPath: socketPath) {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: socketPath), "the server never bound its socket")
+
+        let environment = [
+            "PATH": searchPath,
+            "AGENTS_APP": "1",
+            "AGENTS_CONTROL_SOCK": socketPath,
+            "AGENTS_SESSION_ID": "row-1",
+            "AGENTS_PANE_ID": pane.uuidString,
+            // Under xctest there is no `claude` ancestor to find; this is the
+            // hook's documented fallback for exactly that situation.
+            "CLAUDECODE": "1",
+        ]
+        let hookRun = try await Self.run(
+            "/bin/bash", [hook.path], environment: environment,
+            stdin: #"{"hook_event_name":"UserPromptSubmit","session_id":"abc-123","prompt":"Fix the parser"}"#
+        )
+        XCTAssertEqual(hookRun.status, 0, "hook exited \(hookRun.status): \(hookRun.output)")
+        XCTAssertEqual(signals.map(\.pane), [pane])
+        XCTAssertEqual(signals.map(\.signal), [.structured(.clear)])
+        XCTAssertEqual(
+            announced,
+            [AgentSessionEvent(agent: "claude", name: "UserPromptSubmit", sessionID: "abc-123", query: "Fix the parser")],
+            "the hook's UserPromptSubmit must arrive as one announcement carrying the harness, its session id, and the prompt preview"
+        )
+
+        // A refusal must be answered AND the connection closed, or the
+        // hook's nc hangs on it: drive nc directly to read the reply.
+        let refusal = try await Self.run(
+            "/usr/bin/nc", ["-U", "-w", "2", socketPath], environment: ["PATH": searchPath],
+            stdin: #"{"cmd":"session-event","session":"row-1","pane":"\#(UUID().uuidString)","event":"Stop","status":"clear"}"# + "\n"
+        )
+        XCTAssertTrue(
+            refusal.output.contains(#""ok":false"#) && refusal.output.contains("unknown pane"),
+            "a refusal must reach the caller as a JSON line naming the problem, got: \(refusal.output)"
+        )
+        XCTAssertEqual(signals.count, 1, "a refused event must apply nothing")
+
+        server.stop()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: socketPath), "stop() must remove the socket file")
+    }
+
+    private static func run(
+        _ executable: String, _ arguments: [String], environment: [String: String], stdin: String
+    ) async throws -> (status: Int32, output: String) {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: executable)
+        process.arguments = arguments
+        process.environment = environment
+        let input = Pipe()
+        let output = Pipe()
+        process.standardInput = input
+        process.standardOutput = output
+        process.standardError = output
+        // Never waitUntilExit() here: the server applies events on the main
+        // actor, and blocking the main thread would deadlock the very reply
+        // the hook's nc is waiting for.
+        return try await withCheckedThrowingContinuation { continuation in
+            process.terminationHandler = { process in
+                let data = output.fileHandleForReading.readDataToEndOfFile()
+                continuation.resume(returning: (process.terminationStatus, String(decoding: data, as: UTF8.self)))
+            }
+            do {
+                try process.run()
+                input.fileHandleForWriting.write(Data(stdin.utf8))
+                try input.fileHandleForWriting.close()
+            } catch {
+                continuation.resume(throwing: error)
+            }
+        }
+    }
 }

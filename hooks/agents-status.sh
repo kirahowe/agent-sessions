@@ -1,254 +1,149 @@
 #!/usr/bin/env bash
-# Tells the Agents app which sessions are waiting on the user, by writing an
-# OSC 777 desktop-notification escape to the session's pty. The app parses
-# these in SessionActivity.parseStatusMessage and shows a coloured dot on the
-# session's sidebar row.
+# Tells the Agents app what the agent hosting this hook is doing, over the
+# app's control socket: one line of JSON per hook event, carrying the two
+# facts the sidebar and the restore banner are built from.
+#
+#   status  — is the agent waiting on the user? Drives the coloured dot on
+#             the session's row (SessionAttention in the app):
+#               Stop / Notification(idle_prompt)   -> your-turn  (gold: finished, your move)
+#               Notification(permission_prompt)    -> blocked    (red: stuck waiting on you)
+#               PermissionRequest                  -> blocked    (Codex's spelling of the same)
+#               SessionStart / UserPromptSubmit /
+#               PreToolUse / PostToolUse           -> clear      (no dot: working)
+#             PreToolUse fires before the permission prompt and PostToolUse
+#             after the tool runs, so a tool-use event is what clears the
+#             red once the user unblocks the agent — approving a permission
+#             prompt is not a UserPromptSubmit, so nothing else would.
+#
+#   session — which harness this is ("claude" or "codex"), under which of
+#             its own session ids, plus a preview of the prompt when the
+#             event carries one (UserPromptSubmit). After the app restarts,
+#             this is what lets a restored row print
+#                 Resume this session with:
+#                 claude --resume <id>
+#             instead of a bare shell.
 #
 # Wired to Claude Code and Codex lifecycle hooks, which share an event
-# vocabulary and a JSON-on-stdin payload, so one script serves both:
-#   Stop / Notification(idle_prompt)   -> your-turn  (gold dot: finished, your move)
-#   Notification(permission_prompt)    -> blocked    (red dot: stuck waiting on you)
-#   PermissionRequest                  -> blocked    (Codex's spelling of the same)
-#   UserPromptSubmit / Pre+PostToolUse -> clear      (no dot: working)
-#   SessionStart                       -> clear      (and resets transition state)
+# vocabulary and a JSON-on-stdin payload, so one script serves both. The
+# harness is identified by walking up the process tree to the nearest
+# ancestor named "claude*" or "codex*", with $CLAUDECODE as a fallback; when
+# neither identifies one, the line carries status only.
 #
-# PreToolUse fires before the permission prompt and PostToolUse after the tool
-# runs, so resetting on tool use clears the red once the user unblocks the
-# agent — a permission approval is not a UserPromptSubmit, so nothing else
-# would clear it.
+# Wire format — see ControlServer.decide in the app for the contract:
+#   {"cmd":"session-event","session":$AGENTS_SESSION_ID,"pane":$AGENTS_PANE_ID,
+#    "event":<hook_event_name>,"status":"clear"|"your-turn"|"blocked",
+#    "agent":"claude"|"codex","agent_session_id":<session_id>,"prompt":<preview>}
+# status, agent/agent_session_id and prompt are each omitted when unknown.
+# The app answers {"ok":true} or {"ok":false,"error":...} and closes. The
+# reply is discarded here, but waiting for it is what makes the write
+# synchronous: the event is in the app before the agent's next step.
 #
-# A second, independent protocol rides the same OSC 777 channel under the
-# title "agents:session": it announces the session's identity so that after
-# the app (or the terminal) restarts, it can offer a "resume last session"
-# hint with the exact command to type. The body is a compact JSON object:
-#   {"event":<hook_event_name>,"v":1,"agent":"claude"|"codex","session_id":<sid>,"query":<prompt preview>}
-# "agent" comes from walking the same process tree used to find the pty (see
-# find_tty_and_agent) — the nearest ancestor named "claude*" or "codex*" wins,
-# with $CLAUDECODE as a fallback when no ancestor matches, and no announcement
-# at all when neither identifies a harness. "query" is only present when the
-# payload carries a string prompt (.prompt, or .query as a fallback field
-# name), truncated to its first 200 codepoints: most terminals silently drop
-# any OSC sequence over roughly 2048 bytes, and a raw prompt could easily blow
-# past that on its own, so the cap keeps the whole envelope comfortably inside
-# the limit no matter what the user typed.
+# Why a socket and not the terminal. Earlier versions wrote OSC 777
+# desktop-notification escapes to the session's pty and let the app's
+# terminal deliver them. Ghostty throttles those app-wide — one notification
+# per second across every surface, identical content suppressed for five
+# seconds — so the session announcement that followed a status escape by a
+# few microseconds was dropped every single time, and two agents reporting
+# within a second of each other lost one of the reports. Nothing here could
+# tell: the write to the pty had succeeded. A socket line is never
+# throttled, never deduplicated, needs no pty discovery (hooks run without a
+# controlling terminal), carries the prompt preview without the ~2 KB OSC
+# size limit, and gets an answer. The app still accepts the old OSC forms
+# from other emitters; this script no longer produces them.
 #
-# SessionStart and UserPromptSubmit always announce — SessionStart because
-# it's the natural place to (re)establish identity, UserPromptSubmit because
-# it's the only event carrying a prompt preview. Every other event announces
-# only the FIRST time it fires for a given session id, tracked with a marker
-# file next to the status state file: some real-world hook configs register
-# only a subset of events (PreToolUse/PostToolUse alone, say), so whichever
-# event happens to fire first for a session still has to be able to announce
-# it rather than assuming SessionStart or UserPromptSubmit already ran.
+# Every event is sent, unconditionally. The app deduplicates on its side —
+# a repeated status is a no-op in its reducer, an unchanged announcement
+# skips the save — so there is no state to keep here, and no way for a lost
+# event to be remembered as delivered.
 #
-# The hook is entirely OPTIONAL. Without it the app still lights up sessions
-# from ordinary OSC 9/777 desktop notifications, classified by keyword. What
-# the hook buys is fidelity: a session that speaks this protocol is trusted
-# over classification for the rest of its life, so its red pulse survives the
-# user selecting the session and only clears when the agent says so.
+# Gated on the environment the app stamps into every pane it spawns (see
+# TerminalCenter.sessionEnvVars): this hook is registered globally in the
+# user's Claude Code settings, so it also runs for sessions hosted in iTerm2
+# and every other terminal, where those variables are absent and there is
+# no app to talk to.
 #
-# Claude Code runs hooks WITHOUT a controlling terminal, so /dev/tty is
-# unusable. We discover the pty by walking up the process tree to the first
-# ancestor with a real tty, then write the escape there.
-#
-# Bash + jq rather than babashka (which the rest of this repo uses): hooks run
-# on every tool call, so process startup cost is paid constantly, and this
-# needs no jj/JSON-envelope machinery that would justify it.
-#
-# Gated on $AGENTS_APP: this hook is registered globally in the user's Claude
-# Code settings, so it also runs for sessions hosted in iTerm2 and every other
-# terminal, not just this app — see the guard below for why that matters.
+# Bash + jq rather than babashka (which the rest of this repo uses): hooks
+# run on every tool call, so process startup cost is paid constantly. `nc`
+# is macOS's own BSD netcat, which speaks AF_UNIX with -U.
 
+# Stdin is drained FIRST, before any early exit: Claude Code writes the hook
+# payload into this process's stdin, and exiting before reading it leaves
+# the parent writing into a pipe with no reader — an EPIPE on every tool
+# call in every terminal that isn't this app.
 input=$(cat)
 
-# Stdin is drained FIRST, above, and only then do we decide whether to bail:
-# Claude Code writes the hook payload into this process's stdin, so exiting
-# before reading it leaves the parent writing into a pipe with no reader. The
-# wasted `cat` on the (common) non-app path is far cheaper than risking an
-# EPIPE on every tool call in every terminal that isn't this app.
-#
-# This hook runs for every session regardless of which terminal is hosting it
-# — iTerm2, Terminal.app, a plain tmux pane, anything. $AGENTS_APP is stamped
-# into the environment of every surface this app spawns (see
-# TerminalCenter.sessionEnvVars), so its presence is how this script tells
-# "I'm running inside the Agents app" apart from "I'm running somewhere else
-# that merely also runs Claude Code." Without this guard, the OSC 777 escape
-# below would reach terminals that treat a desktop-notification escape as a
-# REAL system notification, popping one on every single tool call — a
-# notification storm, not a quiet sidebar dot.
-if [ -z "${AGENTS_APP:-}" ]; then
-    exit 0
-fi
+[ -n "${AGENTS_APP:-}" ] || exit 0
+sock="${AGENTS_CONTROL_SOCK:-}"
+session="${AGENTS_SESSION_ID:-}"
+pane="${AGENTS_PANE_ID:-}"
+{ [ -n "$sock" ] && [ -n "$session" ] && [ -n "$pane" ]; } || exit 0
+[ -S "$sock" ] || exit 0
 
 event=$(printf '%s' "$input" | jq -r '.hook_event_name // empty')
 ntype=$(printf '%s' "$input" | jq -r '.notification_type // empty')
 sid=$(printf '%s' "$input" | jq -r '.session_id // empty')
+[ -n "$event" ] || exit 0
 
-# Resolve the controlling terminal device of the hosting session, and along
-# the same walk, the harness (Claude Code or Codex) whose child we're running
-# as — needed for the session-announcement protocol above. Both facts come
-# from the same per-ancestor `ps` call, so one walk does double duty instead
-# of climbing the tree twice.
-#
-# Agent detection reads `ps -o comm=`, which on macOS prints the executable's
-# path (e.g. "/opt/homebrew/bin/claude"; a login shell prints "-/bin/zsh").
-# The basename is matched against "claude*"/"codex*", and the NEAREST
-# matching ancestor wins: the real chain runs
-#   bash(hook) -> /opt/homebrew/bin/claude -> -/bin/zsh -> /usr/bin/login -> Agents
-# so the harness itself is found long before the walk would otherwise reach
-# something unrelated further up.
-find_tty_and_agent() {
-    local pid=$$ t c base
+# The harness whose child we are. The NEAREST matching ancestor wins, so the
+# real chain — bash(hook) -> /opt/homebrew/bin/claude -> -/bin/zsh -> login
+# -> Agents — resolves at the second hop. `ps -o comm=` on macOS prints the
+# executable's path (a login shell prints "-/bin/zsh"); the basename is what
+# gets matched.
+AGENT=""
+find_agent() {
+    local pid=$$ c base
     for _ in 1 2 3 4 5 6 7 8; do
         { [ -z "$pid" ] || [ "$pid" = "0" ] || [ "$pid" = "1" ]; } && break
-        if [ -z "$DEV" ]; then
-            t=$(ps -o tty= -p "$pid" 2>/dev/null | tr -d ' ')
-            [ -n "$t" ] && [ "$t" != "??" ] && DEV="/dev/$t"
-        fi
-        if [ -z "$AGENT" ]; then
-            c=$(ps -o comm= -p "$pid" 2>/dev/null)
-            base=${c##*/}
-            case "$base" in
-                claude*) AGENT="claude" ;;
-                codex*)  AGENT="codex" ;;
-            esac
-        fi
-        [ -n "$DEV" ] && [ -n "$AGENT" ] && break
+        c=$(ps -o comm= -p "$pid" 2>/dev/null)
+        base=${c##*/}
+        case "$base" in
+            claude*) AGENT="claude"; return ;;
+            codex*)  AGENT="codex"; return ;;
+        esac
         pid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
     done
 }
-
-DEV=""
-AGENT=""
-find_tty_and_agent
-[ -n "$DEV" ] || exit 0
-[ -w "$DEV" ] || exit 0
-
-# Fallback when no ancestor matched a known harness: Claude Code stamps
-# CLAUDECODE=1 into every child's environment, so its presence is still good
-# evidence even when the walk above came up empty (Codex has no equivalent
-# marker, so there is nothing symmetric to check for it). If neither the walk
-# nor this variable identifies a harness, the session announcement below is
-# skipped outright rather than guessed at.
+find_agent
+# Claude Code stamps CLAUDECODE=1 into every child's environment, so its
+# presence is still good evidence when the walk came up empty (Codex has no
+# equivalent marker). With neither, the line goes out without a session.
 if [ -z "$AGENT" ] && [ -n "${CLAUDECODE:-}" ]; then
     AGENT="claude"
 fi
 
-# Where the last emitted state is remembered, so only transitions go out (see
-# emit_status below). Keyed on the agent's own session id, which both Claude
-# Code and Codex put in the hook payload; the pty device name is the fallback
-# for any agent that doesn't. That fallback is the weaker of the two — ptys get
-# recycled — which is why SessionStart resets the file below.
-STATE_DIR="${TMPDIR:-/tmp}/agents-status"
-STATE_FILE="$STATE_DIR/${sid:-${DEV##*/}}"
-
-# Marker for the session-announcement protocol's first-sighting rule (see
-# header). Unlike STATE_FILE this has no pty-name fallback — announcement is
-# skipped entirely when sid is empty, so the key only ever needs to be a
-# session id.
-SESSION_MARKER="$STATE_DIR/${sid}.session"
-
-# OSC 777: ESC ] 777 ; notify ; <title> ; <body> BEL. The "agents:status"
-# title is the magic the app matches on, so a genuine desktop notification
-# from anything else running in this shell is never read as a status update.
-#
-# Only state TRANSITIONS are emitted. This hook runs on every single tool
-# call, and the old unconditional emit meant a long agent turn wrote hundreds
-# of identical "clear" escapes down the pty. Ghostty rate-limits desktop
-# notifications to about one a second and suppresses identical content anyway,
-# so most of those were being dropped before they ever reached the app — the
-# repeats bought nothing and were never the mechanism keeping the indicator
-# correct.
-#
-# The emit happens BEFORE the state file is written, deliberately: if the
-# write to the pty fails, nothing is recorded and the next event retries,
-# rather than the script convincing itself it already sent a state the app
-# never saw.
-emit_status() {
-    [ "$(cat "$STATE_FILE" 2>/dev/null)" = "$1" ] && return 0
-    printf '\033]777;notify;agents:status;%s\a' "$1" > "$DEV" 2>/dev/null || return 0
-    mkdir -p "$STATE_DIR" 2>/dev/null && printf '%s' "$1" > "$STATE_FILE" 2>/dev/null
-}
-
-# OSC 777 title "agents:session": see the header for the wire format. Same
-# escape mechanism as emit_status above, different title, so a client can
-# subscribe to either without needing to parse the other's payload.
-#
-# `jq -ac`: `-c` keeps the body one line, so a newline embedded in a user
-# prompt can never be mistaken for the BEL that terminates the OSC sequence;
-# `-a` guarantees no raw multibyte or control byte reaches the pty inside the
-# escape, since jq \u-escapes them instead. The query, when present, is
-# sliced to its first 200 codepoints for the size reason given in the header.
-#
-# Like emit_status, the marker file is written only AFTER the escape write
-# succeeds — a failed write must not be recorded as sent, or a later event
-# would wrongly believe this session was already announced.
-emit_session() {
-    local body
-    body=$(printf '%s' "$input" | jq -ac \
-        --arg event "$event" \
-        --arg agent "$AGENT" \
-        --arg sid "$sid" \
-        '
-        (if (.prompt | type) == "string" then .prompt
-         elif (.query | type) == "string" then .query
-         else null end) as $q
-        | {event: $event, v: 1, agent: $agent, session_id: $sid}
-        + (if $q != null then {query: $q[0:200]} else {} end)
-        ' 2>/dev/null) || return 0
-    [ -n "$body" ] || return 0
-    printf '\033]777;notify;agents:session;%s\a' "$body" > "$DEV" 2>/dev/null || return 0
-    mkdir -p "$STATE_DIR" 2>/dev/null && printf 'sent' > "$SESSION_MARKER" 2>/dev/null
-}
-
+status=""
 case "$event" in
-    # Resets the remembered state before emitting, so a fresh session always
-    # gets one real escape out even if a stale file is sitting on its key —
-    # which is what keeps the pty-name fallback above honest across a recycled
-    # pty. Nothing is showing at session start anyway, so the emit costs
-    # nothing and leaves both sides provably agreeing from the first event.
-    SessionStart)
-        rm -f "$STATE_FILE" 2>/dev/null
-        emit_status clear
-        ;;
-    UserPromptSubmit|PreToolUse|PostToolUse)
-        emit_status clear
-        ;;
-    Stop)
-        emit_status your-turn
-        ;;
-    # Codex's equivalent of Claude Code's Notification(permission_prompt): a
-    # first-class event rather than a subtype, and the only place Codex
-    # reports being blocked at all.
-    PermissionRequest)
-        emit_status blocked
-        ;;
+    SessionStart|UserPromptSubmit|PreToolUse|PostToolUse) status="clear" ;;
+    Stop)              status="your-turn" ;;
+    PermissionRequest) status="blocked" ;;
     Notification)
         case "$ntype" in
-            permission_prompt) emit_status blocked ;;
-            idle_prompt)       emit_status your-turn ;;
+            permission_prompt) status="blocked" ;;
+            idle_prompt)       status="your-turn" ;;
         esac
         ;;
 esac
 
-# Session announcement runs independently of the status case above — for
-# every event, not just the ones status cares about — because whichever event
-# fires FIRST for a session is the one responsible for announcing it (see
-# header for why that has to be event-agnostic). Skipped outright when there
-# is no session id to key on, or no harness was identified.
-if [ -n "$sid" ] && [ -n "$AGENT" ]; then
-    case "$event" in
-        SessionStart)
-            rm -f "$SESSION_MARKER" 2>/dev/null
-            emit_session
-            ;;
-        UserPromptSubmit)
-            emit_session
-            ;;
-        *)
-            [ -f "$SESSION_MARKER" ] || emit_session
-            ;;
-    esac
-fi
+# `-c` keeps the whole request on one line, which is the framing the app's
+# reader expects. The prompt (.prompt, or .query as a fallback field name)
+# is sliced to its first 200 codepoints: the app caps it there anyway, and a
+# pasted novel has no business in a banner heading.
+body=$(printf '%s' "$input" | jq -c \
+    --arg session "$session" --arg pane "$pane" --arg event "$event" \
+    --arg status "$status" --arg agent "$AGENT" --arg sid "$sid" '
+    {cmd: "session-event", session: $session, pane: $pane, event: $event}
+    + (if $status != "" then {status: $status} else {} end)
+    + (if $agent != "" and $sid != "" then {agent: $agent, agent_session_id: $sid} else {} end)
+    + ((if (.prompt | type) == "string" then .prompt
+        elif (.query | type) == "string" then .query
+        else null end) as $q
+       | if $q != null then {prompt: $q[0:200]} else {} end)
+    ' 2>/dev/null) || exit 0
+[ -n "$body" ] || exit 0
+
+# -w 2: give up after two idle seconds rather than stall the agent behind an
+# app that stopped answering. The reply is not needed here; the connection
+# staying open until the app has applied the event is.
+printf '%s\n' "$body" | nc -U -w 2 "$sock" >/dev/null 2>&1
 
 exit 0

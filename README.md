@@ -115,8 +115,8 @@ How the app learns the session id depends on the harness:
 
 Claude Code and Codex announce their session through the same hook that
 reports status (see "With the hook, for real agent state"). The hook
-announces the session from whichever registered event fires first, so even a
-partial registration works — but the prompt preview comes only from
+announces the session on every registered event, so even a partial
+registration works — but the prompt preview comes only from
 `UserPromptSubmit`, and a session that never calls a tool is only announced by
 `SessionStart`, so register both if you want the hint to be reliable.
 
@@ -178,8 +178,8 @@ Selecting a session clears an indicator raised this way. Without a hook,
 ### With the hook, for real agent state
 
 `hooks/agents-status.sh` reports the agent's actual state instead of guessing
-at it, by writing an OSC 777 escape to the session's pty. It's optional, and
-it needs `jq`.
+at it, by sending one line per hook event to the app's control socket. It's
+optional, and it needs `jq` (and `nc`, which macOS ships).
 
 What it buys is trust. A session that speaks this protocol is believed over
 keyword classification for the rest of its life, so its red pulse **survives
@@ -187,18 +187,22 @@ you selecting the session** and clears only when the agent says it's
 unblocked — rather than going dark the moment you glance at a session that is
 still, in fact, stuck.
 
-The script only emits when `AGENTS_APP` is set in its environment, which this
-app stamps into every terminal it spawns. That makes it safe to register
-globally, as below: in iTerm2, Terminal.app, or any other host, the hook sees
-no `AGENTS_APP` and exits without writing anything — which matters, because a
-terminal that renders OSC 777 as a real desktop notification would otherwise
-pop one for real.
+The script only speaks when it finds the app's environment — `AGENTS_APP`,
+`AGENTS_CONTROL_SOCK`, `AGENTS_SESSION_ID`, and `AGENTS_PANE_ID`, which this
+app stamps into every pane it spawns. That makes it safe to register
+globally, as below: in iTerm2, Terminal.app, or any other host, the hook
+finds none of them and exits without doing anything.
 
-It also emits only when the state actually changes, so a long agent turn
-writes nothing down the pty after the first escape.
+It talks to the app directly rather than through the terminal, for a reason
+worth knowing if you ever write your own: Ghostty throttles desktop
+notifications app-wide — one per second, with identical content suppressed
+for five — so a hook that writes OSC escapes to the pty loses any report
+landing within a second of another one, and cannot tell, because the write
+succeeded. The app still understands the `agents:status` and `agents:session`
+OSC forms from other emitters; the bundled hook no longer uses them.
 
-The same script also announces the agent's session id — and, on each prompt,
-a short preview of what you asked — so the app can print the resume hint
+The same line also announces the agent's session id — and, on each prompt, a
+short preview of what you asked — so the app can print the resume hint
 described in "Resuming agent sessions after a restart". It tells Claude Code
 and Codex apart by looking at the process that invoked it, so nothing needs
 configuring per harness.
@@ -246,10 +250,8 @@ rather than replacing it:
 `Stop` and `Notification` raise the indicator; the rest clear it.
 `PreToolUse`/`PostToolUse` are what clear the red after you approve a
 permission prompt — approving isn't a `UserPromptSubmit`, so nothing else
-would. `SessionStart` resyncs a fresh session so the first real event is
-guaranteed to be sent, and together with `UserPromptSubmit` it is what makes
-the resume hint reliable: the session is announced from whichever event fires
-first, but only `UserPromptSubmit` carries the prompt preview, and only
+would. `SessionStart` and `UserPromptSubmit` are what make the resume hint
+reliable: only `UserPromptSubmit` carries the prompt preview, and only
 `SessionStart` catches a session that never calls a tool.
 
 #### Codex
