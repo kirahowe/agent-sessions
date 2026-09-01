@@ -232,14 +232,15 @@ final class SessionResumeTests: XCTestCase {
 
     // MARK: - resumeHintCommand
 
-    func testResumeHintForClaudeUsesPromptFallbackAndExactResumeCommand() {
+    func testResumeHintForClaudeUsesPromptFallbackAndClaudesOwnExitText() {
         let metadata = SessionResumeMetadata(agent: "claude", sessionID: "session-123", title: nil, prompt: "Repair persistence")
 
         let command = SessionResumeMetadata.resumeHintCommand(for: metadata)
 
         XCTAssertEqual(
             command,
-            "printf '%s\\n' 'Last Claude Code session: Repair persistence' 'Resume last session: claude --resume session-123'\n"
+            "printf '%s\\n' 'Last Claude Code session: Repair persistence' 'Resume this session with:' 'claude --resume session-123'\n",
+            "the banner must read like the message Claude Code prints on exit — a heading, then 'Resume this session with:' and the bare command on its own line — so what greets the user after a relaunch is the text they saw when the agent quit"
         )
         XCTAssertTrue(command.hasSuffix("\n"))
     }
@@ -249,7 +250,7 @@ final class SessionResumeTests: XCTestCase {
 
         let command = SessionResumeMetadata.resumeHintCommand(for: metadata)
 
-        XCTAssertTrue(command.contains("'Resume last session: codex resume session-123'"))
+        XCTAssertTrue(command.contains("'Resume this session with:' 'codex resume session-123'"))
     }
 
     func testResumeHintForOmpUsesOmpResumeSyntax() {
@@ -257,7 +258,7 @@ final class SessionResumeTests: XCTestCase {
 
         let command = SessionResumeMetadata.resumeHintCommand(for: metadata)
 
-        XCTAssertTrue(command.contains("'Resume last session: omp --resume session-123'"))
+        XCTAssertTrue(command.contains("'Resume this session with:' 'omp --resume session-123'"))
     }
 
     func testResumeHintForUnknownAgentFallsBackToSessionIDWithNoResumeLine() {
@@ -268,7 +269,7 @@ final class SessionResumeTests: XCTestCase {
         XCTAssertTrue(command.contains("'Last gemini session: T'"))
         XCTAssertTrue(command.contains("'Session id: id-1'"))
         XCTAssertFalse(
-            command.contains("Resume last session"),
+            command.contains("Resume this session"),
             "an agent with no known resume command must not print a resume instruction it can't back up — printing a raw session id is the honest fallback"
         )
     }
@@ -285,49 +286,68 @@ final class SessionResumeTests: XCTestCase {
         XCTAssertFalse(command.contains("session: '"))
     }
 
-    func testPromptLineAppearsOnlyWhenPromptDiffersFromHeading() {
-        let sameAsTitle = SessionResumeMetadata(agent: "claude", sessionID: "s-1", title: "Fix it", prompt: "Fix it")
-        let differentFromTitle = SessionResumeMetadata(agent: "claude", sessionID: "s-1", title: "Fix it", prompt: "Original ask")
+    func testTitleWinsOverPromptAndThePromptNeverGetsItsOwnLine() {
+        let titled = SessionResumeMetadata(agent: "claude", sessionID: "s-1", title: "Fix it", prompt: "Original ask")
 
+        let command = SessionResumeMetadata.resumeHintCommand(for: titled)
+
+        XCTAssertTrue(command.contains("'Last Claude Code session: Fix it'"))
         XCTAssertFalse(
-            SessionResumeMetadata.resumeHintCommand(for: sameAsTitle).contains("Prompt:"),
-            "repeating the same text on both the heading and a Prompt line beneath it is pure noise"
+            command.contains("Original ask"),
+            "the prompt is only ever the heading's fallback for an untitled session — printing it beneath a real title would repeat what the title says and push Claude's two-line resume text further from the prompt"
         )
-        XCTAssertTrue(SessionResumeMetadata.resumeHintCommand(for: differentFromTitle).contains("'Prompt: Original ask'"))
+        XCTAssertFalse(command.contains("Prompt:"))
     }
 
-    func testResumeHintQuotesTitlePromptAndSessionIDWithoutExecutingThem() {
+    func testResumeHintQuotesTitleAndSessionIDWithoutExecutingThem() {
         let metadata = SessionResumeMetadata(
             agent: "omp",
             sessionID: "id'; touch /tmp/nope; echo '",
             title: "Kira's run",
-            prompt: "Don't auto-run"
+            prompt: nil
         )
 
         let command = SessionResumeMetadata.resumeHintCommand(for: metadata)
 
         XCTAssertEqual(command.filter { $0 == "\n" }.count, 1, "the whole hint must be one printf invocation terminated by exactly one trailing newline, or a maliciously-crafted title/prompt could inject extra shell lines")
         XCTAssertTrue(command.contains("'Last OMP session: Kira'\"'\"'s run'"))
-        XCTAssertTrue(command.contains("'Prompt: Don'\"'\"'t auto-run'"))
-        XCTAssertTrue(command.contains("'Resume last session: omp --resume id'\"'\"'; touch /tmp/nope; echo '\"'\"''"))
+        XCTAssertTrue(
+            command.contains("'omp --resume id'\"'\"'; touch /tmp/nope; echo '\"'\"''"),
+            "the command line is printed, never run: a session id carrying shell metacharacters must arrive as one quoted printf argument"
+        )
         XCTAssertFalse(command.contains("\nomp --resume"))
     }
 
-    func testResumeHintCollapsesNewlinesAndStripsTerminalControls() {
-        let metadata = SessionResumeMetadata(
-            agent: "claude",
-            sessionID: "session-123",
-            title: "Line one\n\tLine two\u{001B}\u{0007}",
-            prompt: "Prompt\r\nnext\u{0003}"
-        )
+    func testResumeHintQuotesThePromptFallbackHeadingToo() {
+        let metadata = SessionResumeMetadata(agent: "claude", sessionID: "s-1", title: nil, prompt: "Don't auto-run")
 
         let command = SessionResumeMetadata.resumeHintCommand(for: metadata)
 
-        XCTAssertEqual(command.filter { $0 == "\n" }.count, 1)
-        XCTAssertTrue(command.contains("'Last Claude Code session: Line one Line two'"))
-        XCTAssertTrue(command.contains("'Prompt: Prompt next'"))
-        XCTAssertFalse(command.contains("\u{001B}"))
-        XCTAssertFalse(command.contains("\u{0007}"))
-        XCTAssertFalse(command.contains("\u{0003}"))
+        XCTAssertTrue(command.contains("'Last Claude Code session: Don'\"'\"'t auto-run'"))
+    }
+
+    func testResumeHintCollapsesNewlinesAndStripsTerminalControls() {
+        let titled = SessionResumeMetadata(
+            agent: "claude",
+            sessionID: "session-123",
+            title: "Line one\n\tLine two\u{001B}\u{0007}",
+            prompt: nil
+        )
+        let untitled = SessionResumeMetadata(
+            agent: "claude",
+            sessionID: "session-123",
+            title: nil,
+            prompt: "Prompt\r\nnext\u{0003}"
+        )
+
+        for metadata in [titled, untitled] {
+            let command = SessionResumeMetadata.resumeHintCommand(for: metadata)
+            XCTAssertEqual(command.filter { $0 == "\n" }.count, 1)
+            XCTAssertFalse(command.contains("\u{001B}"))
+            XCTAssertFalse(command.contains("\u{0007}"))
+            XCTAssertFalse(command.contains("\u{0003}"))
+        }
+        XCTAssertTrue(SessionResumeMetadata.resumeHintCommand(for: titled).contains("'Last Claude Code session: Line one Line two'"))
+        XCTAssertTrue(SessionResumeMetadata.resumeHintCommand(for: untitled).contains("'Last Claude Code session: Prompt next'"))
     }
 }

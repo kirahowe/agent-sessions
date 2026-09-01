@@ -228,7 +228,7 @@ final class TerminalCenterTests: XCTestCase {
 
         XCTAssertEqual(
             deliveredTexts,
-            ["printf '%s\\n' 'Last OMP session: Repair recreation' 'Resume last session: omp --resume omp-recreated'\n"]
+            ["printf '%s\\n' 'Last OMP session: Repair recreation' 'Resume this session with:' 'omp --resume omp-recreated'\n"]
         )
         XCTAssertEqual(deliveryProxies.count, 1)
         XCTAssertTrue(deliveryProxies[0] === recreatedProxy)

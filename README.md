@@ -93,12 +93,13 @@ recoverable by hand.
 The app remembers the last agent session associated with each terminal,
 whichever harness it was running. After relaunching Agents, opening a
 restored terminal starts a fresh shell and prints the remembered session
-title, an optional prompt preview, and the resume command for that harness:
+title (or, for a session that never titled itself, your last prompt) followed
+by the same resume text the harness printed when it quit:
 
 ```text
 Last Claude Code session: Make the resume hint harness agnostic
-Prompt: I want the terminal to print a resume command on boot
-Resume last session: claude --resume 01a03bbc-0713-729c-a74b-b66f49ddeddd
+Resume this session with:
+claude --resume 01a03bbc-0713-729c-a74b-b66f49ddeddd
 ```
 
 Agents never runs that command automatically. Resuming can rebuild provider

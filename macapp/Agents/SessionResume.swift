@@ -133,6 +133,17 @@ extension SessionResumeMetadata {
         }
     }
 
+    /// The shell command that prints the restore banner into a fresh pane.
+    /// Shaped after the message Claude Code itself prints when it quits —
+    ///
+    ///     Resume this session with:
+    ///     claude --resume <id>
+    ///
+    /// — under one heading naming the harness and the remembered title, so
+    /// the text that greets the user after a relaunch is the text they saw
+    /// when the agent exited. A session that never titled itself falls
+    /// back to its last prompt for the heading; the prompt is never printed
+    /// on a line of its own.
     static func resumeHintCommand(for metadata: SessionResumeMetadata) -> String {
         let name = displayName(agent: metadata.agent)
         let headingSource = metadata.title ?? metadata.prompt
@@ -140,15 +151,9 @@ extension SessionResumeMetadata {
 
         var lines = [heading.map { "Last \(name) session: \($0)" } ?? "Last \(name) session"]
 
-        if let prompt = metadata.prompt {
-            let sanitizedPrompt = terminalSafeSingleLine(prompt)
-            if sanitizedPrompt != heading {
-                lines.append("Prompt: \(sanitizedPrompt)")
-            }
-        }
-
         if let command = resumeCommand(for: metadata) {
-            lines.append("Resume last session: \(command)")
+            lines.append("Resume this session with:")
+            lines.append(command)
         } else {
             lines.append("Session id: \(terminalSafeSingleLine(metadata.sessionID))")
         }
