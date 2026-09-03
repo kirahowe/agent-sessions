@@ -129,10 +129,32 @@ registration works — but the prompt preview comes only from
 `UserPromptSubmit`, and a session that never calls a tool is only announced by
 `SessionStart`, so register both if you want the banner to be reliable.
 
+A harness running inside another harness's terminal — `codex exec` launched
+from a Claude Code session to review its work, say — is not announced. The
+terminal belongs to the outer agent, and the inner one's short-lived session
+is not what you want back after a relaunch.
+
 OMP needs no hook: terminals spawned by Agents opt into OMP's built-in
 CLI-agent protocol, and the app persists what OMP reports. Only OMP's default
 profile is covered — named profiles are not part of that protocol yet, so the
 app cannot construct a profile-qualified resume command for them.
+
+### When no banner appears
+
+The hook and the app are versioned together: the hook talks to the app over
+its control socket in a form the app has to understand, so after pulling
+this repository the installed app must be at least as new as the hook
+(**Agents ▸ Check for Updates…**). The hook writes one line to
+`~/Library/Logs/Agents/hook.log` whenever something is wrong — a pane spawned
+by an older app, a refusal, no answer — and nothing when all is well. So an
+empty log beside a missing banner means the hook never ran (check the
+`hooks` entries in your harness settings), while a log full of
+`no AGENTS_PANE_ID` means the app is older than the hook. The app itself logs
+`Agents: session … is now resumable as …` when it records a session and
+`typed restore banner` when it prints one; both are visible in Console.app
+or with `log show --predicate 'process == "Agents"' --last 1h`. Setting
+`AGENTS_HOOK_DEBUG=1` in the harness's environment logs every hook decision,
+including the sessions it declined to announce.
 
 ## Agent dashboard
 
@@ -211,10 +233,10 @@ succeeded. The app still understands the `agents:status` and `agents:session`
 OSC forms from other emitters; the bundled hook no longer uses them.
 
 The same line also announces the agent's session id — and, on each prompt, a
-short preview of what you asked — so the app can print the resume hint
-described in "Resuming agent sessions after a restart". It tells Claude Code
-and Codex apart by looking at the process that invoked it, so nothing needs
-configuring per harness.
+short preview of what you asked, and the configuration home the harness runs
+under — so the app can print the restore banner described in "Resuming agent
+sessions after a restart". It tells Claude Code and Codex apart by looking at
+the process that invoked it, so nothing needs configuring per harness.
 
 #### Claude Code
 
@@ -328,6 +350,11 @@ Two differences from Claude Code. Codex has no `Notification` event —
 And Codex requires you to explicitly trust a hook before it will run one; run
 `/hooks` inside Codex to review and approve it. If you script the edit, write
 `hooks.json` in place, for the same reason as above.
+
+If you run Codex through a wrapper that sets `CODEX_HOME` — a shell function
+such as `cdk () { CODEX_HOME=~/.codex-kira codex "$@"; }` — the hook file
+belongs under that home, and the restore banner's command will carry the
+same `CODEX_HOME=…` prefix, since that is where those sessions live.
 
 The script exits 0 and stays silent on anything it doesn't recognise, so it
 is harmless in terminals other than this app, and under agents that send it
