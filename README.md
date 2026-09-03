@@ -254,6 +254,34 @@ would. `SessionStart` and `UserPromptSubmit` are what make the resume hint
 reliable: only `UserPromptSubmit` carries the prompt preview, and only
 `SessionStart` catches a session that never calls a tool.
 
+If you script this rather than editing by hand — an agent wiring itself up,
+say — merge into the existing file and write the result **in place**.
+`settings.json` is often a symlink into a dotfiles repo, and
+`jq … > tmp && mv tmp settings.json` silently swaps the link for a plain
+copy that the repo never sees again. This merges the hook into all six
+events, is safe to re-run, and writes through the link:
+
+```sh
+f="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json"
+cmd=/path/to/agents/hooks/agents-status.sh
+[ -f "$f" ] || echo '{}' > "$f"
+jq --arg cmd "$cmd" '
+  def ensure($ev; $new):
+    .hooks[$ev] |= (
+      . // [] |
+      if any(.[]; (.hooks // []) | any((.command // "") | contains($cmd))) then .
+      elif length > 0 then .[0].hooks += [{type: "command", command: $cmd}]
+      else [$new + {hooks: [{type: "command", command: $cmd}]}]
+      end);
+  ensure("SessionStart"; {}) | ensure("Stop"; {}) | ensure("Notification"; {})
+  | ensure("UserPromptSubmit"; {}) | ensure("PreToolUse"; {matcher: "*"})
+  | ensure("PostToolUse"; {matcher: "*"})
+' "$f" > "$f.new" && cat "$f.new" > "$f" && rm "$f.new"
+```
+
+Where an event already has a hook group the command joins that group and
+inherits its matcher; events with no group get the shapes shown above.
+
 #### Codex
 
 Codex CLI's lifecycle hooks share the event vocabulary and the JSON-on-stdin
@@ -289,7 +317,8 @@ default — and takes the same shape:
 Two differences from Claude Code. Codex has no `Notification` event —
 `PermissionRequest` is a first-class event and is what raises the red pulse.
 And Codex requires you to explicitly trust a hook before it will run one; run
-`/hooks` inside Codex to review and approve it.
+`/hooks` inside Codex to review and approve it. If you script the edit, write
+`hooks.json` in place, for the same reason as above.
 
 The script exits 0 and stays silent on anything it doesn't recognise, so it
 is harmless in terminals other than this app, and under agents that send it
