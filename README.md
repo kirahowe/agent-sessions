@@ -27,6 +27,32 @@ The generated `macapp/Agents.xcodeproj` and build output under `macapp/.build`
 are gitignored — `bb gen` regenerates the project from `macapp/project.yml`
 whenever you need it.
 
+## Releases
+
+There is one release channel: a rolling `nightly` prerelease on GitHub,
+which the Nightly workflow (`.github/workflows/nightly.yml`) rebuilds from
+`main` every morning at 09:00 UTC, skipping the run when nothing has
+changed. The same workflow regenerates the signed Sparkle appcast attached
+to that release, and that appcast is what **Agents ▸ Check for Updates…**
+reads — so publishing a release and making it available to the updater are
+one act.
+
+To publish `main` now rather than waiting for the schedule:
+
+```sh
+bb publish
+```
+
+This dispatches the workflow for `main`, watches the run to completion, and
+prints the resulting release. It refuses if the local `main` bookmark is not
+what GitHub has, so an unpushed fix cannot be silently left out, and it does
+nothing (successfully) when the current nightly is already built from
+`main`. It needs the `gh` CLI, logged in with write access to the
+repository. The build happens on GitHub rather than on the machine running
+the task on purpose: the runner pins the SDK the app is compiled against,
+and the appcast is signed with a key that exists only in the repository's
+secrets.
+
 ## Workspaces
 
 A workspace is an isolated draft of a project: agents read, write, and run

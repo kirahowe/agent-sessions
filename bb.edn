@@ -35,4 +35,12 @@
             :task (shell "bb" "cli/test_agents_cli.clj")}
 
   icon {:doc "Render the app icon PNGs into the asset catalog"
-        :task (shell "swift" "design/icon/RenderAppIcon.swift")}}}
+        :task (shell "swift" "design/icon/RenderAppIcon.swift")}
+
+  ;; Releases are built and published by the Nightly workflow on GitHub,
+  ;; never locally: the runner pins the SDK the app compiles against, and
+  ;; the Sparkle appcast is signed with a key that lives only in the
+  ;; repository secrets. This task dispatches that workflow for main and
+  ;; watches the run — the sequence that used to be done by hand.
+  publish {:doc "Publish GitHub main as the rolling nightly release the in-app updater serves"
+           :task (shell "bb" "scripts/publish.clj")}}}
