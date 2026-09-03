@@ -76,6 +76,28 @@ final class ControlServerTests: XCTestCase {
 
     // MARK: - session-event
 
+    @MainActor
+    func testTheAppAnswersAnAppliedEventWithSuccessNotTheShutdownFallback() {
+        let center = TerminalCenter()
+        _ = center.terminalView(for: "row-1", workingDirectory: "/tmp", restoredResume: nil)
+        let pane = center.layouts["row-1"]!.initialPane
+        let event = ControlSessionEvent(session: "row-1", pane: pane, status: .clear, event: nil)
+
+        XCTAssertNil(
+            AgentsApp.applySessionEvent(event, to: center),
+            "an applied event must be answered ok — the one-liner this replaced turned the center's nil-for-success into the shutdown refusal, so the hook's log called every good report a failure"
+        )
+        XCTAssertEqual(
+            AgentsApp.applySessionEvent(event, to: nil), "app is shutting down"
+        )
+        XCTAssertNotNil(
+            AgentsApp.applySessionEvent(
+                ControlSessionEvent(session: "row-1", pane: UUID(), status: .clear, event: nil), to: center
+            ),
+            "a genuine refusal must still come through"
+        )
+    }
+
     /// The hook's wire form (see hooks/agents-status.sh). Every field the
     /// hook can send, in the exact spelling it sends it.
     private let pane = "7F4B1B6E-9E1E-4B7D-9C1A-1F2E3D4C5B6A"

@@ -51,6 +51,19 @@ struct AgentsApp: App {
             || env["XCTestSessionIdentifier"] != nil
     }()
 
+    /// What the control server answers the hook for one session event: nil
+    /// for applied, else the refusal. Written out as a function rather than
+    /// the one-liner it replaced — `center?.handle…(event) ?? "…"` — because
+    /// optional chaining flattens the method's own `String?`, where nil means
+    /// SUCCESS, into the same nil as a gone center, so that fallback reported
+    /// every applied event as "app is shutting down". Nothing read the reply
+    /// then; the hook's log does now.
+    @MainActor
+    static func applySessionEvent(_ event: ControlSessionEvent, to center: TerminalCenter?) -> String? {
+        guard let center else { return "app is shutting down" }
+        return center.handleControlSessionEvent(event)
+    }
+
     init() {
         let center = TerminalCenter()
         self.center = center
@@ -99,7 +112,7 @@ struct AgentsApp: App {
         // report racing app construction is refused outright rather than
         // half-applied, and the hook's next event carries the same facts.
         controlServer.applySessionEvent = { [weak center] event in
-            center?.handleControlSessionEvent(event) ?? "app is shutting down"
+            Self.applySessionEvent(event, to: center)
         }
 
         // Every session-teardown path (close, project removal, workspace
