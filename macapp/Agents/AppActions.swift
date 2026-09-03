@@ -153,6 +153,14 @@ final class AppActions {
             }
             return true
 
+        case .archiveProject:
+            // Resolved exactly like .removeProject, but with no dialog: an
+            // archive is undone in one click from the sidebar's Archived
+            // section, so there is nothing to confirm.
+            guard let project = resolveProject() else { return false }
+            store.archiveProject(project)
+            return true
+
         case .removeProject:
             let project = resolveProject()
             guard let project else { return false }

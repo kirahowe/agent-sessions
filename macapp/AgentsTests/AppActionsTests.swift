@@ -688,4 +688,41 @@ final class AppActionsTests: XCTestCase {
         XCTAssertFalse(actions.perform(.closePane))
         XCTAssertFalse(actions.perform(.focusPaneDown))
     }
+
+    // MARK: - 14: .archiveProject
+
+    func test14a_archiveProjectFalseWhenAmbiguous() {
+        let (store, _, _) = TestSupport.makeStore()
+        let actions = makeActions(store: store)
+        store.addProject(path: "/tmp/proj-A")
+        store.addProject(path: "/tmp/proj-B")
+        store.selection = nil
+
+        XCTAssertFalse(actions.perform(.archiveProject))
+        XCTAssertTrue(store.archivedProjects.isEmpty)
+    }
+
+    func test14b_archiveProjectArchivesTheSelectedSessionsProjectWithoutADialog() {
+        let (store, _, _) = TestSupport.makeStore()
+        let dialogs = FakeDialogs()
+        let actions = makeActions(store: store, dialogs: dialogs)
+        store.addProject(path: "/tmp/proj-A")
+        store.addProject(path: "/tmp/proj-B") // selection now in B
+
+        XCTAssertTrue(actions.perform(.archiveProject))
+
+        XCTAssertEqual(store.archivedProjects.map(\.path), ["/tmp/proj-B"])
+        XCTAssertEqual(store.projects.map(\.path), ["/tmp/proj-A"])
+        XCTAssertTrue(dialogs.confirmRemoveCalls.isEmpty, "archiving is reversible and asks nothing")
+    }
+
+    func test14c_archiveProjectFallsBackToTheSoleProject() {
+        let (store, _, _) = TestSupport.makeStore()
+        let actions = makeActions(store: store)
+        store.addProject(path: "/tmp/proj-A")
+        store.selection = nil
+
+        XCTAssertTrue(actions.perform(.archiveProject))
+        XCTAssertEqual(store.archivedProjects.map(\.path), ["/tmp/proj-A"])
+    }
 }

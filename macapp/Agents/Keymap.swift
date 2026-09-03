@@ -11,6 +11,7 @@ enum AppAction: Hashable {
     case renameSession
     case closeWindow
     case addProject
+    case archiveProject
     case removeProject
     case previousSession
     case nextSession
@@ -34,7 +35,7 @@ extension AppAction: CaseIterable {
     /// simple cases.
     static var allCases: [AppAction] {
         [
-            .newSession, .closeSession, .renameSession, .closeWindow, .addProject, .removeProject,
+            .newSession, .closeSession, .renameSession, .closeWindow, .addProject, .archiveProject, .removeProject,
             .previousSession, .nextSession, .newWorkspace, .closeWorkspace,
             .splitPaneRight, .splitPaneDown, .closePane,
             .focusPaneLeft, .focusPaneRight, .focusPaneUp, .focusPaneDown,
@@ -57,6 +58,7 @@ extension AppAction {
         case .renameSession: return "Rename Session…"
         case .closeWindow: return "Close Window"
         case .addProject: return "Add Project…"
+        case .archiveProject: return "Archive Project"
         case .removeProject: return "Remove Project…"
         case .previousSession: return "Previous Session"
         case .nextSession: return "Next Session"
@@ -85,7 +87,7 @@ extension AppAction {
             return "Panes"
         case .newWorkspace, .closeWorkspace:
             return "Workspaces"
-        case .addProject, .removeProject:
+        case .addProject, .archiveProject, .removeProject:
             return "Projects"
         case .closeWindow:
             return "Window"
@@ -224,7 +226,7 @@ enum Keymap {
             .focusPaneUp: Shortcut(key: .upArrow, modifiers: [.command, .control]),
             .focusPaneDown: Shortcut(key: .downArrow, modifiers: [.command, .control]),
             .showShortcutHelp: Shortcut(key: .char("?"), modifiers: [.command, .shift]),
-            // .removeProject and .closeWorkspace intentionally have no entry: menu-only.
+            // .archiveProject, .removeProject and .closeWorkspace intentionally have no entry: menu-only.
         ]
         for index in 0..<9 {
             let digit = Character("\(index + 1)")

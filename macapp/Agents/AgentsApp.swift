@@ -222,6 +222,11 @@ struct AgentsApp: App {
                 }
                 .keymapShortcut(.addProject)
 
+                Button("Archive Project") {
+                    actions.perform(.archiveProject)
+                }
+                // No .keymapShortcut: archiveProject is menu-only, like removeProject.
+
                 Button("Remove Project…") {
                     actions.perform(.removeProject)
                 }
