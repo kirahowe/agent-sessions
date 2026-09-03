@@ -568,9 +568,10 @@ final class TerminalCenterPaneTests: XCTestCase {
 
     func testResumeHintPrintsOnceAndOnlyInTheInitialPane() async {
         var deliveries: [(view: TerminalView, text: String)] = []
-        let center = TerminalCenter(textDelivery: { view, text in
-            deliveries.append((view, text))
-        })
+        let center = TerminalCenter(
+            textDelivery: { view, text in deliveries.append((view, text)) },
+            promptSettleDelay: 0, promptFallbackDelay: 0
+        )
         let metadata = SessionResumeMetadata(
             agent: "omp", sessionID: "omp-1", title: "Restored work", prompt: nil
         )
@@ -599,9 +600,12 @@ final class TerminalCenterPaneTests: XCTestCase {
         )
     }
 
-    func testResumeHintWaitsForTheInitialPanesSurface() async {
+    func testResumeHintWaitsForTheInitialPanesSurfaceAndFirstPrompt() async {
         var deliveries: [String] = []
-        let center = TerminalCenter(textDelivery: { _, text in deliveries.append(text) })
+        let center = TerminalCenter(
+            textDelivery: { _, text in deliveries.append(text) },
+            promptSettleDelay: 0, promptFallbackDelay: 60
+        )
         let metadata = SessionResumeMetadata(agent: "claude", sessionID: "c-1", title: "Restored work", prompt: nil)
         let initialView = makeSession(in: center, restoredResume: metadata)
         let initialPane = center.layouts[sessionID]!.initialPane
@@ -616,13 +620,51 @@ final class TerminalCenterPaneTests: XCTestCase {
         )
 
         center.handleSurfaceAttached(paneID: initialPane)
+        await drainMainQueue()
+        XCTAssertTrue(
+            deliveries.isEmpty,
+            "a surface alone is not a shell at its prompt: bytes typed while login still owns the tty are echoed raw by the kernel and then again by the line editor"
+        )
+
+        let newPane = center.splitPane(in: sessionID, axis: .horizontal, workingDirectory: "/tmp")!
+        center.handleSurfaceAttached(paneID: newPane)
+        center.handleTitleChange(paneID: newPane, title: "kira@Mac:~")
+        XCTAssertTrue(deliveries.isEmpty, "only the initial pane's prompt counts — the banner is typed there")
+
+        center.handleTitleChange(paneID: initialPane, title: "kira@Mac:~")
         XCTAssertEqual(deliveries, [SessionResumeMetadata.restoreInput(for: metadata)])
 
+        center.handleTitleChange(paneID: initialPane, title: "kira@Mac:~/code")
         center.handleSurfaceDetached(paneID: initialPane)
         center.handleSurfaceAttached(paneID: initialPane)
+        center.handleTitleChange(paneID: initialPane, title: "kira@Mac:~")
         center.showResumeHintIfNeeded(for: sessionID)
         await drainMainQueue()
-        XCTAssertEqual(deliveries.count, 1, "a surface rebuilt later must not get the banner a second time")
+        XCTAssertEqual(deliveries.count, 1, "later prompts and a surface rebuilt later must not get the banner a second time")
+    }
+
+    func testResumeHintFallsBackToATimerForAShellThatNeverTitlesItself() async throws {
+        var deliveries: [String] = []
+        let center = TerminalCenter(
+            textDelivery: { _, text in deliveries.append(text) },
+            promptSettleDelay: 0, promptFallbackDelay: 0.05
+        )
+        let metadata = SessionResumeMetadata(agent: "omp", sessionID: "o-1", title: nil, prompt: "Restored work")
+        let initialView = makeSession(in: center, restoredResume: metadata)
+        let initialPane = center.layouts[sessionID]!.initialPane
+        let hostView = NSView()
+        hostView.addSubview(initialView)
+
+        center.showResumeHintIfNeeded(for: sessionID)
+        center.handleSurfaceAttached(paneID: initialPane)
+        await drainMainQueue()
+        XCTAssertTrue(deliveries.isEmpty, "the fallback is a timer, not immediate")
+
+        try await Task.sleep(nanoseconds: 300_000_000)
+        XCTAssertEqual(
+            deliveries, [SessionResumeMetadata.restoreInput(for: metadata)],
+            "a shell that never sets a title must still get its banner once the fallback elapses"
+        )
     }
 
     // MARK: - Teardown paths

@@ -105,7 +105,10 @@ Last Claude Code session: Make the resume hint harness agnostic
 Press Enter to resume it, or Ctrl-C to clear the line and use the shell for
 something else. Agents never presses Enter for you: resuming starts the
 harness, the first prompt you send it spends tokens, and restoring twenty
-terminals should not start twenty agents unasked.
+terminals should not start twenty agents unasked. The banner is typed once
+the shell reaches its first prompt — known from the first terminal title it
+sets — or, for a shell that never sets one, a few seconds after the terminal
+opens.
 
 How the app learns the session id depends on the harness:
 

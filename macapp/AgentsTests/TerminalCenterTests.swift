@@ -189,10 +189,13 @@ final class TerminalCenterTests: XCTestCase {
     func testRecreatedOmpSurfaceDeliversPersistedResumeHintExactlyOnce() async {
         var deliveredTexts: [String] = []
         var deliveryProxies: [SessionDelegateProxy] = []
-        let center = TerminalCenter(textDelivery: { view, text in
-            deliveredTexts.append(text)
-            deliveryProxies.append(view.delegate as! SessionDelegateProxy)
-        })
+        let center = TerminalCenter(
+            textDelivery: { view, text in
+                deliveredTexts.append(text)
+                deliveryProxies.append(view.delegate as! SessionDelegateProxy)
+            },
+            promptSettleDelay: 0, promptFallbackDelay: 0
+        )
         let sessionID = "recreated"
         let hostView = NSView()
         let oldView = center.terminalView(
