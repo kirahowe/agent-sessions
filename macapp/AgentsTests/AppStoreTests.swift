@@ -2762,6 +2762,37 @@ final class AppStoreTests: XCTestCase {
         XCTAssertEqual(restored.sessions.first?.resume, store.sessions.first?.resume)
     }
 
+    func test87b_hookHomeIsRememberedAndRefreshedForTheSameSession() {
+        let (store, spy, url) = TestSupport.makeStore()
+        store.addProject(path: "/tmp/proj-A")
+        let sessionID = store.sessions.first!.id
+
+        spy.emitAgentEvent(
+            sessionID,
+            AgentSessionEvent(agent: "codex", name: "SessionStart", sessionID: "c-1", query: nil, home: "/Users/kira/.codex-kira")
+        )
+        XCTAssertEqual(store.sessions.first?.resume?.home, "/Users/kira/.codex-kira")
+
+        // An event without a home keeps the remembered one; an event with a
+        // home replaces it — the latest word on where the harness lives wins.
+        spy.emitAgentEvent(
+            sessionID,
+            AgentSessionEvent(agent: "codex", name: "UserPromptSubmit", sessionID: "c-1", query: "go", home: nil)
+        )
+        XCTAssertEqual(store.sessions.first?.resume?.home, "/Users/kira/.codex-kira")
+        spy.emitAgentEvent(
+            sessionID,
+            AgentSessionEvent(agent: "codex", name: "UserPromptSubmit", sessionID: "c-1", query: nil, home: "/elsewhere")
+        )
+        XCTAssertEqual(store.sessions.first?.resume?.home, "/elsewhere")
+
+        let restored = AppStore(terminals: SpyTerminals(), stateURL: url, engine: FakeWorkspaceEngine())
+        XCTAssertEqual(
+            restored.sessions.first?.resume?.home, "/elsewhere",
+            "the home must survive a relaunch — it is only ever read when building the banner after one"
+        )
+    }
+
     func test88_newOmpSessionIDReplacesPriorMetadataAndLaterDecoratedTitleEnrichesIt() {
         let (store, spy, _) = TestSupport.makeStore()
         store.addProject(path: "/tmp/proj-A")

@@ -65,7 +65,7 @@ Closing stops every session in that workspace before anything changes, because
 the workspace's files are about to be rewritten out from under them. The sheet
 tells you how many sessions it will stop. If the close is refused — an overlap,
 or the workspace changing mid-flight — the sessions come back as fresh shells;
-a session that was running an agent prints its resume command (see "Resuming
+a session that was running an agent gets its resume banner (see "Resuming
 agent sessions after a restart" below).
 
 After a successful add, the app also brings the project root's own unlanded
@@ -92,18 +92,20 @@ recoverable by hand.
 
 The app remembers the last agent session associated with each terminal,
 whichever harness it was running. After relaunching Agents, opening a
-restored terminal starts a fresh shell and prints the remembered session
-title (or, for a session that never titled itself, your last prompt) followed
-by the same resume text the harness printed when it quit:
+restored terminal starts a fresh shell, prints one line naming the harness
+and the remembered session title (or, for a session that never titled
+itself, your last prompt), and leaves the harness's own resume command typed
+at the prompt, waiting:
 
 ```text
 Last Claude Code session: Make the resume hint harness agnostic
-Resume this session with:
-claude --resume 01a03bbc-0713-729c-a74b-b66f49ddeddd
+❯ claude --resume 01a03bbc-0713-729c-a74b-b66f49ddeddd
 ```
 
-Agents never runs that command automatically. Resuming can rebuild provider
-caches and spend tokens, so the decision stays with you.
+Press Enter to resume it, or Ctrl-C to clear the line and use the shell for
+something else. Agents never presses Enter for you: resuming starts the
+harness, the first prompt you send it spends tokens, and restoring twenty
+terminals should not start twenty agents unasked.
 
 How the app learns the session id depends on the harness:
 
@@ -113,12 +115,19 @@ How the app learns the session id depends on the harness:
 | Codex CLI   | `hooks/agents-status.sh` (see below)            | `codex resume <id>`    |
 | OMP         | OMP's built-in Warp CLI-agent protocol, no setup | `omp --resume <id>`    |
 
+If the harness was running under a non-default configuration home —
+`CODEX_HOME` for Codex, `CLAUDE_CONFIG_DIR` for Claude Code — the typed
+command carries it as a prefix, `CODEX_HOME=/path codex resume <id>`. That
+directory is where the harness keeps the session; a fresh shell that doesn't
+export the variable would otherwise look in the default location and find
+nothing.
+
 Claude Code and Codex announce their session through the same hook that
 reports status (see "With the hook, for real agent state"). The hook
 announces the session on every registered event, so even a partial
 registration works — but the prompt preview comes only from
 `UserPromptSubmit`, and a session that never calls a tool is only announced by
-`SessionStart`, so register both if you want the hint to be reliable.
+`SessionStart`, so register both if you want the banner to be reliable.
 
 OMP needs no hook: terminals spawned by Agents opt into OMP's built-in
 CLI-agent protocol, and the app persists what OMP reports. Only OMP's default

@@ -583,6 +583,8 @@ final class TerminalCenterPaneTests: XCTestCase {
             $0 != center.layouts[sessionID]!.initialPane
         }!
         hostView.addSubview(center.view(forPane: newPaneID)!)
+        center.handleSurfaceAttached(paneID: center.layouts[sessionID]!.initialPane)
+        center.handleSurfaceAttached(paneID: newPaneID)
 
         center.showResumeHintIfNeeded(for: sessionID)
         center.showResumeHintIfNeeded(for: sessionID)
@@ -595,6 +597,32 @@ final class TerminalCenterPaneTests: XCTestCase {
             deliveries[0].view === initialView,
             "the resume hint must land in the session's INITIAL pane — printing it into a split would inject shell input into whatever the user is doing there"
         )
+    }
+
+    func testResumeHintWaitsForTheInitialPanesSurface() async {
+        var deliveries: [String] = []
+        let center = TerminalCenter(textDelivery: { _, text in deliveries.append(text) })
+        let metadata = SessionResumeMetadata(agent: "claude", sessionID: "c-1", title: "Restored work", prompt: nil)
+        let initialView = makeSession(in: center, restoredResume: metadata)
+        let initialPane = center.layouts[sessionID]!.initialPane
+        let hostView = NSView()
+        hostView.addSubview(initialView)
+
+        center.showResumeHintIfNeeded(for: sessionID)
+        await drainMainQueue()
+        XCTAssertTrue(
+            deliveries.isEmpty,
+            "the banner goes down the pty, and there is no pty until Ghostty has built the surface — typing before then is a silent no-op that would lose the banner for good"
+        )
+
+        center.handleSurfaceAttached(paneID: initialPane)
+        XCTAssertEqual(deliveries, [SessionResumeMetadata.restoreInput(for: metadata)])
+
+        center.handleSurfaceDetached(paneID: initialPane)
+        center.handleSurfaceAttached(paneID: initialPane)
+        center.showResumeHintIfNeeded(for: sessionID)
+        await drainMainQueue()
+        XCTAssertEqual(deliveries.count, 1, "a surface rebuilt later must not get the banner a second time")
     }
 
     // MARK: - Teardown paths

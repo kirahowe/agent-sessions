@@ -222,6 +222,7 @@ final class TerminalCenterTests: XCTestCase {
         )!
         let recreatedProxy = recreatedView.delegate as! SessionDelegateProxy
         hostView.addSubview(recreatedView)
+        center.handleSurfaceAttached(paneID: center.layouts[sessionID]!.initialPane)
 
         oldProxy.terminalDidClose(processAlive: false)
 
@@ -246,7 +247,7 @@ final class TerminalCenterTests: XCTestCase {
 
         XCTAssertEqual(
             deliveredTexts,
-            ["printf '%s\\n' 'Last OMP session: Repair recreation' 'Resume this session with:' 'omp --resume omp-recreated'\n"]
+            ["printf '%s\\n' 'Last OMP session: Repair recreation'\nomp --resume omp-recreated"]
         )
         XCTAssertEqual(deliveryProxies.count, 1)
         XCTAssertTrue(deliveryProxies[0] === recreatedProxy)

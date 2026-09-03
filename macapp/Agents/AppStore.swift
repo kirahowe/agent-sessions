@@ -1163,13 +1163,22 @@ final class AppStore: ObservableObject {
             if let query = event.query {
                 next.prompt = query
             }
+            if let home = event.home {
+                next.home = home
+            }
         } else {
             next = SessionResumeMetadata(
                 agent: event.agent,
                 sessionID: event.sessionID,
                 title: currentDecoratedTitle,
-                prompt: event.query
+                prompt: event.query,
+                home: event.home
             )
+            // Logged only when the identity changes, not on every prompt:
+            // this is the one line that says a row became resumable as a
+            // particular session, which is what to look for when a restored
+            // row prints no banner.
+            NSLog("Agents: session \(sessionID) is now resumable as \(event.agent) \(event.sessionID)")
         }
 
         guard sessions[index].resume != next else { return }

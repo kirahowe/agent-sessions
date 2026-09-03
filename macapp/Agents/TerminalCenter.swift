@@ -20,6 +20,13 @@ final class TerminalCenter: ObservableObject, SessionTerminating {
         var controller: TerminalController?
         var delegateProxy: SessionDelegateProxy
         var lastTitle: String?
+        /// Whether the pane's Ghostty surface currently exists — set and
+        /// cleared by the surface lifecycle callbacks. The view is created
+        /// long before its surface: the surface is built only once the
+        /// view is in a window with a real size, and `sendText` before
+        /// then is a silent no-op, so anything typed into the pane has to
+        /// wait for this to become true.
+        var surfaceAttached = false
     }
 
     /// Per-session resume-hint bookkeeping. Session-scoped, not pane-scoped:
@@ -284,6 +291,9 @@ final class TerminalCenter: ObservableObject, SessionTerminating {
         )
         let controller = TerminalController(terminalConfiguration: Self.terminalConfiguration)
         view.controller = controller
+        // The pane id is what the hook reports under, so a refusal in the
+        // hook's log ("unknown pane …") can be matched against this line.
+        NSLog("Agents: spawned pane \(paneID.uuidString) for session \(sessionID)")
         return PaneEntry(
             sessionID: sessionID, view: view, controller: controller, delegateProxy: proxy
         )
@@ -433,11 +443,20 @@ final class TerminalCenter: ObservableObject, SessionTerminating {
 
     // MARK: - Resume hint
 
-    /// Prints a resume hint exactly once per restored session, into the
-    /// session's initial pane only, and only when metadata was already
-    /// present when the live surface was created. Metadata learned from an
-    /// agent running in the current surface is intentionally never injected
-    /// back into that active session.
+    /// Types the restore banner (see `SessionResumeMetadata.restoreInput`)
+    /// exactly once per restored session, into the session's initial pane
+    /// only, and only when metadata was already present when the live
+    /// surface was created. Metadata learned from an agent running in the
+    /// current surface is intentionally never injected back into that
+    /// active session.
+    ///
+    /// Delivery waits for the pane's surface: the text goes down the pty,
+    /// and there is no pty until Ghostty has built the surface, which
+    /// happens only once the view is in a window with a real size — an
+    /// arbitrary number of run-loop turns after it is mounted. Marking the
+    /// hint scheduled here, and delivering from whichever comes second of
+    /// the next turn and the surface's attach callback, is what keeps the
+    /// banner from being lost to a `sendText` that silently did nothing.
     func showResumeHintIfNeeded(for sessionID: String) {
         guard var hint = resumeHints[sessionID],
               hint.metadata != nil,
@@ -448,9 +467,6 @@ final class TerminalCenter: ObservableObject, SessionTerminating {
               entry.view.superview != nil
         else { return }
 
-        // Give AppKit one run-loop turn to create the Ghostty surface after
-        // the view enters the hierarchy; sendText is intentionally a no-op
-        // before that surface exists.
         hint.scheduled = true
         resumeHints[sessionID] = hint
         DispatchQueue.main.async { [weak self] in
@@ -464,15 +480,38 @@ final class TerminalCenter: ObservableObject, SessionTerminating {
               !hint.didShow,
               let metadata = hint.metadata,
               let layout = layouts[sessionID],
-              let entry = panes[layout.initialPane]
+              let entry = panes[layout.initialPane],
+              entry.surfaceAttached
         else { return }
 
         hint.didShow = true
         resumeHints[sessionID] = hint
-        textDelivery(
-            entry.view,
-            SessionResumeMetadata.resumeHintCommand(for: metadata)
+        NSLog(
+            "Agents: typed restore banner into session \(sessionID) pane \(layout.initialPane.uuidString) (\(metadata.agent) \(metadata.sessionID))"
         )
+        textDelivery(entry.view, SessionResumeMetadata.restoreInput(for: metadata))
+    }
+
+    /// Called by a pane's delegate proxy once Ghostty has built the pane's
+    /// surface. Delivers the session's restore banner if one is waiting on
+    /// exactly this — see `showResumeHintIfNeeded`.
+    func handleSurfaceAttached(paneID: UUID) {
+        guard var entry = panes[paneID] else { return }
+        entry.surfaceAttached = true
+        panes[paneID] = entry
+        if let layout = layouts[entry.sessionID], layout.initialPane == paneID {
+            deliverResumeHint(for: entry.sessionID)
+        }
+    }
+
+    /// Called by a pane's delegate proxy when its surface is torn down —
+    /// a quiesce, or the view leaving its window. Anything typed after this
+    /// would go nowhere, so the pane stops counting as writable until the
+    /// next attach.
+    func handleSurfaceDetached(paneID: UUID) {
+        guard var entry = panes[paneID] else { return }
+        entry.surfaceAttached = false
+        panes[paneID] = entry
     }
 
     // MARK: - Session teardown
@@ -517,6 +556,11 @@ final class TerminalCenter: ObservableObject, SessionTerminating {
             entry.view.controller = nil
             entry.controller = nil
             entry.lastTitle = nil
+            // The delegate was detached above, so the surface's own detach
+            // callback never arrives: clear the flag by hand, or the banner
+            // typed after resume could go to a surface that no longer
+            // exists — and be lost, since `sendText` says nothing then.
+            entry.surfaceAttached = false
             panes[survivor] = entry
             // The survivor keeps its view and its pane id, but its PROCESS
             // is as dead as its siblings' — announce the closure so its
@@ -675,7 +719,8 @@ final class SessionDelegateProxy:
     TerminalSurfaceCloseDelegate,
     TerminalSurfaceDesktopNotificationDelegate,
     TerminalSurfaceBellDelegate,
-    TerminalSurfaceProgressReportDelegate
+    TerminalSurfaceProgressReportDelegate,
+    TerminalSurfaceLifecycleDelegate
 {
     let sessionID: String
     let paneID: UUID
@@ -698,6 +743,16 @@ final class SessionDelegateProxy:
     func terminalDidClose(processAlive: Bool) {
         guard !suppressesProcessExit else { return }
         center?.handleProcessExit(paneID: paneID)
+    }
+
+    /// The surface — and with it the pty — now exists. This is the signal
+    /// the restore banner waits for: see `TerminalCenter.handleSurfaceAttached`.
+    func terminalDidAttachSurface(_ surface: TerminalSurface) {
+        center?.handleSurfaceAttached(paneID: paneID)
+    }
+
+    func terminalDidDetachSurface() {
+        center?.handleSurfaceDetached(paneID: paneID)
     }
 
     /// The package dispatches every specialized delegate by conditional-

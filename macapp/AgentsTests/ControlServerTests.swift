@@ -130,6 +130,25 @@ final class ControlServerTests: XCTestCase {
         )
     }
 
+    func testSessionEventCarriesTheHarnessHome() {
+        let decision = ControlServer.decide(
+            line: #"{"cmd":"session-event","session":"row-1","pane":"\#(pane)","event":"SessionStart","agent":"codex","agent_session_id":"x-1","agent_home":" /Users/kira/.codex-kira "}"#
+        )
+
+        XCTAssertEqual(
+            decision,
+            .sessionEvent(ControlSessionEvent(
+                session: "row-1",
+                pane: UUID(uuidString: pane)!,
+                status: nil,
+                event: AgentSessionEvent(
+                    agent: "codex", name: "SessionStart", sessionID: "x-1", query: nil, home: "/Users/kira/.codex-kira"
+                )
+            )),
+            "the home the harness ran under rides along with its announcement, trimmed, so the restore banner can prefix the resume command with it"
+        )
+    }
+
     func testSessionEventWithNothingToApplyIsRefused() {
         XCTAssertEqual(
             ControlServer.decide(
@@ -266,6 +285,7 @@ final class ControlServerTests: XCTestCase {
             // Under xctest there is no `claude` ancestor to find; this is the
             // hook's documented fallback for exactly that situation.
             "CLAUDECODE": "1",
+            "CLAUDE_CONFIG_DIR": "/tmp/claude-config",
         ]
         let hookRun = try await Self.run(
             "/bin/bash", [hook.path], environment: environment,
@@ -276,8 +296,11 @@ final class ControlServerTests: XCTestCase {
         XCTAssertEqual(signals.map(\.signal), [.structured(.clear)])
         XCTAssertEqual(
             announced,
-            [AgentSessionEvent(agent: "claude", name: "UserPromptSubmit", sessionID: "abc-123", query: "Fix the parser")],
-            "the hook's UserPromptSubmit must arrive as one announcement carrying the harness, its session id, and the prompt preview"
+            [AgentSessionEvent(
+                agent: "claude", name: "UserPromptSubmit", sessionID: "abc-123", query: "Fix the parser",
+                home: "/tmp/claude-config"
+            )],
+            "the hook's UserPromptSubmit must arrive as one announcement carrying the harness, its session id, the prompt preview, and the configuration home it ran under"
         )
 
         // A refusal must be answered AND the connection closed, or the

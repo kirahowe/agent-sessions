@@ -106,10 +106,14 @@ final class ControlServer: @unchecked Sendable {
         let agent: String?
         let agentSessionID: String?
         let prompt: String?
+        /// The harness's configuration home (`CODEX_HOME`, `CLAUDE_CONFIG_DIR`)
+        /// when the hook's environment had one — see `SessionResumeMetadata.home`.
+        let agentHome: String?
 
         private enum CodingKeys: String, CodingKey {
             case cmd, session, command, cwd, pane, event, status, agent, prompt
             case agentSessionID = "agent_session_id"
+            case agentHome = "agent_home"
         }
     }
 
@@ -186,7 +190,8 @@ final class ControlServer: @unchecked Sendable {
             return .refuse("missing agent")
         case (false, false):
             guard let made = AgentSessionEvent.make(
-                agent: agent, name: name, sessionID: agentSessionID, query: request.prompt
+                agent: agent, name: name, sessionID: agentSessionID, query: request.prompt,
+                home: request.agentHome
             ) else {
                 return .refuse("blank agent or agent_session_id")
             }

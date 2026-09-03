@@ -178,6 +178,15 @@ final class SessionResumeTests: XCTestCase {
 
     // MARK: - displayName / resumeCommand
 
+    func testMakeTrimsTheHomeAndDropsABlankOne() {
+        XCTAssertEqual(
+            AgentSessionEvent.make(agent: "codex", name: "SessionStart", sessionID: "x", query: nil, home: " /Users/kira/.codex-kira ")?.home,
+            "/Users/kira/.codex-kira"
+        )
+        XCTAssertNil(AgentSessionEvent.make(agent: "codex", name: "SessionStart", sessionID: "x", query: nil, home: "  ")?.home)
+        XCTAssertNil(AgentSessionEvent.make(agent: "codex", name: "SessionStart", sessionID: "x", query: nil)?.home)
+    }
+
     func testDisplayNameForKnownAndUnknownAgents() {
         XCTAssertEqual(SessionResumeMetadata.displayName(agent: "omp"), "OMP")
         XCTAssertEqual(SessionResumeMetadata.displayName(agent: "claude"), "Claude Code")
@@ -240,6 +249,14 @@ final class SessionResumeTests: XCTestCase {
         XCTAssertNil(SessionResumeMetadata.normalizedTitle("kira@Mac:~/code", agent: "claude"))
     }
 
+    func testClaudeLaunchPlaceholderTitleIsNotATitle() {
+        XCTAssertNil(
+            SessionResumeMetadata.normalizedTitle("✳ Claude Code", agent: "claude"),
+            "'✳ Claude Code' is what Claude Code shows before the first exchange is summarized — the program's name, not the conversation's — and a banner saying 'Last Claude Code session: Claude Code' would displace the more useful prompt fallback"
+        )
+        XCTAssertEqual(SessionResumeMetadata.normalizedTitle("✳ Claude Code review", agent: "claude"), "Claude Code review")
+    }
+
     func testCrossAgentDecorationsDoNotMatch() {
         XCTAssertNil(
             SessionResumeMetadata.normalizedTitle("π > Task", agent: "claude"),
@@ -253,124 +270,147 @@ final class SessionResumeTests: XCTestCase {
         XCTAssertNil(SessionResumeMetadata.normalizedTitle("anything", agent: "gemini"))
     }
 
-    // MARK: - resumeHintCommand
+    // MARK: - resumeCommand: configuration home
 
-    func testResumeHintForClaudeUsesPromptFallbackAndClaudesOwnExitText() {
-        let metadata = SessionResumeMetadata(agent: "claude", sessionID: "session-123", title: nil, prompt: "Repair persistence")
-
-        let command = SessionResumeMetadata.resumeHintCommand(for: metadata)
+    func testResumeCommandCarriesTheHarnessHomeAsAVariablePrefix() {
+        let codex = SessionResumeMetadata(agent: "codex", sessionID: "s-3", title: nil, prompt: nil, home: "/Users/kira/.codex-kira")
+        let claude = SessionResumeMetadata(agent: "claude", sessionID: "s-2", title: nil, prompt: nil, home: "/Users/kira/.claude-kira")
 
         XCTAssertEqual(
-            command,
-            "printf '%s\\n' 'Last Claude Code session: Repair persistence' 'Resume this session with:' 'claude --resume session-123'\n",
-            "the banner must read like the message Claude Code prints on exit — a heading, then 'Resume this session with:' and the bare command on its own line — so what greets the user after a relaunch is the text they saw when the agent quit"
+            SessionResumeMetadata.resumeCommand(for: codex), "CODEX_HOME=/Users/kira/.codex-kira codex resume s-3",
+            "Codex keeps its sessions under CODEX_HOME: a bare `codex resume` typed into a fresh shell that never set it looks in ~/.codex and fails, so the command must carry the home it ran under"
         )
-        XCTAssertTrue(command.hasSuffix("\n"))
+        XCTAssertEqual(SessionResumeMetadata.resumeCommand(for: claude), "CLAUDE_CONFIG_DIR=/Users/kira/.claude-kira claude --resume s-2")
     }
 
-    func testResumeHintForCodexUsesCodexResumeSyntax() {
-        let metadata = SessionResumeMetadata(agent: "codex", sessionID: "session-123", title: "Fix the parser", prompt: nil)
+    func testResumeCommandIgnoresAHomeForOmpAndABlankHome() {
+        let omp = SessionResumeMetadata(agent: "omp", sessionID: "s-1", title: nil, prompt: nil, home: "/somewhere")
+        let blank = SessionResumeMetadata(agent: "codex", sessionID: "s-3", title: nil, prompt: nil, home: "  ")
 
-        let command = SessionResumeMetadata.resumeHintCommand(for: metadata)
-
-        XCTAssertTrue(command.contains("'Resume this session with:' 'codex resume session-123'"))
+        XCTAssertEqual(
+            SessionResumeMetadata.resumeCommand(for: omp), "omp --resume s-1",
+            "OMP has no home variable this app knows; a stray value must not be turned into a made-up prefix"
+        )
+        XCTAssertEqual(SessionResumeMetadata.resumeCommand(for: blank), "codex resume s-3")
     }
 
-    func testResumeHintForOmpUsesOmpResumeSyntax() {
-        let metadata = SessionResumeMetadata(agent: "omp", sessionID: "session-123", title: "Fix the parser", prompt: nil)
+    func testResumeCommandQuotesIdsAndHomesTheShellWouldOtherwiseInterpret() {
+        let hostile = SessionResumeMetadata(
+            agent: "codex", sessionID: "id'; touch /tmp/nope; echo '", title: nil, prompt: nil,
+            home: "/Users/kira/My Codex"
+        )
 
-        let command = SessionResumeMetadata.resumeHintCommand(for: metadata)
-
-        XCTAssertTrue(command.contains("'Resume this session with:' 'omp --resume session-123'"))
-    }
-
-    func testResumeHintForUnknownAgentFallsBackToSessionIDWithNoResumeLine() {
-        let metadata = SessionResumeMetadata(agent: "gemini", sessionID: "id-1", title: "T", prompt: nil)
-
-        let command = SessionResumeMetadata.resumeHintCommand(for: metadata)
-
-        XCTAssertTrue(command.contains("'Last gemini session: T'"))
-        XCTAssertTrue(command.contains("'Session id: id-1'"))
-        XCTAssertFalse(
-            command.contains("Resume this session"),
-            "an agent with no known resume command must not print a resume instruction it can't back up — printing a raw session id is the honest fallback"
+        XCTAssertEqual(
+            SessionResumeMetadata.resumeCommand(for: hostile),
+            "CODEX_HOME='/Users/kira/My Codex' codex resume 'id'\"'\"'; touch /tmp/nope; echo '\"'\"''",
+            "the command is typed at the prompt and run by Enter, so a session id or home carrying metacharacters must arrive as one quoted word, never as a second command"
         )
     }
 
-    func testResumeHintWithNoTitleOrPromptOmitsTheColonEntirely() {
-        let metadata = SessionResumeMetadata(agent: "claude", sessionID: "session-123", title: nil, prompt: nil)
+    // MARK: - restoreInput
 
-        let command = SessionResumeMetadata.resumeHintCommand(for: metadata)
+    func testRestoreInputPrintsTheHeadingAndLeavesTheResumeCommandTypedButUnrun() {
+        let metadata = SessionResumeMetadata(agent: "claude", sessionID: "session-123", title: "Repair persistence", prompt: nil)
+
+        let input = SessionResumeMetadata.restoreInput(for: metadata)
+
+        XCTAssertEqual(
+            input,
+            "printf '%s\\n' 'Last Claude Code session: Repair persistence'\nclaude --resume session-123",
+            "the heading runs at once (newline-terminated) and the resume command follows with NO newline, so it waits at the prompt: Enter resumes, and nothing spends tokens on the user's behalf"
+        )
+        XCTAssertFalse(input.hasSuffix("\n"), "a trailing newline would run the resume command — the one thing this banner must never do")
+    }
+
+    func testRestoreInputFallsBackToThePromptForAnUntitledSession() {
+        let metadata = SessionResumeMetadata(agent: "claude", sessionID: "session-123", title: nil, prompt: "Repair persistence")
 
         XCTAssertTrue(
-            command.contains("'Last Claude Code session' "),
-            "with neither a title nor a prompt there is nothing to put after a colon, so the heading line must read as a plain statement rather than 'Last Claude Code session: ' with a dangling colon: \(command)"
+            SessionResumeMetadata.restoreInput(for: metadata)
+                .hasPrefix("printf '%s\\n' 'Last Claude Code session: Repair persistence'\n")
         )
-        XCTAssertFalse(command.contains("session: '"))
+    }
+
+    func testRestoreInputUsesEachHarnessesOwnResumeSyntax() {
+        let codex = SessionResumeMetadata(agent: "codex", sessionID: "session-123", title: "Fix the parser", prompt: nil, home: "/h")
+        let omp = SessionResumeMetadata(agent: "omp", sessionID: "session-123", title: "Fix the parser", prompt: nil)
+
+        XCTAssertTrue(SessionResumeMetadata.restoreInput(for: codex).hasSuffix("\nCODEX_HOME=/h codex resume session-123"))
+        XCTAssertTrue(SessionResumeMetadata.restoreInput(for: omp).hasSuffix("\nomp --resume session-123"))
+    }
+
+    func testRestoreInputForUnknownAgentPrintsTheSessionIDAndTypesNothing() {
+        let metadata = SessionResumeMetadata(agent: "gemini", sessionID: "id-1", title: "T", prompt: nil)
+
+        XCTAssertEqual(
+            SessionResumeMetadata.restoreInput(for: metadata),
+            "printf '%s\\n' 'Last gemini session: T' 'Session id: id-1'\n",
+            "an agent with no known resume command must not leave a guessed-at command at the prompt — printing the raw session id is the honest fallback"
+        )
+    }
+
+    func testRestoreInputWithNoTitleOrPromptOmitsTheColonEntirely() {
+        let metadata = SessionResumeMetadata(agent: "claude", sessionID: "session-123", title: nil, prompt: nil)
+
+        let input = SessionResumeMetadata.restoreInput(for: metadata)
+
+        XCTAssertTrue(
+            input.hasPrefix("printf '%s\\n' 'Last Claude Code session'\n"),
+            "with neither a title nor a prompt there is nothing to put after a colon, so the heading must read as a plain statement rather than dangle one: \(input)"
+        )
     }
 
     func testTitleWinsOverPromptAndThePromptNeverGetsItsOwnLine() {
         let titled = SessionResumeMetadata(agent: "claude", sessionID: "s-1", title: "Fix it", prompt: "Original ask")
 
-        let command = SessionResumeMetadata.resumeHintCommand(for: titled)
+        let input = SessionResumeMetadata.restoreInput(for: titled)
 
-        XCTAssertTrue(command.contains("'Last Claude Code session: Fix it'"))
+        XCTAssertTrue(input.contains("'Last Claude Code session: Fix it'"))
         XCTAssertFalse(
-            command.contains("Original ask"),
-            "the prompt is only ever the heading's fallback for an untitled session — printing it beneath a real title would repeat what the title says and push Claude's two-line resume text further from the prompt"
+            input.contains("Original ask"),
+            "the prompt is only ever the heading's fallback for an untitled session — printing it beneath a real title would repeat what the title says"
         )
-        XCTAssertFalse(command.contains("Prompt:"))
     }
 
-    func testResumeHintQuotesTitleAndSessionIDWithoutExecutingThem() {
+    func testRestoreInputQuotesTheHeadingSoATitleCannotInjectShellLines() {
         let metadata = SessionResumeMetadata(
-            agent: "omp",
-            sessionID: "id'; touch /tmp/nope; echo '",
-            title: "Kira's run",
-            prompt: nil
+            agent: "omp", sessionID: "id-1", title: "Kira's run'; touch /tmp/nope; echo '", prompt: nil
         )
 
-        let command = SessionResumeMetadata.resumeHintCommand(for: metadata)
+        let input = SessionResumeMetadata.restoreInput(for: metadata)
 
-        XCTAssertEqual(command.filter { $0 == "\n" }.count, 1, "the whole hint must be one printf invocation terminated by exactly one trailing newline, or a maliciously-crafted title/prompt could inject extra shell lines")
-        XCTAssertTrue(command.contains("'Last OMP session: Kira'\"'\"'s run'"))
-        XCTAssertTrue(
-            command.contains("'omp --resume id'\"'\"'; touch /tmp/nope; echo '\"'\"''"),
-            "the command line is printed, never run: a session id carrying shell metacharacters must arrive as one quoted printf argument"
+        XCTAssertEqual(
+            input,
+            "printf '%s\\n' 'Last OMP session: Kira'\"'\"'s run'\"'\"'; touch /tmp/nope; echo '\"'\"''\nomp --resume id-1",
+            "the heading is one single-quoted printf argument whatever the title contains; the only newline in the whole input is the one that runs printf"
         )
-        XCTAssertFalse(command.contains("\nomp --resume"))
+        XCTAssertEqual(input.filter { $0 == "\n" }.count, 1)
     }
 
-    func testResumeHintQuotesThePromptFallbackHeadingToo() {
+    func testRestoreInputQuotesThePromptFallbackHeadingToo() {
         let metadata = SessionResumeMetadata(agent: "claude", sessionID: "s-1", title: nil, prompt: "Don't auto-run")
 
-        let command = SessionResumeMetadata.resumeHintCommand(for: metadata)
-
-        XCTAssertTrue(command.contains("'Last Claude Code session: Don'\"'\"'t auto-run'"))
+        XCTAssertTrue(
+            SessionResumeMetadata.restoreInput(for: metadata).contains("'Last Claude Code session: Don'\"'\"'t auto-run'")
+        )
     }
 
-    func testResumeHintCollapsesNewlinesAndStripsTerminalControls() {
+    func testRestoreInputCollapsesNewlinesAndStripsTerminalControls() {
         let titled = SessionResumeMetadata(
-            agent: "claude",
-            sessionID: "session-123",
-            title: "Line one\n\tLine two\u{001B}\u{0007}",
-            prompt: nil
+            agent: "claude", sessionID: "session-123", title: "Line one\n\tLine two\u{001B}\u{0007}", prompt: nil
         )
         let untitled = SessionResumeMetadata(
-            agent: "claude",
-            sessionID: "session-123",
-            title: nil,
-            prompt: "Prompt\r\nnext\u{0003}"
+            agent: "claude", sessionID: "session-123", title: nil, prompt: "Prompt\r\nnext\u{0003}"
         )
 
         for metadata in [titled, untitled] {
-            let command = SessionResumeMetadata.resumeHintCommand(for: metadata)
-            XCTAssertEqual(command.filter { $0 == "\n" }.count, 1)
-            XCTAssertFalse(command.contains("\u{001B}"))
-            XCTAssertFalse(command.contains("\u{0007}"))
-            XCTAssertFalse(command.contains("\u{0003}"))
+            let input = SessionResumeMetadata.restoreInput(for: metadata)
+            XCTAssertEqual(input.filter { $0 == "\n" }.count, 1)
+            XCTAssertFalse(input.contains("\u{001B}"))
+            XCTAssertFalse(input.contains("\u{0007}"))
+            XCTAssertFalse(input.contains("\u{0003}"))
         }
-        XCTAssertTrue(SessionResumeMetadata.resumeHintCommand(for: titled).contains("'Last Claude Code session: Line one Line two'"))
-        XCTAssertTrue(SessionResumeMetadata.resumeHintCommand(for: untitled).contains("'Last Claude Code session: Prompt next'"))
+        XCTAssertTrue(SessionResumeMetadata.restoreInput(for: titled).contains("'Last Claude Code session: Line one Line two'"))
+        XCTAssertTrue(SessionResumeMetadata.restoreInput(for: untitled).contains("'Last Claude Code session: Prompt next'"))
     }
 }

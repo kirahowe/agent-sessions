@@ -15,6 +15,17 @@ struct SessionResumeMetadata: Codable, Hashable {
     var sessionID: String
     var title: String?
     var prompt: String?
+    /// The harness's configuration home when it announced itself —
+    /// `CODEX_HOME` for Codex, `CLAUDE_CONFIG_DIR` for Claude Code — if its
+    /// environment had one set. A harness keeps its sessions under that
+    /// directory, so the same resume command typed into a fresh shell that
+    /// lacks the variable looks in the default location and finds nothing;
+    /// the command carries the assignment as a prefix instead (see
+    /// `resumeCommand`). Nil when the harness ran from its default home, or
+    /// announced through a transport with no field for it (OMP's Warp
+    /// envelope). Optional so state files written before this field
+    /// existed still decode.
+    var home: String? = nil
 }
 
 /// The small, Foundation-only portion of the session-announcement protocol
@@ -52,6 +63,17 @@ struct AgentSessionEvent: Hashable {
     let name: String
     let sessionID: String
     let query: String?
+    /// The harness's configuration home, forwarded by the hook — see
+    /// `SessionResumeMetadata.home`. The OSC envelopes have no field for it.
+    let home: String?
+
+    init(agent: String, name: String, sessionID: String, query: String?, home: String? = nil) {
+        self.agent = agent
+        self.name = name
+        self.sessionID = sessionID
+        self.query = query
+        self.home = home
+    }
 
     private struct WireEnvelope: Decodable {
         let event: String
@@ -72,11 +94,11 @@ struct AgentSessionEvent: Hashable {
     /// preview is collapsed to one printable line capped at 200 characters
     /// — a bound the OSC transport needs (terminals drop oversized escapes)
     /// and the socket keeps so the banner heading it may become stays a
-    /// heading. Nil for a blank agent, event name, or session id: an empty
-    /// harness identifier would silently fail every downstream switch
-    /// rather than error anywhere.
+    /// heading. A blank home is no home. Nil for a blank agent, event name,
+    /// or session id: an empty harness identifier would silently fail every
+    /// downstream switch rather than error anywhere.
     static func make(
-        agent: String, name: String, sessionID: String, query: String?
+        agent: String, name: String, sessionID: String, query: String?, home: String? = nil
     ) -> AgentSessionEvent? {
         let agent = agent.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let name = name.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -88,7 +110,11 @@ struct AgentSessionEvent: Hashable {
             guard !preview.isEmpty else { return nil }
             return String(preview.prefix(200))
         }
-        return AgentSessionEvent(agent: agent, name: name, sessionID: sessionID, query: query)
+        let home = home.flatMap { home -> String? in
+            let trimmed = home.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? nil : trimmed
+        }
+        return AgentSessionEvent(agent: agent, name: name, sessionID: sessionID, query: query, home: home)
     }
 
     static func parseNotification(title: String, body: String) -> AgentSessionEvent? {
@@ -124,15 +150,35 @@ extension SessionResumeMetadata {
     }
 
     /// The shell command that resumes a harness's own session, or nil for a
-    /// harness this app doesn't know how to resume.
+    /// harness this app doesn't know how to resume. It is typed at the
+    /// prompt of a restored shell and run by the user's Enter (see
+    /// `restoreInput`), so everything it embeds is one shell word: the
+    /// session id — which comes from the harness itself, but is quoted
+    /// whenever it carries anything a shell could interpret — and, when
+    /// the harness ran under a non-default configuration home, that home
+    /// as a leading variable assignment, without which the command would
+    /// look for the session in the default location and fail.
     static func resumeCommand(for metadata: SessionResumeMetadata) -> String? {
-        let id = terminalSafeSingleLine(metadata.sessionID)
+        let id = shellWord(terminalSafeSingleLine(metadata.sessionID))
+        let invocation: String
+        let homeVariable: String?
         switch metadata.agent {
-        case "omp": return "omp --resume \(id)"
-        case "claude": return "claude --resume \(id)"
-        case "codex": return "codex resume \(id)"  // no `--`: that's Codex's real syntax
-        default: return nil
+        case "omp":
+            invocation = "omp --resume \(id)"
+            homeVariable = nil
+        case "claude":
+            invocation = "claude --resume \(id)"
+            homeVariable = "CLAUDE_CONFIG_DIR"
+        case "codex":
+            invocation = "codex resume \(id)"  // no `--`: that's Codex's real syntax
+            homeVariable = "CODEX_HOME"
+        default:
+            return nil
         }
+        guard let homeVariable,
+              let home = metadata.home.map(terminalSafeSingleLine), !home.isEmpty
+        else { return invocation }
+        return "\(homeVariable)=\(shellWord(home)) \(invocation)"
     }
 
     /// Returns a clean title only when the input is recognizably one of the
@@ -157,33 +203,34 @@ extension SessionResumeMetadata {
         }
     }
 
-    /// The shell command that prints the restore banner into a fresh pane.
-    /// Shaped after the message Claude Code itself prints when it quits —
+    /// What gets typed into a restored session's fresh shell, in one write:
+    /// a `printf` that prints the heading, newline-terminated so the shell
+    /// runs it at once, then the resume command with NO newline, so it sits
+    /// at the prompt waiting for the user's Enter —
     ///
-    ///     Resume this session with:
-    ///     claude --resume <id>
+    ///     Last Claude Code session: Agent session persistence on restart
+    ///     ❯ claude --resume 8b5667f6-3fe2-4e76-8c53-a385933a6c4a
     ///
-    /// — under one heading naming the harness and the remembered title, so
-    /// the text that greets the user after a relaunch is the text they saw
-    /// when the agent exited. A session that never titled itself falls
-    /// back to its last prompt for the heading; the prompt is never printed
-    /// on a line of its own.
-    static func resumeHintCommand(for metadata: SessionResumeMetadata) -> String {
+    /// — one keypress to resume, Ctrl-C to decline. The heading names the
+    /// harness and the remembered title (a session that never titled
+    /// itself falls back to its last prompt; the prompt never gets a line
+    /// of its own), and the command is the harness's own resume syntax, so
+    /// a glance shows exactly what Enter will do. Nothing runs by itself:
+    /// resuming stays the user's decision. A harness with no known resume
+    /// syntax gets its session id in the printed text instead, and nothing
+    /// typed at the prompt.
+    static func restoreInput(for metadata: SessionResumeMetadata) -> String {
         let name = displayName(agent: metadata.agent)
-        let headingSource = metadata.title ?? metadata.prompt
-        let heading = headingSource.map(terminalSafeSingleLine)
-
+        let heading = (metadata.title ?? metadata.prompt).map(terminalSafeSingleLine)
         var lines = [heading.map { "Last \(name) session: \($0)" } ?? "Last \(name) session"]
 
-        if let command = resumeCommand(for: metadata) {
-            lines.append("Resume this session with:")
-            lines.append(command)
-        } else {
+        let command = resumeCommand(for: metadata)
+        if command == nil {
             lines.append("Session id: \(terminalSafeSingleLine(metadata.sessionID))")
         }
 
         let arguments = lines.map { "'\(singleQuoted($0))'" }.joined(separator: " ")
-        return "printf '%s\\n' \(arguments)\n"
+        return "printf '%s\\n' \(arguments)\n" + (command ?? "")
     }
 
     private static func parseOmpDecoratedTitle(_ title: String) -> (recognized: Bool, title: String?) {
@@ -207,12 +254,17 @@ extension SessionResumeMetadata {
 
     /// Claude Code sets titles as `<glyph> <summary>`. A bare glyph (no
     /// space, nothing after it) or a title with no recognized glyph at all
-    /// both return nil.
+    /// both return nil — and so does `✳ Claude Code`, the title Claude Code
+    /// shows from launch until the first exchange has been summarized: it
+    /// names the program, not the conversation, and a banner reading "Last
+    /// Claude Code session: Claude Code" would say less than the prompt
+    /// fallback it displaced.
     private static func parseClaudeDecoratedTitle(_ title: String) -> String? {
         guard let first = title.first, claudeGlyphs.contains(first) else { return nil }
         let afterGlyph = title.dropFirst()
         guard afterGlyph.first == " " else { return nil }
-        return cleanRemainder(afterGlyph.dropFirst())
+        let summary = cleanRemainder(afterGlyph.dropFirst())
+        return summary == "Claude Code" ? nil : summary
     }
 
     private static func cleanRemainder(_ remainder: Substring) -> String? {
@@ -223,6 +275,23 @@ extension SessionResumeMetadata {
 
     private static func singleQuoted(_ value: String) -> String {
         value.replacingOccurrences(of: "'", with: "'\"'\"'")
+    }
+
+    /// `value` as one word of a command typed at the prompt: bare when it
+    /// consists only of characters no POSIX shell interprets, otherwise
+    /// single-quoted with embedded quotes escaped, so a session id or path
+    /// carrying metacharacters arrives as an argument and never as a
+    /// second command.
+    private static func shellWord(_ value: String) -> String {
+        let bare = !value.isEmpty && value.unicodeScalars.allSatisfy { scalar in
+            switch scalar {
+            case "a"..."z", "A"..."Z", "0"..."9", "_", "-", ".", "/", ":", "@", "%", "+", ",", "=":
+                return true
+            default:
+                return false
+            }
+        }
+        return bare ? value : "'\(singleQuoted(value))'"
     }
 }
 
