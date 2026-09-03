@@ -21,11 +21,27 @@ struct SidebarView: View {
         return store.attention[sessionID]?.activity
     }
 
+    /// Collapsed by default: the section exists to get parked projects out
+    /// of the way, so it must not take back the space they just freed.
+    @State private var isArchivedExpanded = false
+
     var body: some View {
         VStack(spacing: 0) {
             List(selection: $store.selection) {
                 ForEach(store.projects) { project in
+                    // One Section per project keeps the spacing between
+                    // projects, but the project is named by the Section's
+                    // first ROW, not a header: swipe actions attach to rows
+                    // only, so a header could never carry the Archive
+                    // swipe. The same row is where project reordering and
+                    // collapse will hang later.
                     Section {
+                        ProjectRowView(
+                            store: store,
+                            project: project,
+                            needsWorkingCopyAttention: store.projectWorkingCopyAttention.contains(project.path)
+                        )
+
                         ForEach(store.sessions.filter { $0.target == .root(projectPath: project.path) }) { session in
                             SessionRowView(store: store, session: session, activity: activity(for: session.id))
                         }
@@ -51,44 +67,31 @@ struct SidebarView: View {
                                 )
                             }
                         }
-                    } header: {
-                        HStack {
-                            Text(project.name)
-                                .font(.subheadline)
-                                .fontWeight(.semibold)
-                            if store.projectWorkingCopyAttention.contains(project.path) {
-                                Image(systemName: "exclamationmark.triangle.fill")
-                                    .imageScale(.small)
-                                    .foregroundStyle(.orange)
-                                    .help("The project's workspace hasn't caught up with the latest project progress. If an update conflicted, resolve the marked conflicts there, then refresh it from the project menu.")
-                                    .accessibilityLabel("Project workspace hasn't followed the latest project progress")
+                    }
+                }
+
+                // Present only while something is parked: an empty "Archived
+                // (0)" would be a permanent reminder of a feature not in use.
+                if !store.archivedProjects.isEmpty {
+                    Section {
+                        DisclosureGroup(isExpanded: $isArchivedExpanded) {
+                            ForEach(store.archivedProjects) { archived in
+                                ArchivedProjectRowView(store: store, archived: archived)
                             }
-                            Spacer()
-                            Menu {
-                                projectHeaderMenuItems(project)
-                            } label: {
-                                Image(systemName: "ellipsis.circle")
-                                    .imageScale(.small)
+                        } label: {
+                            HStack(spacing: 8) {
+                                Image(systemName: "archivebox")
                                     .foregroundStyle(.secondary)
+                                Text("Archived")
+                                    .font(.subheadline)
+                                    .fontWeight(.semibold)
+                                Text("\(store.archivedProjects.count)")
+                                    .font(.subheadline)
+                                    .foregroundStyle(.secondary)
+                                    .monospacedDigit()
                             }
-                            .menuStyle(.borderlessButton)
-                            .menuIndicator(.hidden)
-                            .fixedSize()
-                            .accessibilityLabel("More Actions")
-                            // Direct store call, not actions.perform: this targets
-                            // the specific project this header belongs to, not the app's
-                            // global selection (see comment on the row context menu below).
-                            Button {
-                                store.newSession(in: project)
-                            } label: {
-                                Image(systemName: "plus")
-                            }
-                            .buttonStyle(.borderless)
-                        }
-                        .padding(.vertical, 6)
-                        .padding(.trailing, 4)
-                        .contextMenu {
-                            projectHeaderMenuItems(project)
+                            .padding(.vertical, 5)
+                            .accessibilityElement(children: .combine)
                         }
                     }
                 }
@@ -122,12 +125,89 @@ struct SidebarView: View {
         let target = TargetRef.workspace(projectPath: workspace.projectPath, name: workspace.name)
         return store.sessions.filter { $0.target == target }
     }
+}
 
-    /// Shared with the project header's context menu AND its ellipsis `Menu`
-    /// button, so the two presentations can never drift apart.
+/// The row that names a project — what used to be the Section header, with
+/// the same name, working-copy triangle, ellipsis menu and "+" button, now
+/// as a row so it can be swiped. Built like `WorkspaceRowView`: a
+/// plain-style Button is the tap target and the trailing controls are its
+/// siblings, so no two handlers ever fight over one click. Tapping selects
+/// the project's first root session, or creates one, exactly as tapping a
+/// workspace row does for that workspace. The ellipsis and "+" stay always
+/// visible rather than hover-revealed, as they were on the header: this line
+/// is the project's toolbar, not a row among siblings.
+private struct ProjectRowView: View {
+    let store: AppStore
+    let project: Project
+    let needsWorkingCopyAttention: Bool
+
+    var body: some View {
+        HStack(spacing: 0) {
+            Button {
+                store.selectOrCreateSession(in: .root(projectPath: project.path))
+            } label: {
+                HStack(spacing: 8) {
+                    Text(project.name)
+                        .font(.subheadline)
+                        .fontWeight(.semibold)
+                        .lineLimit(1)
+                    if needsWorkingCopyAttention {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .imageScale(.small)
+                            .foregroundStyle(.orange)
+                            .help("The project's workspace hasn't caught up with the latest project progress. If an update conflicted, resolve the marked conflicts there, then refresh it from the project menu.")
+                            .accessibilityLabel("Project workspace hasn't followed the latest project progress")
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.vertical, 6)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            Menu {
+                menuItems
+            } label: {
+                Image(systemName: "ellipsis.circle")
+                    .imageScale(.small)
+                    .foregroundStyle(.secondary)
+            }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .fixedSize()
+            .accessibilityLabel("More Actions")
+            // Direct store call, not actions.perform: this targets the
+            // specific project this row belongs to, not the app's global
+            // selection (see comment on the session row's context menu).
+            Button {
+                store.newSession(in: project)
+            } label: {
+                Image(systemName: "plus")
+            }
+            .buttonStyle(.borderless)
+        }
+        .padding(.trailing, 4)
+        .contextMenu {
+            menuItems
+        }
+        // Trailing edge, full swipe allowed, like archiving in Mail. No
+        // confirmation: an archive is undone in one click from the Archived
+        // section, and the parked rows keep their resume hints.
+        .swipeActions(edge: .trailing, allowsFullSwipe: true) {
+            Button {
+                store.archiveProject(project)
+            } label: {
+                Label("Archive", systemImage: "archivebox")
+            }
+            .tint(Theme.accent)
+        }
+    }
+
+    /// Shared with the row's ellipsis `Menu` button AND its context menu,
+    /// so the two presentations can never drift apart.
     @ViewBuilder
-    private func projectHeaderMenuItems(_ project: Project) -> some View {
-        if store.projectWorkingCopyAttention.contains(project.path) {
+    private var menuItems: some View {
+        if needsWorkingCopyAttention {
             Button("Refresh Project Workspace") {
                 Task {
                     await store.refreshProjectWorkspace(project.path)
@@ -150,13 +230,96 @@ struct SidebarView: View {
                 }
             }
         }
-        // Direct store/Dialogs call, not actions.perform: this
-        // targets the specific right-clicked project, not the
-        // resolved-from-selection target AppActions' .removeProject
-        // case would use (see design rationale in AppActions.swift).
+        // Direct store/Dialogs calls, not actions.perform: these target the
+        // specific right-clicked project, not the resolved-from-selection
+        // target AppActions' .archiveProject/.removeProject cases would use
+        // (see design rationale in AppActions.swift).
+        Button("Archive Project") {
+            store.archiveProject(project)
+        }
         Button("Remove Project…") {
             if Dialogs.confirmRemove(project) {
                 store.removeProject(project)
+            }
+        }
+    }
+}
+
+/// A parked project in the Archived section. The whole row is the restore
+/// Button (the `WorkspaceRowView` pattern again), with a leading Restore
+/// swipe as the mirror of the project row's trailing Archive swipe. The
+/// hover-revealed ellipsis and the context menu also carry Remove, which
+/// keeps its confirmation — that one really does forget the rows. The path
+/// sits under the name because two parked projects can easily share one.
+private struct ArchivedProjectRowView: View {
+    let store: AppStore
+    let archived: ArchivedProject
+
+    @State private var isHovered = false
+
+    var body: some View {
+        HStack(spacing: 0) {
+            Button {
+                store.restoreProject(archived.path)
+            } label: {
+                HStack(spacing: 8) {
+                    Image(systemName: "folder")
+                        .foregroundStyle(.secondary)
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(archived.name)
+                            .font(.subheadline)
+                            .lineLimit(1)
+                        Text((archived.path as NSString).abbreviatingWithTildeInPath)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.vertical, 4)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help("Restore \u{201C}\(archived.name)\u{201D}")
+
+            Menu {
+                menuItems
+            } label: {
+                Image(systemName: "ellipsis.circle")
+                    .imageScale(.small)
+                    .foregroundStyle(.secondary)
+            }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .fixedSize()
+            .accessibilityLabel("More Actions")
+            .opacity(isHovered ? 1 : 0)
+        }
+        .onHover { isHovered = $0 }
+        .contextMenu {
+            menuItems
+        }
+        .swipeActions(edge: .leading, allowsFullSwipe: true) {
+            Button {
+                store.restoreProject(archived.path)
+            } label: {
+                Label("Restore", systemImage: "tray.and.arrow.up")
+            }
+            .tint(Theme.accent)
+        }
+    }
+
+    /// Shared with the ellipsis `Menu` button above, so the two
+    /// presentations can never drift apart.
+    @ViewBuilder
+    private var menuItems: some View {
+        Button("Restore Project") {
+            store.restoreProject(archived.path)
+        }
+        Button("Remove Project…") {
+            if Dialogs.confirmRemove(archived.project) {
+                store.removeProject(archived.project)
             }
         }
     }
