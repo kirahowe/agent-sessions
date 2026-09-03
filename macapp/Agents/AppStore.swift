@@ -82,6 +82,10 @@ final class AppStore: ObservableObject {
     /// classifier path. Written only by `apply(_:toSession:pane:)`,
     /// `setAttended`, and the pane-close pruning.
     private var paneAttention: [String: [UUID: AttentionState]] = [:]
+    /// The clock `AttentionState.since` is stamped from. A settable closure
+    /// rather than an inline `Date()` so tests can pin it and assert exact
+    /// timestamps through `apply` and the pane fold below.
+    var now: () -> Date = Date.init
     /// Project working copies whose progress hasn't been reconciled — either
     /// because automatic reconciliation failed, or because it was deferred
     /// while the project root had a live session of its own — keyed by
@@ -948,7 +952,7 @@ final class AppStore: ObservableObject {
             activity: nil, isStructured: false, isAttended: attendedSessionID == sessionID
         )
         var panes = paneAttention[sessionID] ?? [:]
-        panes[paneID] = SessionAttention.reduce(panes[paneID] ?? seed, signal)
+        panes[paneID] = SessionAttention.reduce(panes[paneID] ?? seed, signal, at: now())
         paneAttention[sessionID] = panes
         recombineAttention(for: sessionID)
     }
@@ -969,8 +973,8 @@ final class AppStore: ObservableObject {
     /// is blocked; else any pane your-turn → your-turn; else nothing. The
     /// combined `isStructured` is "any pane speaks the protocol" (only
     /// meaningful to observers; each pane's own latch lives in its own
-    /// state), and `isAttended` restates the session-level attended fact.
-    /// With one pane — every session until its first split — this fold is
+    /// state), `isAttended` restates the session-level attended fact, and
+    /// `since` is the earliest pane to reach the winning state. With one pane — every session until its first split — this fold is
     /// the identity, so nothing about single-pane behavior changes.
     private func recombineAttention(for sessionID: String) {
         let isAttended = attendedSessionID == sessionID
@@ -987,10 +991,17 @@ final class AppStore: ObservableObject {
         let activity: SessionActivity? = activities.contains(.blocked)
             ? .blocked
             : activities.contains(.yourTurn) ? .yourTurn : nil
+        // The row has been in its winning state since the EARLIEST pane
+        // reached it: two panes both blocked means the user has been holding
+        // up the older one that long. Panes in a lesser state don't vote — a
+        // pane your-turn since 9:50 says nothing about how long the row has
+        // been blocked.
+        let since = states.compactMap { $0.value.activity == activity ? $0.value.since : nil }.min()
         attention[sessionID] = AttentionState(
             activity: activity,
             isStructured: states.contains { $0.value.isStructured },
-            isAttended: isAttended
+            isAttended: isAttended,
+            since: since
         )
     }
 
@@ -1001,7 +1012,7 @@ final class AppStore: ObservableObject {
         if var panes = paneAttention[sessionID] {
             for (paneID, state) in panes {
                 panes[paneID] = SessionAttention.reduce(
-                    state, .attentionChanged(isAttended: isAttended)
+                    state, .attentionChanged(isAttended: isAttended), at: now()
                 )
             }
             paneAttention[sessionID] = panes

@@ -58,6 +58,16 @@ struct AttentionState: Equatable {
     /// already on screen) and clears an unstructured indicator on the way
     /// in (see `SessionAttention.reduce`'s `.attentionChanged` case).
     var isAttended = false
+
+    /// When `activity` took its current value: the moment the indicator was
+    /// raised, or moved between `.yourTurn` and `.blocked`. `nil` exactly
+    /// when `activity` is nil. Only the reducer writes it, from the clock it
+    /// is handed, so the same rule holds whichever signal did the raising —
+    /// and a repeated identical signal (a second bell, a re-sent `.set`)
+    /// leaves it alone: the user has been waited on since the first raise,
+    /// not the most recent one. Declared last, with a default, so the
+    /// memberwise initializer's existing call sites still compile.
+    var since: Date? = nil
 }
 
 /// The single funnel every attention signal, from every source, passes
@@ -67,7 +77,9 @@ struct AttentionState: Equatable {
 /// agent, one terminal; `AppStore.recombineAttention` folds a session's
 /// pane states into its row's indicator. Foundation-only, like
 /// `SessionActivity.swift`, so the whole state machine is testable without
-/// SwiftUI, AppKit, or a real terminal.
+/// SwiftUI, AppKit, or a real terminal. The clock is a parameter, never
+/// read inside, for the same reason: the transition table stays a pure
+/// function of its inputs and can be tested against fixed dates.
 ///
 /// Nothing below depends on receiving a repeated identical signal. Ghostty
 /// rate-limits desktop notifications to about once a second and suppresses
@@ -76,7 +88,7 @@ struct AttentionState: Equatable {
 /// events. Every case here either latches, raises once, or clears — none of
 /// them need to fire twice to be correct.
 enum SessionAttention {
-    static func reduce(_ state: AttentionState, _ signal: AttentionSignal) -> AttentionState {
+    static func reduce(_ state: AttentionState, _ signal: AttentionSignal, at now: Date) -> AttentionState {
         var next = state
         switch signal {
         case .structured(let message):
@@ -121,6 +133,13 @@ enum SessionAttention {
             // genuinely still blocked would be a lie. It stays red until
             // the hook says otherwise.
             if isAttended, !state.isStructured { next.activity = nil }
+        }
+        // `since` tracks the activity VALUE, not the signal: a raise or an
+        // escalation stamps the clock, a clear drops it, and a signal that
+        // leaves the activity as it was — including every early return
+        // above — leaves the timestamp as it was too.
+        if next.activity != state.activity {
+            next.since = next.activity == nil ? nil : now
         }
         return next
     }

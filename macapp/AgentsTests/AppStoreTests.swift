@@ -1933,6 +1933,68 @@ final class AppStoreTests: XCTestCase {
         )
     }
 
+    // MARK: - 51c: when a row entered its state (the dashboard's age)
+
+    func test51c_applyStampsSinceFromTheStoresClockAndARepeatKeepsIt() {
+        let (store, spy, _) = TestSupport.makeStore()
+        store.addProject(path: "/tmp/proj-A")
+        let session = store.sessions.first!
+        let t0 = Date(timeIntervalSinceReferenceDate: 1_000)
+        let t1 = t0.addingTimeInterval(60)
+
+        store.now = { t0 }
+        spy.emitSignal(session.id, pane: testPane, .structured(.set(.blocked)))
+        XCTAssertEqual(
+            store.attention[session.id]?.since, t0,
+            "the row's timestamp must come from the store's clock at the moment the signal is applied — that clock is the only thing the dashboard's 'blocked for 8m' can be measured from"
+        )
+
+        store.now = { t1 }
+        spy.emitSignal(session.id, pane: testPane, .structured(.set(.blocked)))
+        XCTAssertEqual(
+            store.attention[session.id]?.since, t0,
+            "a hook repeating the state it already reported must not restart the row's age through the store any more than through the reducer"
+        )
+    }
+
+    func test51c_rowSinceIsTheEarliestPaneInTheWinningState() {
+        let (store, spy, _) = TestSupport.makeStore()
+        store.addProject(path: "/tmp/proj-A")
+        let session = store.sessions.first!
+        let t0 = Date(timeIntervalSinceReferenceDate: 1_000)
+        let t1 = t0.addingTimeInterval(60)
+        let t2 = t1.addingTimeInterval(60)
+        let waitingPane = UUID()
+        let laterBlockedPane = UUID()
+        let earlierBlockedPane = UUID()
+
+        store.now = { t0 }
+        spy.emitSignal(session.id, pane: waitingPane, .structured(.set(.yourTurn)))
+        store.now = { t2 }
+        spy.emitSignal(session.id, pane: laterBlockedPane, .structured(.set(.blocked)))
+        store.now = { t1 }
+        spy.emitSignal(session.id, pane: earlierBlockedPane, .structured(.set(.blocked)))
+
+        XCTAssertEqual(store.attention[session.id]?.activity, .blocked)
+        XCTAssertEqual(
+            store.attention[session.id]?.since, t1,
+            "with two panes blocked the row has been blocked since the EARLIER one — and the your-turn pane, older still, must not vote: it says nothing about how long the row has been red"
+        )
+
+        spy.emitPaneClosed(session.id, pane: earlierBlockedPane)
+        XCTAssertEqual(
+            store.attention[session.id]?.since, t2,
+            "once the earlier blocked pane is gone the remaining blocked pane's own stamp is the row's age — the fold must be recomputed from live panes, never remembered from a pane that no longer exists"
+        )
+
+        spy.emitSignal(session.id, pane: laterBlockedPane, .structured(.clear))
+        XCTAssertEqual(store.attention[session.id]?.activity, .yourTurn)
+        XCTAssertEqual(
+            store.attention[session.id]?.since, t0,
+            "when the row drops back to your-turn its age is the your-turn pane's original stamp: the user has been waited on by that agent since t0, and the blocked interlude doesn't reset that"
+        )
+    }
+
     // MARK: - 52
 
     func test52_onTitleChangeBecomesTheDisplayName() {
