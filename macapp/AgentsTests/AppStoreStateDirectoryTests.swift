@@ -31,4 +31,12 @@ final class AppStoreStateDirectoryTests: XCTestCase {
             "Agents"
         )
     }
+
+    func testAnyOtherBundleIdentifierGetsItsOwnDirectory() {
+        XCTAssertEqual(
+            AppStore.stateDirectoryName(forBundleIdentifier: "com.kirahowe.agents.verify"),
+            "Agents (com.kirahowe.agents.verify)",
+            "a build under any third identity must never write into the release app's directory, which holds the user's real rows"
+        )
+    }
 }

@@ -172,8 +172,18 @@ final class AppStore: ObservableObject {
     /// build (com.kirahowe.agents.dev) gets a brand-new "Agents Dev"
     /// directory and starts fresh — there is nothing to migrate for it, it
     /// never had persisted state of its own before this split existed.
+    ///
+    /// Any OTHER identity — a one-off verification build launched beside
+    /// the two real ones, say — gets a directory of its own, named after
+    /// its bundle id, rather than falling into the release app's. The
+    /// release directory is the one place a stray build must never write:
+    /// it holds the user's real rows.
     static func stateDirectoryName(forBundleIdentifier id: String?) -> String {
-        id == "com.kirahowe.agents.dev" ? "Agents Dev" : "Agents"
+        switch id {
+        case nil, "com.kirahowe.agents": return "Agents"
+        case "com.kirahowe.agents.dev": return "Agents Dev"
+        case let other?: return "Agents (\(other))"
+        }
     }
 
     /// The app's real persisted-state location: ~/Library/Application
