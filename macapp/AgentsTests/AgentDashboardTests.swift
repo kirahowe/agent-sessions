@@ -120,6 +120,46 @@ final class AgentDashboardTests: XCTestCase {
         let result = AgentDashboard.entries(sessions: [only], attention: [only.id: attentionState(.blocked)])
 
         XCTAssertEqual(result.count, 1, "a single blocked session must produce exactly one entry")
-        XCTAssertEqual(result.first?.id, only.id, "an entry's `id` must equal its session's id — SwiftUI's `List(entries)` relies on this for row identity, and a mismatch here would let the list misidentify or misanimate rows across updates")
+        XCTAssertEqual(result.first?.id, only.id, "an entry's `id` must equal its session's id — SwiftUI's `ForEach(rows)` relies on this for row identity, and a mismatch here would let the queue misidentify or misanimate cards across updates")
+    }
+
+    // MARK: - 8
+
+    func test08_entryCarriesTheStatesSinceTimestamp() {
+        let raisedAt = Date(timeIntervalSinceReferenceDate: 1_000)
+        let dated = session("Dated")
+        let undated = session("Undated")
+        let attention = [
+            dated.id: AttentionState(activity: .blocked, since: raisedAt),
+            undated.id: AttentionState(activity: .yourTurn)
+        ]
+
+        let result = AgentDashboard.entries(sessions: [dated, undated], attention: attention)
+
+        XCTAssertEqual(result.first?.since, raisedAt, "the entry must carry the state's `since` through unchanged — it is the only thing the card's age is computed from")
+        XCTAssertEqual(result.last?.since, nil, "a state with no timestamp must still produce an entry (the row is listed, just undated) rather than being dropped")
+        XCTAssertEqual(result.count, 2)
+    }
+
+    // MARK: - 9
+
+    /// The exact boundaries matter: a card reads "now" for its first minute,
+    /// then flips unit at 60 minutes and 24 hours, always rounding down.
+    func test09_elapsedFormatsWholeUnitsFlooredWithSpokenForms() {
+        let since = Date(timeIntervalSinceReferenceDate: 0)
+        func at(_ seconds: TimeInterval) -> AgentDashboard.Elapsed {
+            AgentDashboard.elapsed(since: since, now: since.addingTimeInterval(seconds))
+        }
+
+        XCTAssertEqual(at(0), .init(short: "now", spoken: "just now"))
+        XCTAssertEqual(at(59), .init(short: "now", spoken: "just now"), "anything under a minute is 'now' — a seconds counter would only add churn")
+        XCTAssertEqual(at(60), .init(short: "1m", spoken: "1 minute"), "the singular form must be used at exactly one unit")
+        XCTAssertEqual(at(8 * 60 + 59), .init(short: "8m", spoken: "8 minutes"), "minutes must floor, not round — 8:59 is still 8m")
+        XCTAssertEqual(at(59 * 60 + 59), .init(short: "59m", spoken: "59 minutes"))
+        XCTAssertEqual(at(60 * 60), .init(short: "1h", spoken: "1 hour"))
+        XCTAssertEqual(at(23 * 3600 + 59 * 60), .init(short: "23h", spoken: "23 hours"))
+        XCTAssertEqual(at(24 * 3600), .init(short: "1d", spoken: "1 day"))
+        XCTAssertEqual(at(2 * 24 * 3600 + 5 * 3600), .init(short: "2d", spoken: "2 days"), "days must floor too — two days and five hours is 2d")
+        XCTAssertEqual(at(-30), .init(short: "now", spoken: "just now"), "a `since` in the future (clock skew between a stamp and a later reading) must read as 'now', never as a negative age")
     }
 }

@@ -161,13 +161,17 @@ including the sessions it declined to announce.
 
 ## Agent dashboard
 
-The right-side Agent Dashboard shows only the sessions that need you: blocked
-sessions first, then sessions waiting for you. Sessions with no attention
-signal are hidden rather than listed at the bottom. The summary line above the
-list still counts every open session, so the difference is how many are
-hidden. When sessions are open but none need attention, the pane says so.
-Selecting a row opens that terminal. Use the trailing-sidebar toolbar button to
-collapse or reopen the pane.
+The right-side Agent Dashboard is a triage queue of only the sessions that
+need you: a "Blocked on you" section first, then "Waiting for you", each headed
+by its indicator and a count. Every card shows the session, its project and
+workspace, and how long it has been in that state — "now" for the first
+minute, then whole minutes, hours, or days, timed from the moment the state was
+raised or escalated, so a repeated signal never restarts it. Sessions with no
+attention signal are hidden rather than listed at the bottom; the footer still
+counts every open session, so the difference is how many are quiet. When
+sessions are open but none need attention, the pane says so. Selecting a card
+opens that terminal. Use the trailing-sidebar toolbar button to collapse or
+reopen the pane.
 
 The all-quiet state says the hidden sessions are “working or idle” rather than
 “working” on purpose: without a structured status signal, the app cannot
