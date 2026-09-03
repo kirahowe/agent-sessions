@@ -139,23 +139,49 @@ extension SessionRow {
     }
 }
 
+/// A project parked out of the sidebar by `AppStore.archiveProject`, with
+/// its rows kept whole so a restore reinstates the sidebar exactly as it
+/// was: session ids (and with them terminal-view identity and resume
+/// metadata), names, agent titles, and workspace rows all survive.
+/// `archivedAt` is recorded so a future automatic "archive after N idle
+/// days" needs no migration; nothing reads it yet.
+struct ArchivedProject: Identifiable, Codable, Hashable {
+    let path: String
+    var archivedAt: Date
+    var sessions: [SessionRow]
+    var workspaces: [WorkspaceRow]
+
+    var id: String { path }   // same identity rule as Project
+    var name: String { (path as NSString).lastPathComponent }
+    var project: Project { Project(path: path) }
+}
+
 struct PersistedState: Codable {
     var version: Int
     var projects: [String]        // absolute paths
     var sessions: [SessionRow]
     var workspaces: [WorkspaceRow]
     var selection: String?        // session id
+    var archivedProjects: [ArchivedProject]
 
-    init(version: Int, projects: [String], sessions: [SessionRow], workspaces: [WorkspaceRow], selection: String?) {
+    init(
+        version: Int,
+        projects: [String],
+        sessions: [SessionRow],
+        workspaces: [WorkspaceRow],
+        selection: String?,
+        archivedProjects: [ArchivedProject] = []
+    ) {
         self.version = version
         self.projects = projects
         self.sessions = sessions
         self.workspaces = workspaces
         self.selection = selection
+        self.archivedProjects = archivedProjects
     }
 
     private enum CodingKeys: String, CodingKey {
-        case version, projects, sessions, workspaces, selection
+        case version, projects, sessions, workspaces, selection, archivedProjects
     }
 
     /// The pre-v2 on-disk shape: sessions carried a flat `projectPath`
@@ -171,6 +197,9 @@ struct PersistedState: Codable {
         version = try container.decodeIfPresent(Int.self, forKey: .version) ?? 1
         projects = try container.decode([String].self, forKey: .projects)
         selection = try container.decodeIfPresent(String.self, forKey: .selection)
+        // Absent from every file written before archiving existed; an
+        // optional key (not a version bump) keeps those loading unchanged.
+        archivedProjects = try container.decodeIfPresent([ArchivedProject].self, forKey: .archivedProjects) ?? []
 
         if version >= 2 {
             sessions = try container.decode([SessionRow].self, forKey: .sessions)

@@ -59,6 +59,13 @@ final class AppStore: ObservableObject {
     @Published var projects: [Project] = []
     @Published var sessions: [SessionRow] = []
     @Published var workspaces: [WorkspaceRow] = []
+    /// Projects parked out of the sidebar, most recently archived first.
+    /// Their rows live here and ONLY here — never also in `projects`,
+    /// `sessions` or `workspaces` — so nothing that consumes the live arrays
+    /// (sidebar, dashboard, badge, navigation, workspace operations) has to
+    /// know archiving exists. Written only by `archiveProject`,
+    /// `restoreProject` and `removeProject`.
+    @Published private(set) var archivedProjects: [ArchivedProject] = []
     @Published var selection: String? {
         didSet { updateAttention() }
     }
@@ -236,7 +243,18 @@ final class AppStore: ObservableObject {
 
     // MARK: - Project management
 
+    /// Adding a path that is archived restores it, rows and all, rather than
+    /// opening a second, empty copy beside the parked one: the user picked
+    /// that directory in the open panel because they want it back in the
+    /// sidebar, and its parked sessions are a better answer to that than a
+    /// fresh "Session 1". No extra session is added on top — see
+    /// `restoreProject`, which gives a session only to a project that has
+    /// none.
     func addProject(path: String) {
+        if archivedProjects.contains(where: { $0.path == path }) {
+            restoreProject(path)
+            return
+        }
         let project: Project
         if let existing = projects.first(where: { $0.path == path }) {
             project = existing
@@ -250,6 +268,10 @@ final class AppStore: ObservableObject {
         save()
     }
 
+    /// Forgets a project wherever it is — active or archived. Every live-side
+    /// step is a no-op for an archived project (it has no live rows), so
+    /// the one function serves both the sidebar's project row and the
+    /// Archived section's rows.
     func removeProject(_ project: Project) {
         let removedIDs = sessions.filter { $0.projectPath == project.path }.map(\.id)
         for id in removedIDs {
@@ -266,10 +288,86 @@ final class AppStore: ObservableObject {
         // Removing a project is local bookkeeping only: never destroy its
         // on-disk workspaces.
         workspaces.removeAll { $0.projectPath == project.path }
+        archivedProjects.removeAll { $0.path == project.path }
         if let selection, removedIDs.contains(selection) {
             self.selection = nil
         }
         save()
+    }
+
+    /// Parks a project: stops its terminals and moves its session and
+    /// workspace rows out of the live arrays into `archivedProjects`, whole,
+    /// so `restoreProject` can put the sidebar back exactly as it was. The
+    /// live-side teardown deliberately mirrors `removeProject` step for
+    /// step — the only difference is where the rows go afterwards. Like
+    /// removal, this is app bookkeeping only: nothing on disk changes and
+    /// the engine is never called, so a workspace with unlanded changes is
+    /// exactly as recoverable after an archive as before it.
+    ///
+    /// The selection, if it was inside this project, moves to the project
+    /// now occupying its sidebar slot (the previous one when it was last)
+    /// rather than going nil: the terminal area should keep showing
+    /// something while other projects remain.
+    func archiveProject(_ project: Project) {
+        guard let index = projects.firstIndex(where: { $0.path == project.path }) else { return }
+        let parkedSessions = sessions.filter { $0.projectPath == project.path }
+        let parkedWorkspaces = workspaces.filter { $0.projectPath == project.path }
+        let removedIDs = parkedSessions.map(\.id)
+        for id in removedIDs {
+            terminals.closeSession(id)
+        }
+        sessions.removeAll { $0.projectPath == project.path }
+        workspaces.removeAll { $0.projectPath == project.path }
+        pruneLiveSessionState()
+        projects.remove(at: index)
+        projectLifecycleTokens.removeValue(forKey: project.path)
+        projectWorkingCopyAttention.remove(project.path)
+        if closeWorkspace?.projectPath == project.path {
+            closeWorkspace = nil
+        }
+        // Most recently archived first. The path can't already be parked —
+        // a path is active or archived, never both — but dropping any stale
+        // entry keeps that true even if state ever desyncs.
+        archivedProjects.removeAll { $0.path == project.path }
+        archivedProjects.insert(
+            ArchivedProject(
+                path: project.path,
+                archivedAt: Date(),
+                sessions: parkedSessions,
+                workspaces: parkedWorkspaces
+            ),
+            at: 0
+        )
+        if let selection, removedIDs.contains(selection) {
+            let neighbour = projects.indices.contains(index) ? projects[index] : projects.last
+            self.selection = orderedSessions.first { $0.projectPath == neighbour?.path }?.id
+        }
+        save()
+    }
+
+    /// Reinstates an archived project at the end of the active list — the
+    /// same place `addProject` puts a new one — with every parked row back
+    /// in place. Selection lands on the project's first sidebar session so
+    /// the restore is visibly answered; a project archived with no sessions
+    /// gets a fresh one, as Add Project would give it.
+    func restoreProject(_ path: String) {
+        guard let index = archivedProjects.firstIndex(where: { $0.path == path }) else { return }
+        let archived = archivedProjects.remove(at: index)
+        let project = archived.project
+        projects.append(project)
+        projectLifecycleTokens[project.path] = UUID()
+        sessions.append(contentsOf: archived.sessions)
+        workspaces.append(contentsOf: archived.workspaces)
+        // These targets' counters were last seeded before the archive — or
+        // never, when the archive predates this launch — so reseed from the
+        // restored names, or a new session would reuse "Session 1".
+        seedSessionCounters(for: orderedTargets.filter { $0.projectPath == project.path })
+        if let first = orderedSessions.first(where: { $0.projectPath == project.path }) {
+            selection = first.id
+            save()
+        } else {
+            newSession(in: project)
+        }
     }
 
     // MARK: - Workspace management
@@ -1343,7 +1441,7 @@ final class AppStore: ObservableObject {
         guard FileManager.default.fileExists(atPath: stateURL.path) else { return }
 
         guard let data = try? Data(contentsOf: stateURL),
-              let state = try? JSONDecoder().decode(PersistedState.self, from: data)
+              let state = try? Self.makeDecoder().decode(PersistedState.self, from: data)
         else {
             moveAsideCorruptStateFile()
             return
@@ -1353,6 +1451,23 @@ final class AppStore: ObservableObject {
         sessions = state.sessions
         workspaces = state.workspaces
         selection = state.selection
+        archivedProjects = state.archivedProjects
+    }
+
+    /// `ArchivedProject.archivedAt` is the only date in the file. ISO 8601
+    /// keeps it legible to anyone inspecting state.json, where the default
+    /// strategy would write seconds since 2001. Encoder and decoder must
+    /// agree, so both are minted here.
+    private static func makeDecoder() -> JSONDecoder {
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        return decoder
+    }
+
+    private static func makeEncoder() -> JSONEncoder {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        return encoder
     }
 
     /// Renames an unreadable/undecodable state.json to a sibling file
@@ -1396,12 +1511,13 @@ final class AppStore: ObservableObject {
             projects: projects.map(\.path),
             sessions: sessions,
             workspaces: workspaces,
-            selection: selection
+            selection: selection,
+            archivedProjects: archivedProjects
         )
         do {
             let directory = stateURL.deletingLastPathComponent()
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-            let data = try JSONEncoder().encode(state)
+            let data = try Self.makeEncoder().encode(state)
             try data.write(to: stateURL, options: .atomic)
         } catch {
             NSLog("Agents: failed to save state: \(error)")
@@ -1409,7 +1525,15 @@ final class AppStore: ObservableObject {
     }
 
     private func seedSessionCounters() {
-        for target in orderedTargets {
+        seedSessionCounters(for: orderedTargets)
+    }
+
+    /// Seeds each target's counter to one past its highest "Session N" name.
+    /// Never lowers a counter that already exists: a reseed (a restore after
+    /// an archive in this launch) must not hand out a number a close has
+    /// already retired.
+    private func seedSessionCounters(for targets: [TargetRef]) {
+        for target in targets {
             let maxNumber = sessions
                 .filter { $0.target == target }
                 .compactMap { row -> Int? in
@@ -1417,7 +1541,7 @@ final class AppStore: ObservableObject {
                     return Int(row.name.dropFirst("Session ".count))
                 }
                 .max() ?? 0
-            sessionCounters[target.id] = maxNumber + 1
+            sessionCounters[target.id] = max(sessionCounters[target.id] ?? 0, maxNumber + 1)
         }
     }
 

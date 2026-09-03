@@ -4224,4 +4224,218 @@ final class AppStoreTests: XCTestCase {
             "with the sheet dismissed there is no longer a workspace under review"
         )
     }
+
+    // MARK: - 92: project archiving
+
+    func test92a_archiveProjectParksRowsWholeStopsTerminalsAndNeverTouchesTheEngine() async {
+        let fake = FakeWorkspaceEngine()
+        let (store, spy, _) = TestSupport.makeStore(engine: fake)
+        let path = "/tmp/proj-A"
+        store.addProject(path: path)                                   // Session 1
+        let project = store.projects.first { $0.path == path }!
+        store.newSession(in: project)                                  // Session 2
+        let wsRow = WorkspaceRow(projectPath: path, name: "ws-a", path: "/tmp/workspaces/ws-a", label: "draft")
+        fake.nextCreateResult = .success(wsRow)
+        await store.createWorkspace(in: path)                          // + a workspace session
+        let renamed = store.sessions.first { $0.projectPath == path && $0.name == "Session 1" }!
+        store.renameSession(renamed.id, to: "build server")
+        spy.emitAgentEvent(
+            renamed.id,
+            AgentSessionEvent(agent: "claude", name: "session_start", sessionID: "c-1", query: nil)
+        )
+        let parkedSessions = store.sessions.filter { $0.projectPath == path }
+        let parkedWorkspaces = store.workspaces.filter { $0.projectPath == path }
+        for session in parkedSessions {
+            store.apply(.structured(.set(.yourTurn)), toSession: session.id, pane: testPane)
+        }
+        XCTAssertEqual(parkedSessions.count, 3)
+
+        store.archiveProject(project)
+
+        XCTAssertFalse(store.projects.contains { $0.path == path })
+        XCTAssertTrue(store.sessions.isEmpty)
+        XCTAssertTrue(store.workspaces.isEmpty)
+        XCTAssertNil(store.selection)
+        XCTAssertTrue(store.attention.isEmpty, "attention describes live processes and goes with them")
+        XCTAssertEqual(Set(spy.closedIDs), Set(parkedSessions.map(\.id)))
+        XCTAssertTrue(fake.deleteCalls.isEmpty, "archiving is app bookkeeping; the engine is never called")
+        XCTAssertEqual(store.archivedProjects.map(\.path), [path])
+        let archived = store.archivedProjects[0]
+        XCTAssertEqual(archived.sessions, parkedSessions, "rows are parked whole, in order, resume metadata included")
+        XCTAssertEqual(archived.sessions[0].resume?.sessionID, "c-1")
+        XCTAssertEqual(archived.workspaces, parkedWorkspaces)
+    }
+
+    func test92b_archiveMovesSelectionToTheProjectTakingItsSlot() {
+        let (store, _, _) = TestSupport.makeStore()
+        store.addProject(path: "/tmp/proj-A")
+        store.addProject(path: "/tmp/proj-B")
+        store.addProject(path: "/tmp/proj-C")
+        let projects = store.projects
+        func firstSession(in path: String) -> String? {
+            store.orderedSessions.first { $0.projectPath == path }?.id
+        }
+
+        store.selection = firstSession(in: projects[1].path)
+        store.archiveProject(projects[1])
+        XCTAssertEqual(store.selection, firstSession(in: projects[2].path), "the next project takes the archived slot")
+
+        store.archiveProject(projects[2])
+        XCTAssertEqual(store.selection, firstSession(in: projects[0].path), "archiving the last project falls back to the previous one")
+
+        store.archiveProject(projects[0])
+        XCTAssertNil(store.selection, "no projects left to show")
+        XCTAssertEqual(
+            store.archivedProjects.map(\.path),
+            [projects[0].path, projects[2].path, projects[1].path],
+            "most recently archived first"
+        )
+    }
+
+    func test92c_archiveLeavesAnUnrelatedSelectionUntouched() {
+        let (store, spy, _) = TestSupport.makeStore()
+        store.addProject(path: "/tmp/proj-A")
+        store.addProject(path: "/tmp/proj-B") // selection now in B
+        let projectA = store.projects[0]
+        let sessionA = store.sessions.first { $0.projectPath == projectA.path }!
+        let selectionBefore = store.selection
+
+        store.archiveProject(projectA)
+
+        XCTAssertEqual(store.selection, selectionBefore)
+        XCTAssertEqual(spy.closedIDs, [sessionA.id])
+    }
+
+    func test92d_restoreReinstatesRowsSelectsFirstSessionAndContinuesNumbering() async {
+        let fake = FakeWorkspaceEngine()
+        let (store, _, _) = TestSupport.makeStore(engine: fake)
+        let path = "/tmp/proj-A"
+        store.addProject(path: path)                                   // Session 1
+        let project = store.projects[0]
+        store.newSession(in: project)                                  // Session 2
+        let wsRow = WorkspaceRow(projectPath: path, name: "ws-a", path: "/tmp/workspaces/ws-a", label: nil)
+        fake.nextCreateResult = .success(wsRow)
+        await store.createWorkspace(in: path)
+        store.addProject(path: "/tmp/proj-B")
+        let parkedSessions = store.sessions.filter { $0.projectPath == path }
+        let parkedWorkspaces = store.workspaces.filter { $0.projectPath == path }
+        store.archiveProject(project)
+
+        store.restoreProject(path)
+
+        XCTAssertTrue(store.archivedProjects.isEmpty)
+        XCTAssertEqual(store.projects.map(\.path), ["/tmp/proj-B", path], "restored at the end, where Add Project puts a new one")
+        XCTAssertEqual(store.sessions.filter { $0.projectPath == path }, parkedSessions)
+        XCTAssertEqual(store.workspaces.filter { $0.projectPath == path }, parkedWorkspaces)
+        XCTAssertEqual(store.selection, parkedSessions[0].id, "the restore is answered by selecting the project's first session")
+
+        store.newSession(in: project)
+        XCTAssertEqual(store.sessions.last?.name, "Session 3", "numbering continues; Session 1 is not reused")
+
+        let wsRow2 = WorkspaceRow(projectPath: path, name: "ws-b", path: "/tmp/workspaces/ws-b", label: nil)
+        fake.nextCreateResult = .success(wsRow2)
+        await store.createWorkspace(in: path)
+        XCTAssertTrue(
+            store.workspaces.contains { $0.name == "ws-b" },
+            "restore must mint a lifecycle token, or every workspace operation silently no-ops"
+        )
+    }
+
+    func test92e_restoringAProjectArchivedWithNoSessionsGivesItOne() {
+        let (store, _, _) = TestSupport.makeStore()
+        store.addProject(path: "/tmp/proj-A")
+        let project = store.projects[0]
+        store.closeSession(store.sessions[0].id)
+        store.archiveProject(project)
+        XCTAssertTrue(store.archivedProjects[0].sessions.isEmpty)
+
+        store.restoreProject(project.path)
+
+        let sessions = store.sessions.filter { $0.projectPath == project.path }
+        XCTAssertEqual(sessions.map(\.name), ["Session 2"], "as Add Project would, and the retired number stays retired")
+        XCTAssertEqual(store.selection, sessions[0].id)
+    }
+
+    func test92f_addProjectOnAnArchivedPathRestoresInsteadOfDuplicating() {
+        let (store, _, _) = TestSupport.makeStore()
+        let path = "/tmp/proj-A"
+        store.addProject(path: path)
+        let project = store.projects[0]
+        let session = store.sessions[0]
+        store.renameSession(session.id, to: "build server")
+        store.archiveProject(project)
+
+        store.addProject(path: path)
+
+        XCTAssertEqual(store.projects.map(\.path), [path])
+        XCTAssertTrue(store.archivedProjects.isEmpty)
+        XCTAssertEqual(store.sessions.map(\.id), [session.id], "the parked session comes back and no extra Session N is added")
+        XCTAssertEqual(store.sessions[0].customName, "build server")
+        XCTAssertEqual(store.selection, session.id)
+    }
+
+    func test92g_removeProjectForgetsAnArchivedProject() {
+        let (store, spy, _) = TestSupport.makeStore()
+        store.addProject(path: "/tmp/proj-A")
+        let project = store.projects[0]
+        store.archiveProject(project)
+        let closedBefore = spy.closedIDs
+
+        store.removeProject(project)
+
+        XCTAssertTrue(store.archivedProjects.isEmpty)
+        XCTAssertTrue(store.projects.isEmpty)
+        XCTAssertEqual(spy.closedIDs, closedBefore, "nothing live is left to stop")
+    }
+
+    func test92h_archivedProjectsSurviveARelaunchAndRestoreReseedsNumbering() {
+        let url = TestSupport.freshStateURL()
+        let spy1 = SpyTerminals()
+        let store1 = AppStore(terminals: spy1, stateURL: url, engine: FakeWorkspaceEngine())
+        let path = "/tmp/proj-A"
+        store1.addProject(path: path)
+        let project = store1.projects[0]
+        let session = store1.sessions[0]
+        spy1.emitAgentEvent(
+            session.id,
+            AgentSessionEvent(agent: "claude", name: "session_start", sessionID: "c-1", query: nil)
+        )
+        store1.newSession(in: project)                                 // Session 2
+        store1.archiveProject(project)
+        let archived = store1.archivedProjects[0]
+
+        let store2 = AppStore(terminals: SpyTerminals(), stateURL: url, engine: FakeWorkspaceEngine())
+
+        XCTAssertTrue(store2.projects.isEmpty)
+        XCTAssertEqual(store2.archivedProjects.count, 1)
+        let reloaded = store2.archivedProjects[0]
+        XCTAssertEqual(reloaded.path, archived.path)
+        XCTAssertEqual(reloaded.sessions, archived.sessions, "parked rows round-trip through state.json, resume metadata included")
+        XCTAssertEqual(reloaded.workspaces, archived.workspaces)
+        // ISO 8601 carries whole seconds, which is all "archived when" needs.
+        XCTAssertEqual(reloaded.archivedAt.timeIntervalSince1970, archived.archivedAt.timeIntervalSince1970, accuracy: 1)
+
+        store2.restoreProject(path)
+        XCTAssertEqual(store2.sessions.first { $0.id == session.id }?.resume?.sessionID, "c-1")
+        store2.newSession(in: project)
+        XCTAssertEqual(
+            store2.sessions.map(\.name), ["Session 1", "Session 2", "Session 3"],
+            "counters for rows that were archived at launch are seeded on restore"
+        )
+    }
+
+    func test92i_stateFileWithoutArchivedProjectsLoadsWithNone() throws {
+        let url = TestSupport.freshStateURL()
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let raw = """
+        {"version":2,"projects":["/tmp/proj-A"],"sessions":[{"id":"s-1","target":{"root":{"projectPath":"/tmp/proj-A"}},"name":"Session 1"}],"workspaces":[],"selection":"s-1"}
+        """
+        try raw.write(to: url, atomically: true, encoding: .utf8)
+
+        let store = AppStore(terminals: SpyTerminals(), stateURL: url, engine: FakeWorkspaceEngine())
+
+        XCTAssertEqual(store.projects.map(\.path), ["/tmp/proj-A"])
+        XCTAssertEqual(store.selection, "s-1")
+        XCTAssertTrue(store.archivedProjects.isEmpty)
+    }
 }
