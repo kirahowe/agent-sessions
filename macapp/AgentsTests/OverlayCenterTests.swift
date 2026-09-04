@@ -10,9 +10,11 @@ import XCTest
 /// contract actually rests on, each of which fails silently rather than
 /// loudly if it regresses:
 ///
-/// - the command is sent **once**, and only after the surface is mounted —
-///   `sendText` is a no-op before libghostty has created the surface, so an
-///   early send is not an error, just a review that never starts;
+/// - the command is sent **once**, and only once the surface has attached —
+///   `sendText` is a silent no-op before libghostty has built the surface, so
+///   a send that races ahead of it is not an error, just a review that never
+///   starts, and the user is left looking at a bare login shell where revdiff
+///   should be;
 /// - the command is `exec`'d, so the surface closes when it exits rather than
 ///   dropping the user at a shell prompt they have to dismiss by hand;
 /// - a process exit both frees the session's slot and fires `onClosed`, which
@@ -52,7 +54,13 @@ final class OverlayCenterTests: XCTestCase {
         )
     }
 
-    func testCommandIsExecdExactlyOnceAfterMounting() async throws {
+    /// The core of the fix. The surface is built an unpredictable number of
+    /// run-loop turns after the view mounts, and `sendText` is a silent
+    /// no-op until it exists. The previous version typed exactly one turn
+    /// after mount, so whenever the surface was not ready yet the command
+    /// vanished and the overlay sat at a bare shell — the intermittent
+    /// "empty terminal" this whole type exists to prevent.
+    func testCommandIsTypedOnlyOnceTheSurfaceHasAttached() async throws {
         var delivered: [String] = []
         let overlays = OverlayCenter(textDelivery: { _, text in delivered.append(text) })
         try overlays.present(command: "/tmp/review.sh", workingDirectory: "/tmp", sessionID: "s1")
@@ -67,23 +75,49 @@ final class OverlayCenterTests: XCTestCase {
 
         let host = NSView()
         host.addSubview(try XCTUnwrap(overlays.view(forSession: "s1")))
-
-        overlays.deliverCommandsIfNeeded()
         overlays.deliverCommandsIfNeeded()
         await drainMainQueue()
-        overlays.deliverCommandsIfNeeded()
-        await drainMainQueue()
+        XCTAssertTrue(
+            delivered.isEmpty,
+            "mounting is not attachment: the surface is built only once the view has a real size in a window, so typing at mount time dropped the command whenever that build had not happened yet — exactly the intermittent empty-terminal failure"
+        )
 
+        overlays.handleSurfaceAttached(sessionID: "s1")
         XCTAssertEqual(
             delivered,
             ["exec /tmp/review.sh\n"],
-            "the overlay command must be sent exactly once and via exec — repeated sends would run the review twice, and dropping exec would leave a shell prompt behind after it quits"
+            "the command must be typed exactly once the surface attaches, and via exec — repeated sends would run the review twice, and dropping exec would leave a shell prompt behind after it quits"
         )
+
+        overlays.handleSurfaceAttached(sessionID: "s1")
+        overlays.deliverCommandsIfNeeded()
+        overlays.handleSurfaceDetached(sessionID: "s1")
+        overlays.handleSurfaceAttached(sessionID: "s1")
+        await drainMainQueue()
+        XCTAssertEqual(delivered.count, 1, "a repeat attach, a repeat arm, or a surface rebuilt later must not run the review a second time")
+    }
+
+    /// Arming (from `TerminalHostView`) and the surface attaching have no
+    /// fixed order. Whichever lands second must be the one that types.
+    func testCommandIsTypedWhenAttachComesBeforeArming() async throws {
+        var delivered: [String] = []
+        let overlays = OverlayCenter(textDelivery: { _, text in delivered.append(text) })
+        try overlays.present(command: "/tmp/review.sh", workingDirectory: "/tmp", sessionID: "s1")
+        let host = NSView()
+        host.addSubview(try XCTUnwrap(overlays.view(forSession: "s1")))
+
+        overlays.handleSurfaceAttached(sessionID: "s1")
+        XCTAssertTrue(delivered.isEmpty, "an attached surface must not type before the host has armed delivery")
+
+        overlays.deliverCommandsIfNeeded()
+        XCTAssertEqual(delivered, ["exec /tmp/review.sh\n"])
     }
 
     /// A review requested by a session that isn't on screen is mounted
     /// hidden by `TerminalHostView`; its command must still be delivered —
-    /// the review runs behind the scenes and is simply revealed later.
+    /// the review runs behind the scenes and is simply revealed later. An
+    /// overlay that was never mounted must not type even once its surface
+    /// attaches, because it was never armed.
     func testCommandDeliveryIgnoresOnlyUnmountedOverlays() async throws {
         var delivered: [String] = []
         let overlays = OverlayCenter(textDelivery: { _, text in delivered.append(text) })
@@ -96,12 +130,33 @@ final class OverlayCenterTests: XCTestCase {
         mounted.isHidden = true
 
         overlays.deliverCommandsIfNeeded()
+        overlays.handleSurfaceAttached(sessionID: "s1")
+        overlays.handleSurfaceAttached(sessionID: "s2")
         await drainMainQueue()
 
         XCTAssertEqual(
             delivered,
             ["exec /tmp/mounted.sh\n"],
-            "a mounted-but-hidden overlay must still receive its command (a background session's review has to actually start), while an unmounted one must not (sendText would be silently swallowed)"
+            "a mounted-but-hidden overlay must still receive its command (a background session's review has to actually start), while an unmounted one must not — it was never armed, so even its surface attaching must not type"
+        )
+    }
+
+    /// The package finds this delegate by conditional cast on the single
+    /// `view.delegate`, so conformance is the entire registration. Without
+    /// the lifecycle conformance the overlay never learns its surface exists
+    /// and the command is never typed at all.
+    func testOverlayProxyReceivesSurfaceLifecycle() throws {
+        let overlays = OverlayCenter(textDelivery: { _, _ in })
+        try overlays.present(command: "/tmp/review.sh", workingDirectory: "/tmp", sessionID: "s1")
+        let view = try XCTUnwrap(overlays.view(forSession: "s1"))
+        let proxy = try XCTUnwrap(view.delegate as? OverlayDelegateProxy)
+        XCTAssertTrue(
+            proxy is any TerminalSurfaceLifecycleDelegate,
+            "without the lifecycle conformance libghostty never calls back with the attached surface, so the review command is never typed"
+        )
+        XCTAssertTrue(
+            proxy is any TerminalSurfaceCloseDelegate,
+            "without the close conformance a finished review never fires onClosed, hanging the launcher forever"
         )
     }
 

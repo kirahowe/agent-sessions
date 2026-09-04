@@ -35,15 +35,25 @@ final class OverlayCenter: ObservableObject {
     /// libghostty's exec backend spawns the user's login shell and offers no
     /// argv override (see `TerminalSessionBackend` — it is `.exec` or an
     /// in-memory session, nothing more). Handing the command to that shell as
-    /// typed input is the same mechanism the OMP resume hint already uses, so
+    /// typed input is the same mechanism the restore banner already uses, so
     /// it is a path this app is known to work on rather than a new one.
     private struct Active {
         let sessionID: String
         let view: TerminalView
         let command: String
         let delegateProxy: OverlayDelegateProxy
+        /// Set once `TerminalHostView` has mounted the surface and asked for
+        /// delivery. From then on the command is typed as soon as the
+        /// surface exists — see `surfaceAttached`.
         var deliveryScheduled = false
         var didDeliver = false
+        /// Whether libghostty has built this overlay's surface. `sendText`
+        /// is a silent no-op until it has — and the surface is created only
+        /// once the view is in a window with a real size, an arbitrary
+        /// number of run-loop turns after the view is mounted. Typing before
+        /// then loses the command outright, which left the user staring at a
+        /// bare login shell where the review should have been.
+        var surfaceAttached = false
     }
 
     enum PresentError: Error, Equatable {
@@ -127,38 +137,65 @@ final class OverlayCenter: ObservableObject {
         reviewSessionIDs.insert(sessionID)
     }
 
-    /// Sends each pending overlay's command once, after its surface exists.
+    /// Arms delivery for each mounted overlay, once. Called by
+    /// `TerminalHostView` after it mounts the overlays: nothing can happen
+    /// before the view is in the hierarchy, because libghostty builds the
+    /// surface only then.
     ///
-    /// `sendText` is a silent no-op before libghostty has created the surface,
-    /// which does not happen until the view is in the hierarchy — so this is
-    /// called by `TerminalHostView` after it mounts the overlays, and defers
-    /// one further run-loop turn to let AppKit finish. Exactly the shape of
-    /// `TerminalCenter.showResumeHintIfNeeded`, and for exactly the same
-    /// reason; if that one's timing ever needs revisiting, this one does too.
+    /// Arming is not typing. The command is typed by `deliverCommandIfReady`
+    /// once the surface has actually attached — which is a later, unpredictable
+    /// run-loop turn. The previous version typed exactly one turn after mount
+    /// and, whenever the surface had not been built by then, sent the command
+    /// into a nil surface where `sendText` silently drops it: the review never
+    /// started and the overlay sat at a bare shell.
     func deliverCommandsIfNeeded() {
-        for (sessionID, entry) in active {
-            guard entry.view.superview != nil,
-                  !entry.deliveryScheduled,
-                  !entry.didDeliver
-            else { continue }
-
-            var scheduled = entry
-            scheduled.deliveryScheduled = true
-            active[sessionID] = scheduled
-            DispatchQueue.main.async { [weak self] in
-                self?.deliverCommand(forSession: sessionID)
-            }
+        // Snapshot the sessions to arm before mutating: `deliverCommandIfReady`
+        // can type and write back synchronously (when the surface is already
+        // attached), and mutating `active` while iterating it would be unsafe.
+        let pending = active.compactMap { sessionID, entry in
+            entry.view.superview != nil && !entry.deliveryScheduled && !entry.didDeliver
+                ? sessionID : nil
+        }
+        for sessionID in pending {
+            guard var entry = active[sessionID] else { continue }
+            entry.deliveryScheduled = true
+            active[sessionID] = entry
+            deliverCommandIfReady(forSession: sessionID)
         }
     }
 
-    private func deliverCommand(forSession sessionID: String) {
+    /// Called by an overlay's delegate proxy once libghostty has built its
+    /// surface. This is the signal the command was waiting for.
+    func handleSurfaceAttached(sessionID: String) {
+        guard var entry = active[sessionID] else { return }
+        entry.surfaceAttached = true
+        active[sessionID] = entry
+        NSLog("Agents: overlay surface attached for session \(sessionID)")
+        deliverCommandIfReady(forSession: sessionID)
+    }
+
+    /// Called by an overlay's delegate proxy when its surface is torn down.
+    /// Anything typed after this would go nowhere, so the overlay stops
+    /// counting as writable until the next attach.
+    func handleSurfaceDetached(sessionID: String) {
+        guard var entry = active[sessionID] else { return }
+        entry.surfaceAttached = false
+        active[sessionID] = entry
+    }
+
+    /// Types the command if it is armed, not yet sent, and the surface exists.
+    /// A no-op otherwise; whichever of arming and surface-attach comes second
+    /// drives it.
+    private func deliverCommandIfReady(forSession sessionID: String) {
         guard var current = active[sessionID],
               current.deliveryScheduled,
-              !current.didDeliver
+              !current.didDeliver,
+              current.surfaceAttached
         else { return }
 
         current.didDeliver = true
         active[sessionID] = current
+        NSLog("Agents: typed review command into the overlay for session \(sessionID)")
         // `exec` so the command replaces the login shell rather than running
         // as its child: the surface then closes when the command exits, with
         // no leftover shell sitting at a prompt for the user to dismiss.
@@ -198,10 +235,18 @@ final class OverlayCenter: ObservableObject {
 
 /// Delegate for an overlay surface. Separate from `SessionDelegateProxy`
 /// because that one routes into attention, title, and OMP-event handling —
-/// none of which an overlay has or wants. The only signal that matters here
-/// is "the command exited."
+/// none of which an overlay has or wants. Two signals matter here: "the
+/// surface exists" (which gates typing the command — see `OverlayCenter`)
+/// and "the command exited".
+///
+/// The package dispatches every specialized delegate by conditional-casting
+/// the single `view.delegate` object, so these conformances are the whole
+/// registration: drop one and its callbacks silently stop arriving.
 @MainActor
-final class OverlayDelegateProxy: TerminalSurfaceCloseDelegate {
+final class OverlayDelegateProxy:
+    TerminalSurfaceCloseDelegate,
+    TerminalSurfaceLifecycleDelegate
+{
     let sessionID: String
     weak var center: OverlayCenter?
     var suppressesProcessExit = false
@@ -214,5 +259,13 @@ final class OverlayDelegateProxy: TerminalSurfaceCloseDelegate {
     func terminalDidClose(processAlive: Bool) {
         guard !suppressesProcessExit else { return }
         center?.handleProcessExit(sessionID: sessionID)
+    }
+
+    func terminalDidAttachSurface(_ surface: TerminalSurface) {
+        center?.handleSurfaceAttached(sessionID: sessionID)
+    }
+
+    func terminalDidDetachSurface() {
+        center?.handleSurfaceDetached(sessionID: sessionID)
     }
 }
