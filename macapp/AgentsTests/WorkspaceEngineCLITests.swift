@@ -195,21 +195,30 @@ final class WorkspaceEngineCLITests: XCTestCase {
         let projectDir = try makeTempJJRepo(jj: tools.jj)
         defer { try? FileManager.default.removeItem(atPath: projectDir) }
 
-        let engine = WorkspaceEngineCLI()
+        let workspacesRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("WorkspaceEngineCLITests-root-\(UUID().uuidString)")
+            .path
+        defer { try? FileManager.default.removeItem(atPath: workspacesRoot) }
+
+        // Inject the root so the test never writes under the real
+        // ~/.agents/workspaces; the production wiring is pinned by
+        // test_createWorkspace_passesTheProjectKeyedWorkspacesRoot.
+        let engine = WorkspaceEngineCLI(workspacesRoot: { _ in workspacesRoot })
         let row = try await engine.createWorkspace(projectPath: projectDir)
 
         let namePredicate = NSPredicate(format: "SELF MATCHES %@", "^[a-z]+-[a-z]+$")
         XCTAssertTrue(namePredicate.evaluate(with: row.name), "expected a two-word adjective-noun name, got \(row.name)")
 
-        // Workspaces nest INSIDE the project (<project>/workspaces/<name>),
-        // not alongside it in a directory shared by every project under the
-        // same parent — see agents-cli's workspaces-root doc comment for why
-        // (jj's per-workspace working-copy tracking makes the nested
-        // directory invisible to the outer workspace; the repo-root
-        // .gitignore's /workspaces/ entry is what keeps plain git happy
-        // about it).
-        let expectedPath = projectDir + "/workspaces/" + row.name
+        // Workspaces live under the root the engine passes as
+        // --workspaces-root, never inside the project: a nested directory
+        // is wiped by `git clean -fdx` at the project root and has to be
+        // hidden from every tool that walks the tree.
+        let expectedPath = workspacesRoot + "/" + row.name
         XCTAssertEqual(row.path, expectedPath)
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: projectDir + "/workspaces"),
+            "nothing may be created inside the project itself"
+        )
 
         // The CLI absolutizes the project path server-side, and on macOS
         // temp dirs are often under a symlink (/tmp -> /private/tmp), so
@@ -249,7 +258,9 @@ final class WorkspaceEngineCLITests: XCTestCase {
         try FileManager.default.createDirectory(at: nonRepoDir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: nonRepoDir) }
 
-        let engine = WorkspaceEngineCLI()
+        let engine = WorkspaceEngineCLI(
+            workspacesRoot: { _ in nonRepoDir.appendingPathComponent("unused-root").path }
+        )
 
         do {
             _ = try await engine.createWorkspace(projectPath: nonRepoDir.path)
@@ -460,6 +471,37 @@ final class WorkspaceEngineCLITests: XCTestCase {
                 XCTFail("expected EngineError.cleanupFailed, got \(error)")
             }
         }
+    }
+
+    /// The one subcommand that learns where workspaces go. A default-built
+    /// engine must send the app-owned, project-keyed root, and an injected
+    /// resolver must be honored verbatim.
+    func test_createWorkspace_passesTheProjectKeyedWorkspacesRoot() async throws {
+        let envelope = #"{"ok":true,"workspace":{"name":"ws-stub","jj_name":"agents/ws-stub","path":"/tmp/roots/ws-stub","project":"/tmp/proj-stub","vcs":"jj"}}"#
+
+        let defaultArguments = try await withStubBB(json: envelope) {
+            _ = try await WorkspaceEngineCLI().createWorkspace(projectPath: "/tmp/proj-stub")
+        }
+        XCTAssertEqual(
+            Array(defaultArguments.dropFirst()),
+            [
+                "workspace-add",
+                "--project", "/tmp/proj-stub",
+                "--workspaces-root", WorkspacesRoot.directory(forProject: "/tmp/proj-stub"),
+            ]
+        )
+
+        let injectedArguments = try await withStubBB(json: envelope) {
+            let engine = WorkspaceEngineCLI(workspacesRoot: { projectPath in
+                "/tmp/roots/" + (projectPath as NSString).lastPathComponent
+            })
+            let row = try await engine.createWorkspace(projectPath: "/tmp/proj-stub")
+            XCTAssertEqual(row.path, "/tmp/roots/ws-stub", "the row keeps the CLI's reported path")
+        }
+        XCTAssertEqual(
+            Array(injectedArguments.dropFirst()),
+            ["workspace-add", "--project", "/tmp/proj-stub", "--workspaces-root", "/tmp/roots/proj-stub"]
+        )
     }
 
     func test_deleteWorkspace_guardedForgetUsesManagerSideRecheckAndCreatesMainTrunk() async throws {

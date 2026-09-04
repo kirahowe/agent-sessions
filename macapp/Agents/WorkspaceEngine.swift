@@ -116,13 +116,21 @@ final class WorkspaceEngineCLI: WorkspaceEngineProviding {
     // init. The init itself touches no actor-isolated state, so opting it
     // out here is safe.
     private let trashWorkspaceDirectory: @Sendable (URL) throws -> Void
+    /// Where a project's new workspaces go on disk, passed to the CLI as
+    /// `--workspaces-root`. Injected so tests never create directories
+    /// under the real `~/.agents`; production uses `WorkspacesRoot`.
+    private let workspacesRoot: @Sendable (_ projectPath: String) -> String
 
     nonisolated init(
         trashWorkspaceDirectory: @escaping @Sendable (URL) throws -> Void = { url in
             try FileManager.default.trashItem(at: url, resultingItemURL: nil)
+        },
+        workspacesRoot: @escaping @Sendable (_ projectPath: String) -> String = { projectPath in
+            WorkspacesRoot.directory(forProject: projectPath)
         }
     ) {
         self.trashWorkspaceDirectory = trashWorkspaceDirectory
+        self.workspacesRoot = workspacesRoot
     }
 
     // MARK: - Envelope decoding
@@ -385,7 +393,13 @@ final class WorkspaceEngineCLI: WorkspaceEngineProviding {
     // MARK: - WorkspaceEngineProviding
 
     func createWorkspace(projectPath: String) async throws -> WorkspaceRow {
-        let envelope = try await run("workspace-add", args: ["--project", projectPath])
+        // The root only has to reach workspace-add: both engines record
+        // where a workspace was created and drive it there afterwards, so
+        // forget, land, and preview are never told about it.
+        let envelope = try await run(
+            "workspace-add",
+            args: ["--project", projectPath, "--workspaces-root", workspacesRoot(projectPath)]
+        )
         // workspace-add always includes a workspace payload on success; a
         // missing one here would mean the CLI contract was violated.
         guard let payload = envelope.workspace else {
