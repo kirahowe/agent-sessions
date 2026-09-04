@@ -31,33 +31,75 @@ import GhosttyTerminal
 /// Different sessions review concurrently without contention.
 @MainActor
 final class OverlayCenter: ObservableObject {
-    /// Why a command string rather than a `TerminalSurfaceOptions` command:
-    /// libghostty's exec backend spawns the user's login shell and offers no
-    /// argv override (see `TerminalSessionBackend` — it is `.exec` or an
-    /// in-memory session, nothing more). Handing the command to that shell as
-    /// typed input is the same mechanism the restore banner already uses, so
-    /// it is a path this app is known to work on rather than a new one.
+    /// The review command is the surface's OWN process, not text typed into a
+    /// login shell. `TerminalSurfaceOptions.command` (exposed by
+    /// libghostty-spm 1.5) hands the exec backend a command in place of the
+    /// user's shell, so the review is running the moment the surface is
+    /// built. Nothing is ever typed, so there is no readiness to wait on and
+    /// no login shell to `exec` away.
+    ///
+    /// Two facts about how Ghostty's embedded runtime treats that command
+    /// shape everything below, and neither is visible from the package's
+    /// option names:
+    ///
+    /// - The string is bash source, not an argv. On macOS it runs as
+    ///   `login -flp <user> bash --noprofile --norc -c "exec -l <string>"`.
+    ///   The `direct:` prefix Ghostty's *config file* accepts is parsed by
+    ///   the config loader only; handed in here it reaches bash as the name
+    ///   of a program to exec, and the review never runs. So `present`
+    ///   composes a quoted command line — see `surfaceCommand`.
+    /// - A surface spawned with a command is held open after that command
+    ///   exits: the runtime forces wait-after-command on, and the package's
+    ///   `waitAfterCommand` can only turn it on too. The surface does not
+    ///   close, and so does not fire `terminalDidClose`, until a key is
+    ///   pressed at Ghostty's "Process exited" line. The exit the launcher
+    ///   is waiting on therefore has to be reported another way: the surface
+    ///   runs the bundled `overlay-run.sh` wrapper around the review with a
+    ///   token minted for this one review, the wrapper sets the terminal
+    ///   title to that token once the review has ended (also from its
+    ///   signal traps), and libghostty reports every title as
+    ///   `terminalDidChangeTitle`. The overlay is torn down when its own
+    ///   token arrives — a title no child of the review can produce by
+    ///   accident, which a shell-integration mark could. `terminalDidClose`
+    ///   stays as the fallback for a keypress or a surface that died some
+    ///   other way.
+    /// - The process gets the APP's environment, and a Finder-launched app
+    ///   has the bare system PATH: no Homebrew, no direnv, no project
+    ///   toolchain. The old login shell rebuilt all that from the user's rc
+    ///   files; a spawned command has no such step, and no login shell could
+    ///   recover per-project environment anyway. So the launcher forwards the
+    ///   variables its subprocesses resolve tools and config through, taken
+    ///   from the shell that asked for the review, and `present` lays them
+    ///   under the session's own variables.
+    ///
+    /// This replaced typing `exec <command>\n` once the surface attached. That
+    /// worked, but it was type-ahead into a freshly spawned shell — inherently
+    /// racy against libghostty building the surface, and it left a login shell
+    /// in the process tree for the instant before `exec` replaced it. Spawning
+    /// the command directly removes both.
     private struct Active {
         let sessionID: String
         let view: TerminalView
-        let command: String
         let delegateProxy: OverlayDelegateProxy
-        /// Set once `TerminalHostView` has mounted the surface and asked for
-        /// delivery. From then on the command is typed as soon as the
-        /// surface exists — see `surfaceAttached`.
-        var deliveryScheduled = false
-        var didDeliver = false
-        /// Whether libghostty has built this overlay's surface. `sendText`
-        /// is a silent no-op until it has — and the surface is created only
-        /// once the view is in a window with a real size, an arbitrary
-        /// number of run-loop turns after the view is mounted. Typing before
-        /// then loses the command outright, which left the user staring at a
-        /// bare login shell where the review should have been.
-        var surfaceAttached = false
     }
 
-    enum PresentError: Error, Equatable {
+    enum PresentError: Error, Equatable, CustomStringConvertible {
         case alreadyActive
+        /// The app bundle has no `overlay-run.sh`: a broken build, not a
+        /// runtime condition. Refusing the review with a message beats
+        /// spawning a surface whose command cannot start.
+        case wrapperMissing
+
+        /// Worded for the launcher, which prints the control-socket refusal
+        /// verbatim to the agent that asked for the review.
+        var description: String {
+            switch self {
+            case .alreadyActive:
+                return "a review is already open in this session"
+            case .wrapperMissing:
+                return "this Agents build is missing its overlay-run.sh resource — rebuild or reinstall the app"
+            }
+        }
     }
 
     /// How a review ended, forwarded to `onClosed` so the control server can
@@ -78,14 +120,20 @@ final class OverlayCenter: ObservableObject {
 
     private var active: [String: Active] = [:]
 
-    private let textDelivery: @MainActor (TerminalView, String) -> Void
+    /// Where the wrapper every overlay runs lives — the bundled resource in
+    /// the app, injectable so tests can pin the composed command line
+    /// without depending on the test host's install path.
+    private let wrapperPath: String?
 
-    init(
-        textDelivery: @escaping @MainActor (TerminalView, String) -> Void = { view, text in
-            view.paste(text: text)
-        }
-    ) {
-        self.textDelivery = textDelivery
+    /// The wrapper as shipped in this app bundle, if the build carried it.
+    /// Nonisolated so it can be `init`'s default argument (default arguments
+    /// are evaluated outside the actor); `Bundle.main` is safe from anywhere.
+    nonisolated static var bundledWrapperURL: URL? {
+        Bundle.main.url(forResource: "overlay-run", withExtension: "sh")
+    }
+
+    init(wrapperURL: URL? = OverlayCenter.bundledWrapperURL) {
+        wrapperPath = wrapperURL?.path
     }
 
     /// Invoked with the invoking session id after an overlay's surface has
@@ -102,18 +150,30 @@ final class OverlayCenter: ObservableObject {
     /// Every live overlay view. `TerminalHostView` mounts all of them — not
     /// just the selected session's — because a review can be requested by a
     /// session that isn't on screen, and its surface must exist (view in the
-    /// hierarchy) before the command can be delivered and start running.
+    /// hierarchy, with a real size) before libghostty spawns the command and
+    /// the review starts running.
     var allViews: [TerminalView] {
         active.values.map(\.view)
     }
 
-    /// Creates an overlay surface for `sessionID`'s review. The command is
-    /// not sent here — the surface has to be in the view hierarchy first, so
-    /// delivery waits for `deliverCommandsIfNeeded()`; see that method for why.
-    func present(command: String, workingDirectory: String, sessionID: String) throws {
+    /// Creates an overlay surface whose own process runs `sessionID`'s review
+    /// command. The command starts as soon as libghostty builds the surface —
+    /// once `TerminalHostView` has mounted the view and it has a real size —
+    /// so there is nothing further to deliver after this.
+    ///
+    /// `environment` is what the caller forwarded (see the class comment);
+    /// the session's own variables win over it, so a request cannot re-point
+    /// the review at another session or another app instance.
+    func present(
+        command: String, workingDirectory: String, sessionID: String,
+        environment: [String: String] = [:]
+    ) throws {
         guard active[sessionID] == nil else { throw PresentError.alreadyActive }
+        guard let wrapperPath else { throw PresentError.wrapperMissing }
 
-        let proxy = OverlayDelegateProxy(sessionID: sessionID, center: self)
+        let proxy = OverlayDelegateProxy(
+            sessionID: sessionID, completionToken: UUID().uuidString, center: self
+        )
         let view = TerminalView(frame: .zero)
 
         // Same setup order as TerminalCenter and the package's own AppKit
@@ -122,84 +182,39 @@ final class OverlayCenter: ObservableObject {
         view.configuration = TerminalSurfaceOptions(
             backend: .exec,
             workingDirectory: workingDirectory,
-            envVars: TerminalCenter.sessionEnvVars(for: sessionID)
+            envVars: environment.merging(TerminalCenter.sessionEnvVars(for: sessionID)) { _, session in session },
+            command: Self.surfaceCommand(
+                wrapper: wrapperPath, token: proxy.completionToken, running: command
+            )
+            // No `waitAfterCommand`: the runtime holds a surface spawned with
+            // a command open regardless, and the option can only agree with
+            // it. The exit is observed through the wrapper instead — see the
+            // class comment.
         )
         view.controller = TerminalController(
             terminalConfiguration: TerminalCenter.terminalConfiguration
         )
 
-        active[sessionID] = Active(
-            sessionID: sessionID,
-            view: view,
-            command: command,
-            delegateProxy: proxy
-        )
+        active[sessionID] = Active(sessionID: sessionID, view: view, delegateProxy: proxy)
         reviewSessionIDs.insert(sessionID)
     }
 
-    /// Arms delivery for each mounted overlay, once. Called by
-    /// `TerminalHostView` after it mounts the overlays: nothing can happen
-    /// before the view is in the hierarchy, because libghostty builds the
-    /// surface only then.
+    /// The `command` handed to libghostty for a review: the bundled wrapper
+    /// with this review's completion token and the review command as its
+    /// arguments, each single-quoted.
     ///
-    /// Arming is not typing. The command is typed by `deliverCommandIfReady`
-    /// once the surface has actually attached — which is a later, unpredictable
-    /// run-loop turn. The previous version typed exactly one turn after mount
-    /// and, whenever the surface had not been built by then, sent the command
-    /// into a nil surface where `sendText` silently drops it: the review never
-    /// started and the overlay sat at a bare shell.
-    func deliverCommandsIfNeeded() {
-        // Snapshot the sessions to arm before mutating: `deliverCommandIfReady`
-        // can type and write back synchronously (when the surface is already
-        // attached), and mutating `active` while iterating it would be unsafe.
-        let pending = active.compactMap { sessionID, entry in
-            entry.view.superview != nil && !entry.deliveryScheduled && !entry.didDeliver
-                ? sessionID : nil
-        }
-        for sessionID in pending {
-            guard var entry = active[sessionID] else { continue }
-            entry.deliveryScheduled = true
-            active[sessionID] = entry
-            deliverCommandIfReady(forSession: sessionID)
-        }
+    /// The runtime treats this string as bash source (see the class comment),
+    /// so each word is quoted for bash — and the paths need it: a Debug build
+    /// is "Agents Dev.app", space included, and the launcher's script lives
+    /// under `TMPDIR`, whose value is nobody's promise.
+    static func surfaceCommand(wrapper: String, token: String, running command: String) -> String {
+        "\(shellQuoted(wrapper)) \(shellQuoted(token)) \(shellQuoted(command))"
     }
 
-    /// Called by an overlay's delegate proxy once libghostty has built its
-    /// surface. This is the signal the command was waiting for.
-    func handleSurfaceAttached(sessionID: String) {
-        guard var entry = active[sessionID] else { return }
-        entry.surfaceAttached = true
-        active[sessionID] = entry
-        NSLog("Agents: overlay surface attached for session \(sessionID)")
-        deliverCommandIfReady(forSession: sessionID)
-    }
-
-    /// Called by an overlay's delegate proxy when its surface is torn down.
-    /// Anything typed after this would go nowhere, so the overlay stops
-    /// counting as writable until the next attach.
-    func handleSurfaceDetached(sessionID: String) {
-        guard var entry = active[sessionID] else { return }
-        entry.surfaceAttached = false
-        active[sessionID] = entry
-    }
-
-    /// Types the command if it is armed, not yet sent, and the surface exists.
-    /// A no-op otherwise; whichever of arming and surface-attach comes second
-    /// drives it.
-    private func deliverCommandIfReady(forSession sessionID: String) {
-        guard var current = active[sessionID],
-              current.deliveryScheduled,
-              !current.didDeliver,
-              current.surfaceAttached
-        else { return }
-
-        current.didDeliver = true
-        active[sessionID] = current
-        NSLog("Agents: typed review command into the overlay for session \(sessionID)")
-        // `exec` so the command replaces the login shell rather than running
-        // as its child: the surface then closes when the command exits, with
-        // no leftover shell sitting at a prompt for the user to dismiss.
-        textDelivery(current.view, "exec \(current.command)\n")
+    /// Single-quotes `value` for bash: the one quoting form in which nothing
+    /// is special except a single quote, which is spelled `'\''`.
+    static func shellQuoted(_ value: String) -> String {
+        "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 
     /// Cancels `sessionID`'s review, if it has one: tears the overlay down
@@ -212,7 +227,9 @@ final class OverlayCenter: ObservableObject {
         onClosed?(sessionID, .cancelled)
     }
 
-    /// Called by an overlay's delegate proxy when its command exits.
+    /// Called by an overlay's delegate proxy once its review has ended —
+    /// normally on the wrapper's command-finished mark, else when the
+    /// surface closes.
     func handleProcessExit(sessionID: String) {
         guard dismissOverlay(forSession: sessionID) else { return }
         onClosed?(sessionID, .finished)
@@ -235,37 +252,66 @@ final class OverlayCenter: ObservableObject {
 
 /// Delegate for an overlay surface. Separate from `SessionDelegateProxy`
 /// because that one routes into attention, title, and OMP-event handling —
-/// none of which an overlay has or wants. Two signals matter here: "the
-/// surface exists" (which gates typing the command — see `OverlayCenter`)
-/// and "the command exited".
+/// none of which an overlay has or wants. Only one thing matters here: the
+/// review ended. That arrives as the wrapper setting the terminal title to
+/// this review's completion token (`terminalDidChangeTitle`), or — the
+/// fallback, since a surface spawned with a command stays open after it
+/// exits — as the surface closing (`terminalDidClose`) once the user
+/// presses a key. Either dismisses the overlay and answers the launcher;
+/// whichever comes second is a no-op.
+///
+/// The overlay needs no surface-lifecycle callback: its command is spawned by
+/// libghostty as the surface is built, not typed in afterward, so nothing
+/// waits on "the surface exists".
 ///
 /// The package dispatches every specialized delegate by conditional-casting
 /// the single `view.delegate` object, so these conformances are the whole
-/// registration: drop one and its callbacks silently stop arriving.
+/// registration: drop one and its callback silently stops arriving. Drop
+/// both and a finished review hangs its launcher forever.
 @MainActor
-final class OverlayDelegateProxy:
-    TerminalSurfaceCloseDelegate,
-    TerminalSurfaceLifecycleDelegate
-{
+final class OverlayDelegateProxy: TerminalSurfaceTitleDelegate, TerminalSurfaceCloseDelegate {
     let sessionID: String
+    /// The title the wrapper sets once the review has ended. Minted per
+    /// review, so only this review's wrapper can end this review: the
+    /// review's own titles, and anything its children write to the pty,
+    /// never match it. The overlay displays no title, so nothing is lost by
+    /// using the channel this way; a real child-exited signal from the
+    /// package would replace it (agents#2).
+    let completionToken: String
     weak var center: OverlayCenter?
     var suppressesProcessExit = false
 
-    init(sessionID: String, center: OverlayCenter) {
+    init(sessionID: String, completionToken: String, center: OverlayCenter) {
         self.sessionID = sessionID
+        self.completionToken = completionToken
         self.center = center
     }
 
+    /// Every title the surface sets. The one that matters is the completion
+    /// token: the review command has ended, while the surface itself is
+    /// still open (and will stay so), which is why this — not the close — is
+    /// the signal a review normally ends on.
+    ///
+    /// Deferred one run-loop turn: the package delivers this synchronously
+    /// from inside libghostty's handling of this surface's own message, and
+    /// the dismissal frees the surface. Freeing it there would pull it out
+    /// from under the core mid-call; a turn later the core is done with it.
+    /// (The close callback below is different: closing is the last thing
+    /// the core does with a surface on that path, so it acts at once.)
+    func terminalDidChangeTitle(_ title: String) {
+        guard title == completionToken else { return }
+        DispatchQueue.main.async { [weak self] in self?.reviewEnded() }
+    }
+
+    /// The surface closed: the user pressed a key at Ghostty's "Process
+    /// exited" line, or the process went away without ever writing the
+    /// wrapper's token. Same outcome, later.
     func terminalDidClose(processAlive: Bool) {
+        reviewEnded()
+    }
+
+    private func reviewEnded() {
         guard !suppressesProcessExit else { return }
         center?.handleProcessExit(sessionID: sessionID)
-    }
-
-    func terminalDidAttachSurface(_ surface: TerminalSurface) {
-        center?.handleSurfaceAttached(sessionID: sessionID)
-    }
-
-    func terminalDidDetachSurface() {
-        center?.handleSurfaceDetached(sessionID: sessionID)
     }
 }

@@ -1,0 +1,11 @@
+{:id 2
+ :title "Upstream a child-exited delegate to libghostty-spm and drop the overlay wrapper"
+ :status :inbox
+ :type :chore
+ :priority :p2
+ :created "2026-09-04"
+ :updated "2026-09-04"
+ :tags #{"libghostty" "overlay" "upstream"}
+ :blocked-by #{}
+ :related #{}
+ :details "2-upstream-a-child-exited-delegate-to-libghostty-spm-and-drop.md"}

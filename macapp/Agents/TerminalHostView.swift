@@ -37,16 +37,13 @@ struct TerminalHostView: NSViewRepresentable {
     func updateNSView(_ containerView: PaneHostContainerView, context: Context) {
         // Every live overlay is mounted, not just the selected session's: a
         // review can be requested by a session that isn't on screen, and its
-        // command cannot be delivered — the review never starts — until its
-        // surface exists, which requires the view to be in the hierarchy.
-        // Mounting is not revealing: which subviews are visible is decided
-        // below, so a hidden session's review runs behind the scenes.
+        // command process is spawned by libghostty only once the surface
+        // exists, which requires the view to be in the hierarchy with a real
+        // size. Mounting is not revealing: which subviews are visible is
+        // decided below, so a hidden session's review runs behind the scenes.
         for overlayView in overlays.allViews {
             containerView.mountOverlay(overlayView)
         }
-        // Only safe once the views are in the hierarchy — see
-        // OverlayCenter.deliverCommandsIfNeeded.
-        overlays.deliverCommandsIfNeeded()
 
         guard let selectedID = store.selection else {
             containerView.presentNothing()
@@ -384,7 +381,8 @@ final class PaneHostContainerView: NSView {
 
         // Every overlay surface — visible or not — fills the container, so a
         // hidden review keeps running at real size (and so a freshly mounted
-        // one has a surface to deliver its command into).
+        // one has the real size libghostty needs before it builds the
+        // surface and spawns the review).
         for overlaySurface in overlaySurfaces.allObjects where overlaySurface.superview === self {
             setSurfaceFrame(overlaySurface, to: bounds)
         }

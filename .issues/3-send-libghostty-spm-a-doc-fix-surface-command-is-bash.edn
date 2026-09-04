@@ -1,0 +1,11 @@
+{:id 3
+ :title "Send libghostty-spm a doc fix: surface command is bash source and waitAfterCommand cannot be turned off"
+ :status :inbox
+ :type :chore
+ :priority :p3
+ :created "2026-09-04"
+ :updated "2026-09-04"
+ :tags #{"libghostty" "upstream"}
+ :blocked-by #{}
+ :related #{}
+ :details "3-send-libghostty-spm-a-doc-fix-surface-command-is-bash.md"}

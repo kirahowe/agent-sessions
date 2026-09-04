@@ -99,6 +99,12 @@ final class ControlServer: @unchecked Sendable {
         // overlay-run
         let command: String?
         let cwd: String?
+        /// Environment the review's process should see on top of the app's
+        /// own — the launcher forwards the variables its subprocesses
+        /// resolve tools and config through (PATH first of all: a
+        /// Finder-launched app has the bare system PATH, and revdiff spawns
+        /// jj/git/hg by name). Optional for a launcher that predates it.
+        let env: [String: String]?
         // session-event
         let pane: String?
         let event: String?
@@ -111,7 +117,7 @@ final class ControlServer: @unchecked Sendable {
         let agentHome: String?
 
         private enum CodingKeys: String, CodingKey {
-            case cmd, session, command, cwd, pane, event, status, agent, prompt
+            case cmd, session, command, cwd, env, pane, event, status, agent, prompt
             case agentSessionID = "agent_session_id"
             case agentHome = "agent_home"
         }
@@ -124,7 +130,7 @@ final class ControlServer: @unchecked Sendable {
     /// against — can be pinned in tests without standing up a socket.
     enum RequestDecision: Equatable {
         case refuse(String)
-        case run(command: String, cwd: String, session: String)
+        case run(command: String, cwd: String, session: String, env: [String: String])
         case sessionEvent(ControlSessionEvent)
     }
 
@@ -148,7 +154,10 @@ final class ControlServer: @unchecked Sendable {
             // The message names the fix because the launcher prints it verbatim.
             return .refuse("missing session — update the revdiff launcher to forward AGENTS_SESSION_ID")
         }
-        return .run(command: command, cwd: request.cwd ?? NSHomeDirectory(), session: session)
+        return .run(
+            command: command, cwd: request.cwd ?? NSHomeDirectory(), session: session,
+            env: request.env ?? [:]
+        )
     }
 
     /// Every refusal here is a contract violation by the sender, not a
@@ -435,8 +444,8 @@ final class ControlServer: @unchecked Sendable {
         switch Self.decide(line: line) {
         case .refuse(let error):
             reply(to: client, ok: false, error: error, closing: true)
-        case .run(let command, let cwd, let session):
-            serveOverlayRun(client: client, command: command, cwd: cwd, session: session)
+        case .run(let command, let cwd, let session, let env):
+            serveOverlayRun(client: client, command: command, cwd: cwd, session: session, env: env)
         case .sessionEvent(let event):
             serveSessionEvent(client: client, event: event)
         }
@@ -467,7 +476,9 @@ final class ControlServer: @unchecked Sendable {
         }
     }
 
-    private func serveOverlayRun(client: Int32, command: String, cwd: String, session: String) {
+    private func serveOverlayRun(
+        client: Int32, command: String, cwd: String, session: String, env: [String: String]
+    ) {
         Task { @MainActor [weak self] in
             guard let self else {
                 close(client)
@@ -487,18 +498,17 @@ final class ControlServer: @unchecked Sendable {
                 return
             }
             do {
-                try self.overlays.present(command: command, workingDirectory: cwd, sessionID: session)
+                try self.overlays.present(
+                    command: command, workingDirectory: cwd, sessionID: session, environment: env
+                )
                 // No reply yet — the overlay is live, and this connection is
                 // the thing the caller is blocked on. `completePending` answers
                 // it when the command exits.
                 self.pendingClients[session] = client
             } catch {
-                self.reply(
-                    to: client,
-                    ok: false,
-                    error: "a review is already open in this session",
-                    closing: true
-                )
+                // `OverlayCenter.PresentError` describes itself in the words
+                // the launcher should print.
+                self.reply(to: client, ok: false, error: String(describing: error), closing: true)
             }
         }
     }

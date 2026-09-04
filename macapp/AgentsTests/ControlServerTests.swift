@@ -14,7 +14,33 @@ final class ControlServerTests: XCTestCase {
         )
         XCTAssertEqual(
             decision,
-            .run(command: "/tmp/launch.sh", cwd: "/tmp/repo", session: "row-1")
+            .run(command: "/tmp/launch.sh", cwd: "/tmp/repo", session: "row-1", env: [:])
+        )
+    }
+
+    /// The review runs as the overlay surface's own process, in the app's
+    /// environment — which for a Finder-launched app is the bare system PATH.
+    /// The launcher forwards what its subprocesses need from the shell that
+    /// asked; the decision carries it through untouched, and a launcher that
+    /// predates the field still runs.
+    func testOverlayRunForwardsTheCallersEnvironment() {
+        let decision = ControlServer.decide(
+            line: #"{"cmd":"overlay-run","command":"/tmp/launch.sh","cwd":"/tmp/repo","session":"row-1","env":{"PATH":"/opt/homebrew/bin:/usr/bin","LANG":"en_GB.UTF-8"}}"#
+        )
+        XCTAssertEqual(
+            decision,
+            .run(
+                command: "/tmp/launch.sh", cwd: "/tmp/repo", session: "row-1",
+                env: ["PATH": "/opt/homebrew/bin:/usr/bin", "LANG": "en_GB.UTF-8"]
+            ),
+            "the forwarded environment must reach the overlay as sent — it is how revdiff's jj/git/hg subprocesses find their binaries and config from inside an app that has no PATH of its own"
+        )
+        XCTAssertEqual(
+            ControlServer.decide(
+                line: #"{"cmd":"overlay-run","command":"/tmp/launch.sh","cwd":"/tmp/repo","session":"row-1","env":{"PATH":1}}"#
+            ),
+            .refuse("malformed request"),
+            "an env that is not a string map is a malformed request, not a review that starts with half an environment"
         )
     }
 
@@ -70,7 +96,33 @@ final class ControlServerTests: XCTestCase {
         )
         XCTAssertEqual(
             decision,
-            .run(command: "/tmp/launch.sh", cwd: NSHomeDirectory(), session: "row-1")
+            .run(command: "/tmp/launch.sh", cwd: NSHomeDirectory(), session: "row-1", env: [:])
+        )
+    }
+
+    /// A build without its overlay wrapper cannot run a review, and the
+    /// refusal has to reach the launcher as a JSON line that names the
+    /// resource — that line is the only thing the agent ever sees.
+    @MainActor
+    func testAMissingOverlayWrapperIsRefusedOverTheSocket() async throws {
+        let socketPath = FileManager.default.temporaryDirectory
+            .appendingPathComponent("agents-wrapper-test-\(getpid()).sock").path
+        let server = ControlServer(overlays: OverlayCenter(wrapperURL: nil), socketPath: socketPath)
+        server.validateSession = { $0 == "row-1" }
+        server.start()
+        defer { server.stop() }
+        for _ in 0..<100 where !FileManager.default.fileExists(atPath: socketPath) {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: socketPath), "the server never bound its socket")
+
+        let refusal = try await Self.run(
+            "/usr/bin/nc", ["-U", "-w", "2", socketPath], environment: ["PATH": "/usr/bin:/bin"],
+            stdin: #"{"cmd":"overlay-run","command":"/tmp/launch.sh","cwd":"/tmp","session":"row-1"}"# + "\n"
+        )
+        XCTAssertTrue(
+            refusal.output.contains(#""ok":false"#) && refusal.output.contains("overlay-run.sh"),
+            "the refusal must be a JSON line naming the missing resource, got: \(refusal.output)"
         )
     }
 
