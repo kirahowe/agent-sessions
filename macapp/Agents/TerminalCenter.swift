@@ -23,9 +23,9 @@ final class TerminalCenter: ObservableObject, SessionTerminating {
         /// Whether the pane's Ghostty surface currently exists — set and
         /// cleared by the surface lifecycle callbacks. The view is created
         /// long before its surface: the surface is built only once the
-        /// view is in a window with a real size, and `sendText` before
-        /// then is a silent no-op, so anything typed into the pane has to
-        /// wait for this to become true.
+        /// view is in a window with a real size, and a paste before then
+        /// goes nowhere (`paste(text:)` returns false), so anything typed
+        /// into the pane has to wait for this to become true.
         var surfaceAttached = false
         /// Whether the pane's shell has reached its first prompt, taken
         /// from its first OSC title: shell integration and most prompts set
@@ -96,7 +96,12 @@ final class TerminalCenter: ObservableObject, SessionTerminating {
     /// synchronously (zero) or hold the fallback off entirely.
     init(
         textDelivery: @escaping @MainActor (TerminalView, String) -> Void = { view, text in
-            view.sendText(text)
+            // The readiness gate below is what keeps this from ever being
+            // false; if it is, say so — a paste with no surface used to be a
+            // silent no-op, and a lost banner is otherwise undiagnosable.
+            if !view.paste(text: text) {
+                NSLog("Agents: dropped typed text — the pane has no surface")
+            }
         },
         promptSettleDelay: TimeInterval = 0.1,
         promptFallbackDelay: TimeInterval = 3.0
@@ -124,14 +129,17 @@ final class TerminalCenter: ObservableObject, SessionTerminating {
     /// see `TerminalCenterTests`. Two things here are load-bearing and will
     /// silently regress if dropped:
     ///
-    /// - `term`: the package bundles no terminfo, so losing this breaks
-    ///   ncurses apps (vim, htop, ...) in every spawned shell.
+    /// - `term`: every spawned shell advertises `xterm-256color`, the one
+    ///   TERM every host and ncurses app already knows. libghostty-spm 1.5
+    ///   does bundle an `xterm-ghostty` terminfo and exports it to child
+    ///   processes, so the default TERM would now work locally — whether to
+    ///   drop this override (and accept `xterm-ghostty` over ssh to hosts
+    ///   without that entry) is an open decision, tracked in `.issues`.
     /// - the four brand colours: dropping them costs the app its visual
     ///   identity, with no error to point at why.
     static let terminalConfiguration = TerminalConfiguration { builder in
-        // The package bundles no terminfo; without this the default
-        // TERM=xterm-ghostty breaks ncurses apps (vim, htop, ...) in the
-        // spawned shell.
+        // Pinned to xterm-256color rather than the package's default
+        // xterm-ghostty — see the doc comment above.
         builder.withCustom("term", "xterm-256color")
 
         // Terminal-content breathing room. Done via ghostty config

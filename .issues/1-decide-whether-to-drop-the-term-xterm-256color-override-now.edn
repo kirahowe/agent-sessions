@@ -1,0 +1,10 @@
+{:id 1
+ :title "Decide whether to drop the TERM=xterm-256color override now that 1.5 bundles ghostty terminfo"
+ :status :inbox
+ :type :chore
+ :priority :p2
+ :created "2026-09-04"
+ :updated "2026-09-04"
+ :tags #{"libghostty" "terminal"}
+ :blocked-by #{}
+ :related #{}}

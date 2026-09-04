@@ -4,14 +4,14 @@ import GhosttyTerminal
 
 /// A `TerminalView` subclass that adds Finder drag-and-drop, iTerm2-style.
 ///
-/// libghostty-spm ships no drag-and-drop support at all — dropping a file
-/// onto a bare `TerminalView` does nothing. `AppTerminalView+PublicInput.swift`
-/// does give us `sendText(_:)`, a public write path that injects raw UTF-8
-/// straight into the pty, bypassing key translation entirely. That's exactly
-/// the "paste" semantics a drop wants: no synthetic keystrokes, no IME or
-/// dead-key interaction, just bytes landing at the cursor as if pasted. This
-/// class exists solely to wire Finder's drag pasteboard to that write path,
-/// escaping each dropped path the way a shell would expect it typed.
+/// libghostty-spm ships no drag-and-drop support for AppKit — dropping a
+/// file onto a bare `TerminalView` does nothing. `AppTerminalView+PublicInput.swift`
+/// does give us `paste(text:)`, the public paste path: text goes to the pty
+/// the way a paste does (bracketed, for a program that asked for that), with
+/// no synthetic keystrokes and no IME or dead-key interaction. That's exactly
+/// what a drop wants. This class exists solely to wire Finder's drag
+/// pasteboard to that write path, escaping each dropped path the way a shell
+/// would expect it typed.
 @MainActor
 final class DropTerminalView: TerminalView {
     /// Restricts pasteboard reads to genuine file URLs (as opposed to
@@ -59,7 +59,7 @@ final class DropTerminalView: TerminalView {
         // after the paste (e.g. drop a file onto `cat `, then type more),
         // matching the iTerm2 convention this feature is modeled on.
         let pasted = urls.map { Self.shellEscape($0.path) }.joined(separator: " ")
-        sendText(pasted + " ")
+        paste(text: pasted + " ")
         return true
     }
 

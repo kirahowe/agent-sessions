@@ -20,7 +20,7 @@ final class TerminalCenterTests: XCTestCase {
     func testTermIsXterm256Color() {
         XCTAssertTrue(
             rendered.contains("term = xterm-256color"),
-            "term=xterm-256color is missing from the terminal configuration — the package bundles no terminfo, so the default TERM=xterm-ghostty breaks ncurses apps (vim, htop, ...) in every spawned shell"
+            "term=xterm-256color is missing from the terminal configuration — dropping the override is a pending decision (see .issues), not a side effect: every spawned shell would silently switch to TERM=xterm-ghostty, which remote hosts without that terminfo entry cannot use"
         )
     }
 

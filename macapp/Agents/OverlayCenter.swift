@@ -82,7 +82,7 @@ final class OverlayCenter: ObservableObject {
 
     init(
         textDelivery: @escaping @MainActor (TerminalView, String) -> Void = { view, text in
-            view.sendText(text)
+            view.paste(text: text)
         }
     ) {
         self.textDelivery = textDelivery

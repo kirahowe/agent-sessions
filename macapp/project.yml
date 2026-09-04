@@ -37,7 +37,7 @@ settings:
 packages:
   libghostty-spm:
     url: https://github.com/Lakr233/libghostty-spm
-    exactVersion: 1.3.2
+    exactVersion: 1.5.20260903
   Sparkle:
     url: https://github.com/sparkle-project/Sparkle
     exactVersion: 2.9.5
