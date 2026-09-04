@@ -1,0 +1,11 @@
+{:id 4
+ :title "Restore banner: pasted heading line is not executed under bracketed paste"
+ :status :inbox
+ :type :bug
+ :priority :p3
+ :created "2026-09-04"
+ :updated "2026-09-04"
+ :tags #{"restore-banner" "terminal"}
+ :blocked-by #{}
+ :related #{}
+ :details "4-restore-banner-pasted-heading-line-is-not-executed-under.md"}

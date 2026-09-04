@@ -10,6 +10,7 @@
 | [1](1-decide-whether-to-drop-the-term-xterm-256color-override-now.edn) | Decide whether to drop the TERM=xterm-256color override now that 1.5 bundles ghostty terminfo | chore | P2 |
 | [2](2-upstream-a-child-exited-delegate-to-libghostty-spm-and-drop.md) | Upstream a child-exited delegate to libghostty-spm and drop the overlay wrapper | chore | P2 |
 | [3](3-send-libghostty-spm-a-doc-fix-surface-command-is-bash.md) | Send libghostty-spm a doc fix: surface command is bash source and waitAfterCommand cannot be turned off | chore | P3 |
+| [4](4-restore-banner-pasted-heading-line-is-not-executed-under.md) | Restore banner: pasted heading line is not executed under bracketed paste | bug | P3 |
 
 ## Done
 
