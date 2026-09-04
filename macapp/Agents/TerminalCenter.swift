@@ -20,30 +20,10 @@ final class TerminalCenter: ObservableObject, SessionTerminating {
         var controller: TerminalController?
         var delegateProxy: SessionDelegateProxy
         var lastTitle: String?
-        /// Whether the pane's Ghostty surface currently exists — set and
-        /// cleared by the surface lifecycle callbacks. The view is created
-        /// long before its surface: the surface is built only once the
-        /// view is in a window with a real size, and a paste before then
-        /// goes nowhere (`paste(text:)` returns false), so anything typed
-        /// into the pane has to wait for this to become true.
-        var surfaceAttached = false
-        /// Whether the pane's shell has reached its first prompt, taken
-        /// from its first OSC title: shell integration and most prompts set
-        /// one from precmd, which runs just before the prompt is painted.
-        /// Typing earlier lands while `login` still owns the tty in cooked
-        /// mode — the kernel echoes the raw bytes above "Last login", and
-        /// the prompt then repaints underneath the line editor as it
-        /// inserts them.
-        var promptSeen = false
-        /// Whether the prompt fallback has run out: a shell that never sets
-        /// a title still gets its banner, `promptFallbackDelay` after the
-        /// surface attached.
-        var promptFallbackElapsed = false
-        /// Bumped on every attach so a fallback timer started for one
-        /// surface cannot declare a later surface's shell ready.
-        var attachGeneration = 0
-
-        var readyForInput: Bool { surfaceAttached && (promptSeen || promptFallbackElapsed) }
+        /// When the pane is safe to type into — the surface built, the shell
+        /// at its prompt — kept as a pure state machine so the transitions
+        /// are unit-tested without a live surface (see `TerminalReadiness`).
+        var readiness = TerminalReadiness()
     }
 
     /// Per-session resume-hint bookkeeping. Session-scoped, not pane-scoped:
@@ -500,13 +480,13 @@ final class TerminalCenter: ObservableObject, SessionTerminating {
     /// active session.
     ///
     /// Delivery waits for the pane to be ready for input, which is two
-    /// things (see `PaneEntry.readyForInput`): its surface must exist —
+    /// things (see `TerminalReadiness.isReady`): its surface must exist —
     /// the text goes down the pty, and there is no pty until Ghostty has
     /// built the surface, an arbitrary number of run-loop turns after the
     /// view is mounted — and its shell must have reached a prompt, known
     /// from the pane's first title or, failing that, a timer. Marking the
     /// hint scheduled here and letting whichever signal completes the set
-    /// deliver it is what keeps the banner from being lost to a `sendText`
+    /// deliver it is what keeps the banner from being lost to a paste
     /// that silently did nothing, or echoed twice by a tty no shell has
     /// taken over yet.
     func showResumeHintIfNeeded(for sessionID: String) {
@@ -531,7 +511,7 @@ final class TerminalCenter: ObservableObject, SessionTerminating {
               hint.scheduled, !hint.didShow,
               let layout = layouts[sessionID],
               let entry = panes[layout.initialPane],
-              entry.readyForInput
+              entry.readiness.isReady
         else { return }
         after(promptSettleDelay) { [weak self] in self?.deliverResumeHint(for: sessionID) }
     }
@@ -543,7 +523,7 @@ final class TerminalCenter: ObservableObject, SessionTerminating {
               let metadata = hint.metadata,
               let layout = layouts[sessionID],
               let entry = panes[layout.initialPane],
-              entry.readyForInput
+              entry.readiness.isReady
         else { return }
 
         hint.didShow = true
@@ -560,15 +540,15 @@ final class TerminalCenter: ObservableObject, SessionTerminating {
     /// waiting on — see `showResumeHintIfNeeded`.
     func handleSurfaceAttached(paneID: UUID) {
         guard var entry = panes[paneID] else { return }
-        entry.surfaceAttached = true
-        entry.attachGeneration += 1
+        let generation = entry.readiness.attach()
         panes[paneID] = entry
-        let generation = entry.attachGeneration
         after(promptFallbackDelay) { [weak self] in
+            // `noteFallbackElapsed` drops the timer if a detach/attach has
+            // since bumped the generation past it — the surface it was armed
+            // for is gone.
             guard let self, var entry = self.panes[paneID],
-                  entry.surfaceAttached, entry.attachGeneration == generation
+                  entry.readiness.noteFallbackElapsed(generation: generation)
             else { return }
-            entry.promptFallbackElapsed = true
             self.panes[paneID] = entry
             self.deliverResumeHintWhenReady(for: entry.sessionID)
         }
@@ -581,9 +561,7 @@ final class TerminalCenter: ObservableObject, SessionTerminating {
     /// next attach, and the next surface's shell starts from scratch.
     func handleSurfaceDetached(paneID: UUID) {
         guard var entry = panes[paneID] else { return }
-        entry.surfaceAttached = false
-        entry.promptSeen = false
-        entry.promptFallbackElapsed = false
+        entry.readiness.detach()
         panes[paneID] = entry
     }
 
@@ -630,13 +608,11 @@ final class TerminalCenter: ObservableObject, SessionTerminating {
             entry.controller = nil
             entry.lastTitle = nil
             // The delegate was detached above, so the surface's own detach
-            // callback never arrives: clear the readiness flags by hand, or
-            // the banner typed after resume could go to a surface that no
-            // longer exists — and be lost, since `sendText` says nothing
-            // then — or to a fresh shell that is not at its prompt yet.
-            entry.surfaceAttached = false
-            entry.promptSeen = false
-            entry.promptFallbackElapsed = false
+            // callback never arrives: reset readiness by hand, or the banner
+            // typed after resume could go to a surface that no longer exists
+            // — and be lost, since a paste says nothing then — or to a fresh
+            // shell that is not at its prompt yet.
+            entry.readiness.detach()
             panes[survivor] = entry
             // The survivor keeps its view and its pane id, but its PROCESS
             // is as dead as its siblings' — announce the closure so its
@@ -708,8 +684,7 @@ final class TerminalCenter: ObservableObject, SessionTerminating {
         // The first title is the shell's first prompt — see
         // `PaneEntry.promptSeen` — and may be what the restore banner
         // was waiting on.
-        let firstPrompt = !entry.promptSeen
-        entry.promptSeen = true
+        let firstPrompt = entry.readiness.notePrompt()
         panes[paneID] = entry
         if firstPrompt {
             deliverResumeHintWhenReady(for: entry.sessionID)
